@@ -1,0 +1,9 @@
+# Keep secrets and machine-local state out of `git archive` distributions.
+config.json export-ignore
+config.json.bak export-ignore
+config.json.tmp export-ignore
+cache/ export-ignore
+.uv/ export-ignore
+.venv/ export-ignore
+.zcode/ export-ignore
+.mimosa/ export-ignore

@@ -1,0 +1,22 @@
+# Secrets and machine-local state
+config.json
+config.json.bak
+config.json.tmp
+
+# Generated data
+cache/
+.uv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Machine-local tool/editor state
+.zcode/
+.mimosa/
+.idea/
+.vscode/
+
+# Editor and OS noise
+.DS_Store
+*.swp

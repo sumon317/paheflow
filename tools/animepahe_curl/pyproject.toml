@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "animepahe-curl"
+version = "1.0.0"
+description = "Small curl-compatible HTTP client with browser impersonation for AnimePahe GUI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["curl_cffi>=0.5.10"]
+
+[project.scripts]
+animepahe-curl = "animepahe_curl.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["animepahe_curl"]
