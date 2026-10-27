@@ -433,6 +433,31 @@ class ServerHarness(unittest.TestCase):
         self.assertEqual(status, 400, payload)
         self.assertIn("filesystem root", payload["error"])
 
+    def test_episode_error_falls_back_to_the_saved_list(self):
+        cached = [{"episode": "1", "session": "s1", "audio": "jpn"}]
+        with mock.patch.object(
+            server.backend,
+            "release",
+            side_effect=backend.BackendError("Cloudflare refused this request (block page)."),
+        ), mock.patch.object(server.backend, "load_release_cache", return_value=cached):
+            status, payload, _ = self.json_request("GET", "/api/episodes?slug=demo")
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["items"], cached)
+        self.assertIs(payload["stale"], True)
+        self.assertIn("block page", payload["warning"])
+
+    def test_episode_error_without_a_cache_is_reported(self):
+        with mock.patch.object(
+            server.backend,
+            "release",
+            side_effect=backend.BackendError("animepahe.pw is unavailable."),
+        ), mock.patch.object(server.backend, "load_release_cache", return_value=[]):
+            status, payload, _ = self.json_request("GET", "/api/episodes?slug=demo")
+
+        self.assertEqual(status, 502, payload)
+        self.assertIn("unavailable", payload["error"])
+
     def test_unknown_api_with_token_is_404(self):
         status, payload, _ = self.json_request("GET", "/api/nope")
         self.assertEqual(status, 404)

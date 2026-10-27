@@ -137,14 +137,25 @@ def _fetch_json(url: str) -> dict[str, Any]:
                 "Wait a minute and retry — if it keeps happening, copy a fresh "
                 "cf_clearance cookie and User-Agent into Settings."
             ) from exc
-        if "<html" in head:
+        if "sorry, you have been blocked" in head or "cf-error-details" in head:
             raise BackendError(
-                "animepahe.pw returned an HTML page instead of data — the cf_clearance "
-                "cookie is probably expired. Update it in Settings."
+                "Cloudflare refused this request (block page). Your IP or the "
+                "User-Agent/cookie pair is being rejected — copy a fresh "
+                "cf_clearance cookie from the browser that issued it into Settings."
+            ) from exc
+        if "<html" in head:
+            # A plain HTML page (typically the site's WordPress 404) means the
+            # endpoint itself answered, but the request was invalid — most
+            # often a rotated slug, not a credential problem. Worded so the
+            # frontend does not raise the cookie banner.
+            raise BackendError(
+                "animepahe.pw has no data for this request — the anime's slug has "
+                "probably rotated on the site. Re-search the anime in Browse and "
+                "use the fresh result."
             ) from exc
         raise BackendError(
-            "animepahe.pw returned an unexpected response — the cf_clearance cookie is "
-            "probably expired. Update it in Settings."
+            "animepahe.pw returned an unexpected response — the cf_clearance cookie "
+            "is probably expired. Update it in Settings."
         ) from exc
     if not isinstance(data, dict):
         raise BackendError("Unexpected response shape from animepahe.pw")

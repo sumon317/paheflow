@@ -12,6 +12,7 @@ A local web GUI for the [animepahe-dl](https://github.com/KevCui/animepahe-dl) b
 | **Progress** | Live log stream (SSE), progress bar, per-episode status chips, playlist links when `-l` is used. The log panel keeps the newest 1,000 lines so long batches stay responsive. |
 | **Library** | Scan downloaded folders, open files/folders, delete single episodes or whole series. Follows the configured destination. Large collections render series headers first and load episode rows on demand. |
 | **Settings** | First-time setup panel, download destination with a native folder picker, replace or clear the stored `cf_clearance`, “Use this browser’s User-Agent”, concurrent fragments, Test connection, and a dependency checklist. |
+| **Themes** | Six built-in palettes — Midnight (default), Daylight, Ink, Sepia, Nord, and Rose — chosen from the top bar and remembered per browser. |
 | **Responsive** | Works on desktop and mobile; activity panel can be toggled. |
 
 The stored `cf_clearance` cookie is never sent back to the browser. Settings only shows whether a cookie is saved and how long it is; leaving the field blank keeps the current value, and **Clear** deletes it.
@@ -37,6 +38,18 @@ Fragment downloads are retried with a short sleep. If a fragment is still unavai
 Downloading hundreds of episodes produces far more log output than the browser can usefully display. The runner keeps at most 2,000 log entries and returns the newest 500 in snapshots. The progress panel renders at most 1,000 lines, batches incoming SSE events once per animation frame, and discards the oldest lines. **Copy logs** copies the retained window, not the complete job history.
 
 The Library shows one header per anime folder. Small libraries (up to 5 folders / 200 files) open automatically; larger ones load an episode list only when **Show episodes** is clicked. This keeps both long batches and large collections from creating tens of thousands of DOM nodes.
+
+### Cached episode lists
+
+A successful full episode fetch is also saved under `cache/`. If a later request fails because the site is blocked, Cloudflare is challenging the request, or the anime’s slug has rotated, the GUI shows the last cached list with a warning toast instead of an empty Episodes panel. The toast includes the underlying reason, and a later successful fetch replaces the cache.
+
+Cached lists can be out of date. Re-search the anime in **Browse** when the warning mentions a rotated slug, or refresh the cookie when it reports a Cloudflare block.
+
+### Themes
+
+Use the palette picker in the top bar to switch between **Midnight** (default), **Daylight**, **Ink**, **Sepia**, **Nord**, and **Rose**. Midnight is the original palette; the other themes only override color and typography variables. The selection is stored in `localStorage` under `apgui-theme` and applies immediately on later page loads.
+
+Themes are presentation-only. Changing one never sends an API request, changes download settings, or touches the stored cookie.
 
 ## Requirements and one-command setup
 
@@ -199,7 +212,7 @@ The automated suite uses Python's standard library and never touches the real `a
 python3 -m unittest discover -s tests -v
 ```
 
-It covers config permission, cookie preservation, and download-destination rules; library delete guards and destination scoping; shell startup, helper fallback, optional `fzf`, catalog, and destination precedence; folder-picker fallbacks; runner log sequencing, bounds, redaction, and destination propagation; HTTP token/Host/SSE behaviour against ephemeral servers; the `animepahe-curl` option parser and its HTTP behaviour against a local test server; and dependency reporting.
+It covers config permission, cookie preservation, and download-destination rules; library delete guards and destination scoping; shell startup, helper fallback, optional `fzf`, catalog, and destination precedence; folder-picker fallbacks; runner log sequencing, bounds, redaction, and destination propagation; HTTP token/Host/SSE behaviour against ephemeral servers; backend error classification, episode-cache persistence, and stale-list fallback; the `animepahe-curl` option parser and its HTTP behaviour against a local test server; and dependency reporting.
 
 Verify an installed checkout without changing anything:
 
@@ -213,6 +226,7 @@ Verify an installed checkout without changing anything:
 
 - **“error code: 1015”** in logs → Cloudflare rate-limited the API. The GUI retries automatically; if it persists, wait a minute or refresh the catalogue less often.
 - **“cf_clearance expired”** or a Cloudflare “Just a moment…” page → copy a fresh cookie from the same browser session, click **Use this browser’s User-Agent**, then save. The cookie is tied to the browser’s User-Agent and often to the network address.
+- **A “cached episode list” warning appears** → The live request failed and the GUI reused the last successful list from `cache/`. Read the warning: re-search the anime if its slug rotated, or refresh the cookie if Cloudflare blocked the request. A successful fetch replaces the cache.
 - **A required tool is missing** → run `./requirements.sh`, then start the GUI again. The launcher lists every missing tool; the dependency card in Settings shows resolved paths.
 - **`animepahe-curl` fails to start** → run `./requirements.sh --yes` to rebuild the helper and its `curl_cffi` dependency.
 - **“Invalid or missing session token”** → The server restarted and issued a new token. Reload the page.

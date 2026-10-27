@@ -305,6 +305,10 @@
       updatePagination();
       probeFirstEpisode();
       $("cookieBanner").classList.add("hidden");
+      if (res.stale) {
+        // The site refused the live request; this list came from the disk cache.
+        toast(res.warning || "Showing a cached episode list — the live request failed.", "warn");
+      }
     } catch (e) {
       toast("Failed to load episodes: " + e.message, "error");
       noteApiError(e.message);
@@ -1339,11 +1343,34 @@
   }
 
   /* ─────────────────────────────────────────────────────────────────
+   *  theme picker — presentation only
+   *
+   *  Sets data-theme on <html> and remembers the choice. Reads and writes
+   *  nothing else: no app state, no API calls, no event interference.
+   * ───────────────────────────────────────────────────────────────── */
+
+  function initThemePicker() {
+    const select = $("themeSelect");
+    if (!select) return;
+    const KEY = "apgui-theme";
+    let saved = null;
+    try { saved = localStorage.getItem(KEY); } catch (e) { /* storage unavailable */ }
+    if (saved && [...select.options].some(o => o.value === saved)) select.value = saved;
+    const apply = () => { document.documentElement.dataset.theme = select.value || "midnight"; };
+    select.addEventListener("change", () => {
+      apply();
+      try { localStorage.setItem(KEY, select.value); } catch (e) { /* storage unavailable */ }
+    });
+    apply();
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
    *  go
    * ───────────────────────────────────────────────────────────────── */
 
   bind();
   fillUAPresets();
   initEventSource();
+  initThemePicker();
   loadInitialState();
 })();

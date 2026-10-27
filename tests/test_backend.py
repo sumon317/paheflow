@@ -108,5 +108,72 @@ class CurlBinaryTests(unittest.TestCase):
             self.assertEqual(backend._curl_binary(), "/usr/bin/curl")
 
 
+class FetchJsonErrorTests(unittest.TestCase):
+    """The GUI raises the cookie banner from these messages, so classification matters."""
+
+    def error_for(self, body: str) -> str:
+        with mock.patch.object(backend, "_fetch", return_value=body):
+            with self.assertRaises(backend.BackendError) as raised:
+                backend._fetch_json("https://animepahe.pw/api")
+        return str(raised.exception)
+
+    def test_cloudflare_challenge_asks_for_a_fresh_cookie(self):
+        message = self.error_for("<html><title>Just a moment...</title></html>")
+        self.assertIn("Cloudflare", message)
+        self.assertIn("cf_clearance", message)
+
+    def test_block_page_is_reported_as_a_block(self):
+        message = self.error_for(
+            "<html><div id='cf-error-details'>Sorry, you have been blocked</div></html>"
+        )
+        self.assertIn("block page", message)
+        self.assertIn("cf_clearance", message)
+
+    def test_plain_html_404_means_rotated_slug_not_expired_cookie(self):
+        message = self.error_for("<html><body>Page not found</body></html>")
+        self.assertIn("slug", message)
+        # A rotated slug must not raise the cookie banner in the frontend.
+        for trigger in ("cf_clearance", "cloudflare", "just a moment", "expired", "challenge"):
+            self.assertNotIn(trigger, message.lower())
+
+    def test_unexpected_body_still_suggests_updating_the_cookie(self):
+        message = self.error_for("not json at all")
+        self.assertIn("cf_clearance", message)
+
+
+class ReleaseCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = Path(self.tmp.name) / "cache"
+        patcher = mock.patch.object(backend, "CACHE_DIR", self.cache)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_roundtrip_preserves_episode_metadata(self):
+        episodes = [
+            {"episode": "1", "session": "abc", "audio": "jpn", "duration": "24:00"},
+            {"episode": "2", "session": "def", "audio": "eng", "duration": "24:00"},
+        ]
+
+        backend.save_release_cache("demo-slug", episodes)
+
+        self.assertEqual(backend.load_release_cache("demo-slug"), episodes)
+
+    def test_unsafe_slug_cannot_escape_the_cache_directory(self):
+        backend.save_release_cache("../../etc/passwd", [{"episode": "1"}])
+
+        files = list(self.cache.glob("*.json"))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].parent, self.cache)
+
+    def test_missing_or_corrupt_cache_returns_an_empty_list(self):
+        self.assertEqual(backend.load_release_cache("never-saved"), [])
+
+        self.cache.mkdir()
+        backend._cache_file("broken").write_text("{not json", encoding="utf-8")
+        self.assertEqual(backend.load_release_cache("broken"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
