@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#18122B"/>
+      <stop offset="50%" stop-color="#281A45"/>
+      <stop offset="100%" stop-color="#392467"/>
+    </linearGradient>
+    <linearGradient id="glowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF5B79"/>
+      <stop offset="50%" stop-color="#A259FF"/>
+      <stop offset="100%" stop-color="#38E54D"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF5B79"/>
+      <stop offset="100%" stop-color="#A259FF"/>
+    </linearGradient>
+    <linearGradient id="playGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#D4BEE4"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="16" stdDeviation="24" flood-color="#A259FF" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Squircle Base -->
+  <rect x="32" y="32" width="448" height="448" rx="112" fill="url(#bgGrad)" stroke="url(#glowGrad)" stroke-width="4"/>
+
+  <!-- Subtle Inner Ring -->
+  <circle cx="256" cy="256" r="170" fill="none" stroke="#A259FF" stroke-width="2" stroke-opacity="0.3" stroke-dasharray="8 12"/>
+
+  <!-- Anime Vinyl / Disc Pattern -->
+  <circle cx="256" cy="256" r="140" fill="#1e1535" stroke="#FF5B79" stroke-width="3" stroke-opacity="0.4"/>
+  <circle cx="256" cy="256" r="110" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-opacity="0.15"/>
+  <circle cx="256" cy="256" r="80" fill="none" stroke="#A259FF" stroke-width="1" stroke-opacity="0.25"/>
+
+  <!-- Stylized Play Emblem / Anime Arrow -->
+  <path d="M 220 176 L 336 256 L 220 336 Z" fill="url(#accentGrad)" filter="url(#shadow)"/>
+  <path d="M 226 194 L 316 256 L 226 318 Z" fill="url(#playGrad)" fill-opacity="0.95"/>
+
+  <!-- Pahe Accent Badge Dot -->
+  <circle cx="340" cy="180" r="14" fill="#38E54D"/>
+</svg>

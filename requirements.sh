@@ -60,12 +60,13 @@ Options:
   --no-optional  Skip optional packages (fzf, mpv).
   -h, --help     Show this help.
 
-Required runtime tools: Python 3.11+, jq, ffmpeg, yt-dlp with curl_cffi
-support, and either curl-impersonate or the bundled animepahe-curl helper.
+Required for the native Rust GUI: Rust/Cargo, ffmpeg, and either
+curl-impersonate or the bundled animepahe-curl helper.
+The legacy Python/bash CLI additionally uses Python 3.11+ and yt-dlp.
 
-yt-dlp and animepahe-curl are installed with uv into .uv/bin. The launcher
-puts that directory on PATH automatically. config.json and cookies are never
-read or modified by this script.
+This script installs ffmpeg plus yt-dlp and animepahe-curl into .uv/bin.
+It does not install Rust; install it from https://rustup.rs if needed.
+config.json and cookies are never read or modified by this script.
 EOF
 }
 

@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="app-token" content="__APP_TOKEN__" />
+<title>PaheFlow</title>
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg" />
+<link rel="alternate icon" type="image/png" href="/static/icon.png" />
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"></div>
+      <div class="brand-text">
+        <h1>PaheFlow</h1>
+        <span>local downloader</span>
+      </div>
+    </div>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="browse" role="tab">Browse</button>
+      <button class="tab" data-tab="episodes" role="tab">Episodes</button>
+      <button class="tab" data-tab="settings" role="tab">Settings</button>
+    </nav>
+
+    <div class="topbar-right">
+      <button class="btn btn-ghost btn-sm" id="topbarSolveCf" title="Solve Cloudflare verification challenge in a compact window">🛡️ Solve Cloudflare</button>
+      <label class="theme-select" title="Color theme">
+        <select id="themeSelect" aria-label="Color theme">
+          <option value="midnight">Midnight</option>
+          <option value="daylight">Daylight</option>
+          <option value="ink">Ink</option>
+          <option value="sepia">Sepia</option>
+          <option value="nord">Nord</option>
+          <option value="rose">Rose</option>
+        </select>
+      </label>
+      <div class="status-pill" id="statusPill" data-state="idle">
+        <span class="status-dot"></span>
+        <span id="statusText">Idle</span>
+      </div>
+      <button class="btn btn-ghost btn-icon" id="toggleActivity" title="Show / hide activity panel" aria-label="Toggle activity panel">
+        <span class="pulse-icon" aria-hidden="true"></span>
+      </button>
+      <button class="btn btn-ghost btn-icon shutdown-icon-btn" id="shutdownBtnTop" title="Shut down PaheFlow" aria-label="Shut down app">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+          <line x1="12" y1="2" x2="12" y2="12"></line>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="layout" id="layout">
+    <div class="content">
+
+    <div class="banner hidden" id="cookieBanner">
+      <div class="banner-icon">!</div>
+      <div class="banner-body">
+        <strong>animepahe.pw is refusing the requests.</strong>
+        <span id="cookieBannerText">The cf_clearance cookie is missing or expired.</span>
+        <button class="btn btn-primary btn-sm" id="bannerSolveCookie">🛡️ Solve Cloudflare</button>
+        <button class="btn btn-ghost btn-sm" id="bannerSettings">Open settings</button>
+      </div>
+      <button class="banner-close" id="bannerClose" title="Dismiss">✕</button>
+    </div>
+
+    <div class="banner hidden" id="storagePermissionBanner" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.1);">
+      <div class="banner-icon" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b;">📁</div>
+      <div class="banner-body">
+        <strong>Storage permission needed to save downloads</strong>
+        <span id="storagePermissionBannerText">Grant "All files access" so PaheFlow can save videos directly to <code>Downloads/PaheFlow</code> without storage errors.</span>
+        <button class="btn btn-primary btn-sm" id="grantStoragePermBtn" style="background: #f59e0b; border-color: #f59e0b; color: #000; font-weight: 600;">📁 Grant Permission</button>
+      </div>
+      <button class="banner-close" id="storagePermClose" title="Dismiss">✕</button>
+    </div>
+
+    <!-- ─────────────────────────────  BROWSE  ───────────────────────────── -->
+    <section class="panel is-active" id="panel-browse">
+      <div class="panel-head">
+        <div>
+          <h2>Catalog & search</h2>
+          <p class="panel-sub" id="catalogMeta">Loading the local slug list…</p>
+        </div>
+        <div class="panel-actions">
+          <button class="btn btn-ghost" id="refreshCatalog" title="Re-download the anime listing from animepahe.pw">Refresh catalog</button>
+        </div>
+      </div>
+
+      <div class="search-row">
+        <div class="search-box">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 21l-4.35-4.35M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16z"/></svg>
+          <input id="searchInput" type="search" autocomplete="off" placeholder="Search animepahe.pw — e.g. attack on titan" />
+          <button class="btn btn-ghost btn-sm" id="clearSearch" title="Clear">✕</button>
+        </div>
+        <button class="btn btn-primary" id="searchBtn">Search</button>
+      </div>
+
+      <div class="segmented" id="resultModes">
+        <button class="seg is-active" data-mode="remote">Site results</button>
+        <button class="seg" data-mode="local">Local catalog</button>
+      </div>
+
+      <div class="results" id="resultsList">
+        <div class="empty">
+          <p class="empty-title">Type to search animepahe.pw</p>
+          <p class="empty-text">The local catalog tab filters the 6 000+ cached slugs without touching the network.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ────────────────────────────  EPISODES  ──────────────────────────── -->
+    <section class="panel" id="panel-episodes">
+      <div class="panel-head">
+        <div class="title-block">
+          <h2 id="epTitle">No anime selected</h2>
+          <p class="panel-sub" id="epSubtitle">Pick something in the Browse tab first.</p>
+        </div>
+        <div class="panel-actions">
+          <button class="btn btn-ghost btn-sm" id="copySlug" title="Copy the slug / uuid">Copy slug</button>
+          <button class="btn btn-ghost btn-sm" id="reloadEpisodes" title="Reload the episode list">Reload</button>
+        </div>
+      </div>
+
+      <div class="ep-toolbar">
+        <input id="epFilter" type="search" placeholder="Filter episodes…" autocomplete="off" />
+        <div class="segmented ep-audio-seg" id="epAudioSegmented" role="group" aria-label="Audio filter">
+          <button class="seg is-active" data-audio="" id="btnAudioAll" title="Show all episodes">All</button>
+          <button class="seg" data-audio="sub" id="btnAudioSub" title="Filter to Japanese Sub episodes">Sub</button>
+          <button class="seg" data-audio="dub" id="btnAudioDub" title="Filter to English Dub episodes">Dub</button>
+        </div>
+        <div class="toolbar-buttons">
+          <button class="btn btn-ghost btn-sm" data-ep="all">All</button>
+          <button class="btn btn-ghost btn-sm" data-ep="none">None</button>
+          <button class="btn btn-ghost btn-sm" data-ep="invert">Invert</button>
+          <button class="btn btn-ghost btn-sm" data-ep="range">Range…</button>
+          <button class="btn btn-ghost btn-sm" data-ep="latest">Latest</button>
+        </div>
+      </div>
+
+      <div class="ep-grid" id="epGrid">
+        <div class="empty"><p class="empty-title">No episodes loaded</p></div>
+      </div>
+
+      <div class="pager hidden" id="epPager">
+        <button class="btn btn-ghost btn-sm" id="epPrev" title="Previous page">← Previous</button>
+        <span id="epPageInfo">Page 1 of 1</span>
+        <button class="btn btn-ghost btn-sm" id="epNext" title="Next page">Next →</button>
+      </div>
+
+      <div class="options-grid">
+        <div class="option">
+          <label for="optResolution">Video resolution</label>
+          <div class="option-control">
+            <select id="optResolution">
+              <option value="">Auto — highest available</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" id="probeOptions" title="Ask animepahe.pw which resolutions this episode has">Probe</button>
+          </div>
+          <p class="option-hint" id="resolutionHint">Empty = the backend picks the highest available quality.</p>
+        </div>
+
+        <div class="option">
+          <label for="optAudio">Audio language</label>
+          <div class="option-control">
+            <select id="optAudio">
+              <option value="">Default (All)</option>
+              <option value="jpn">Japanese (Sub)</option>
+              <option value="eng">English (Dub)</option>
+            </select>
+          </div>
+          <p class="option-hint" id="audioHint">Selecting Dub or Sub filters the catalogue to available episodes.</p>
+        </div>
+
+        <div class="option">
+          <label>Mode</label>
+          <div class="option-control switches">
+            <label class="switch">
+              <input type="checkbox" id="optListOnly" />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+              <span class="switch-label">Playlist link only</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="optDebug" />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+              <span class="switch-label">Debug mode</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="optReplace" />
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+              <span class="switch-label">Replace existing</span>
+            </label>
+          </div>
+          <p class="option-hint">"Playlist link only" resolves the m3u8 without downloading the video. "Replace existing" downloads a fresh copy to a temporary file and swaps it in only after success; off skips episodes you already have.</p>
+        </div>
+      </div>
+
+      <div class="command-preview">
+        <span class="command-label">Job summary</span>
+        <code id="commandPreview">Select an anime to preview the job</code>
+        <button class="btn btn-ghost btn-sm" id="copyCommand">Copy</button>
+      </div>
+    </section>
+
+    <!-- ────────────────────────────  SETTINGS  ──────────────────────────── -->
+    <section class="panel" id="panel-settings">
+      <div class="panel-head">
+        <div>
+          <h2>Configuration</h2>
+          <p class="panel-sub">Stored in <code>config.json</code> next to the backend script.</p>
+        </div>
+        <div class="panel-actions">
+          <button class="btn btn-ghost" id="testConnection">Test connection</button>
+        </div>
+      </div>
+
+      <div class="card setup-card hidden" id="setupPanel">
+        <div class="card-head">
+          <h3>First-time setup</h3>
+          <span class="badge warn" id="setupBadge">cookie needed</span>
+        </div>
+        <p class="option-hint">
+          animepahe.pw is protected by Cloudflare. The GUI needs the
+          <code>cf_clearance</code> cookie and the matching User-Agent from the
+          same browser session.
+        </p>
+        <ol class="setup-steps">
+          <li>
+            <span class="setup-num">1</span>
+            <div>
+              <strong>Open the site and pass the Cloudflare check.</strong>
+              Use <a href="https://animepahe.pw/" target="_blank" rel="noreferrer" id="setupOpenSite">animepahe.pw</a>
+              in the browser you normally use.
+            </div>
+          </li>
+          <li>
+            <span class="setup-num">2</span>
+            <div>
+              <strong>Copy the <code>cf_clearance</code> value.</strong>
+              DevTools → Application → Cookies → <code>animepahe.pw</code> → copy
+              <code>cf_clearance</code>. The cookie is HttpOnly, so JavaScript cannot
+              read it. Then <button type="button" class="link-btn" id="setupFocusCookie">paste it into the cookie field below</button>.
+            </div>
+          </li>
+          <li>
+            <span class="setup-num">3</span>
+            <div>
+              <strong>Match the User-Agent, save, and test.</strong>
+              Click <em>Use this browser's User-Agent</em>, then
+              <em>Save configuration</em> and <em>Test connection</em>.
+            </div>
+          </li>
+        </ol>
+        <div class="setup-actions">
+          <button class="btn btn-primary" id="setupAutoDetect">✨ Auto-Detect from Browser</button>
+          <button class="btn btn-ghost" id="setupUseBrowserUa">Use this browser's User-Agent</button>
+          <button class="btn btn-ghost" id="setupSaveTest">Save &amp; test connection</button>
+        </div>
+        <p class="option-hint" id="setupHint"></p>
+      </div>
+
+      <div class="settings-grid">
+        <div class="card">
+          <div class="card-head">
+            <h3>Destination folder</h3>
+            <span class="badge" id="downloadDirBadge">default</span>
+          </div>
+          <label class="field">
+            <span>Where downloaded anime folders are saved</span>
+            <div class="field-row">
+              <input id="cfgDownloadDir" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/anime" />
+              <button class="btn btn-ghost btn-sm" id="browseDownloadDir" title="Choose a folder">Browse…</button>
+              <button class="btn btn-ghost btn-sm" id="resetDownloadDir" title="Use the project folder">Default</button>
+            </div>
+          </label>
+          <p class="option-hint">
+            Choosing a folder saves it immediately and makes it the default for future
+            downloads. Existing files are not moved.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>Cloudflare clearance</h3>
+            <span class="badge" id="cfBadge">unknown</span>
+          </div>
+          <label class="field">
+            <span>cf_clearance cookie</span>
+            <div class="field-row">
+              <input id="cfgCf" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the cf_clearance cookie value" />
+              <button class="btn btn-outline btn-sm" id="autoDetectCf" title="Automatically read Cloudflare cookie from your local browser">✨ Auto-Detect</button>
+              <button class="btn btn-ghost btn-sm" id="pasteCf" title="Paste from clipboard">Paste</button>
+              <button class="btn btn-ghost btn-sm" id="toggleCf" title="Show / hide">Show</button>
+              <button class="btn btn-ghost btn-sm" id="clearCf" title="Delete the stored cookie">Clear</button>
+            </div>
+          </label>
+          <p class="option-hint">
+            The stored cookie is never sent back to this page. Leave the field empty to keep it.
+          </p>
+          <p class="option-hint">
+            <strong>How to refresh:</strong>
+            <a href="https://animepahe.pw/" target="_blank" rel="noreferrer" id="openSite">open animepahe.pw</a>
+            in the browser that issued the cookie → wait for the Cloudflare check to pass →
+            DevTools → Application → Cookies → <code>animepahe.pw</code> → copy the
+            <code>cf_clearance</code> value → paste it here. The cookie is HttpOnly, so it
+            cannot be read by JavaScript.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>User agent</h3>
+            <span class="badge" id="uaBadge">unknown</span>
+          </div>
+          <label class="field">
+            <span>User-Agent header</span>
+            <input id="cfgUa" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>Preset</span>
+            <div class="field-row">
+              <select id="uaPreset"></select>
+              <button class="btn btn-ghost btn-sm" id="useBrowserUa" title="Fill in the User-Agent of this browser">Use this browser</button>
+            </div>
+          </label>
+          <p class="option-hint">Must match the browser that issued the cf_clearance cookie.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>Download tuning</h3>
+          </div>
+          <label class="field">
+            <span>Concurrent fragments</span>
+            <div class="field-row stepper">
+              <button class="step-btn" id="cfgFragMinus" title="Decrease" aria-label="Decrease concurrent fragments">−</button>
+              <input id="cfgFrag" type="number" min="1" max="64" step="1" />
+              <button class="step-btn" id="cfgFragPlus" title="Increase" aria-label="Increase concurrent fragments">+</button>
+            </div>
+          </label>
+          <p class="option-hint">Number of parallel HLS fragment downloads in the native engine. 1–64.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>Environment</h3>
+          </div>
+          <div id="depList" class="dep-list"></div>
+        </div>
+      </div>
+
+      <div class="settings-actions">
+        <button class="btn btn-primary" id="saveConfig">Save configuration</button>
+        <button class="btn btn-ghost" id="reloadConfig">Discard changes</button>
+        <span class="save-hint" id="saveHint"></span>
+      </div>
+
+      <div class="card danger-zone">
+        <div class="card-head"><h3>Maintenance</h3></div>
+        <div class="settings-actions no-margin">
+          <button class="btn btn-ghost" id="clearLogs">Clear activity log</button>
+          <button class="btn btn-ghost" id="copyConfig">Copy config.json</button>
+        </div>
+        <div class="settings-actions" style="margin-top: 10px;">
+          <button class="btn btn-danger" id="shutdownBtnSettings" style="width: 100%;">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: -2px; margin-right: 6px;" aria-hidden="true">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+              <line x1="12" y1="2" x2="12" y2="12"></line>
+            </svg>
+            Shut down PaheFlow
+          </button>
+        </div>
+      </div>
+    </section>
+
+    </div><!-- /.content -->
+
+  <!-- ─────────────────────────────  ACTIVITY  ───────────────────────────── -->
+  <aside class="activity" id="activityPanel">
+    <div class="activity-head">
+      <h3>Activity</h3>
+      <div class="activity-head-actions">
+        <button class="btn btn-ghost btn-sm" id="clearLogsTop" title="Clear the log">Clear</button>
+        <button class="btn btn-ghost btn-sm" id="copyLogs" title="Copy the log">Copy</button>
+        <button class="btn btn-ghost btn-sm btn-icon" id="closeActivity" title="Hide activity panel" aria-label="Close activity panel">✕</button>
+      </div>
+    </div>
+
+    <div class="progress-block">
+      <div class="progress-head">
+        <span id="progressLabel">Idle</span>
+        <span id="progressPercent" class="progress-percent">—</span>
+      </div>
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-meta">
+        <span id="progressEpisode"></span>
+        <span id="progressSpeed"></span>
+        <span id="progressEta"></span>
+      </div>
+      <div class="ep-status" id="epStatus"></div>
+    </div>
+
+    <div class="playlist-block hidden" id="playlistBlock">
+      <div class="playlist-head">
+        <h4>Playlist links</h4>
+        <button class="btn btn-ghost btn-sm" id="copyPlaylists">Copy all</button>
+      </div>
+      <div id="playlistList"></div>
+    </div>
+
+    <div class="log-head">
+      <div class="log-filters">
+        <button class="chip is-active" data-level="all">All</button>
+        <button class="chip" data-level="info">Info</button>
+        <button class="chip" data-level="warn">Warn</button>
+        <button class="chip" data-level="error">Error</button>
+        <button class="chip" data-level="debug">Debug</button>
+      </div>
+      <label class="autoscroll">
+        <input type="checkbox" id="autoscroll" checked />
+        <span>Follow</span>
+      </label>
+    </div>
+
+    <div class="logs" id="logs"></div>
+  </aside>
+
+  </main>
+
+  <!-- ─────────────────────────────  ACTION BAR  ───────────────────────────── -->
+  <footer class="actionbar">
+    <div class="action-summary">
+      <div class="action-item">
+        <span class="action-label">Anime</span>
+        <span class="action-value" id="actionAnime">—</span>
+      </div>
+      <div class="action-item">
+        <span class="action-label">Episodes</span>
+        <span class="action-value" id="actionEpisodes">—</span>
+      </div>
+      <div class="action-item">
+        <span class="action-label">Quality</span>
+        <span class="action-value" id="actionQuality">Auto</span>
+      </div>
+    </div>
+    <div class="action-buttons">
+      <button class="btn btn-ghost" id="stopBtn" disabled>Stop</button>
+      <button class="btn btn-primary btn-lg" id="startBtn" disabled>Start download</button>
+    </div>
+  </footer>
+
+</div>
+
+<!-- In-App Cloudflare Solver Modal -->
+<div id="cfSolverModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <div class="modal-icon">🛡️</div>
+    <h2>Cloudflare Human Verification</h2>
+    <p id="cfSolverDesc">
+      AnimePahe is protected by Cloudflare. Click the button below to open AnimePahe in Firefox.
+      Once you check the "Verify you are human" box in Firefox, the app will <strong>automatically capture the cookie and connect</strong>!
+    </p>
+    <div class="cf-status-box" id="cfSolverStatus">
+      <span class="spinner-sm hidden" id="cfSolverSpinner"></span>
+      <span id="cfSolverStatusText">Ready to verify</span>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="cfStartSolverBtn">🚀 Solve Cloudflare in Firefox</button>
+      <button class="btn btn-ghost" id="cfCancelSolverBtn">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Shutdown Confirmation Modal -->
+<div id="shutdownModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <div class="modal-icon" style="margin-bottom: 0.75rem; color: var(--err, #ff4c6a);">
+      <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+        <line x1="12" y1="2" x2="12" y2="12"></line>
+      </svg>
+    </div>
+    <h2>Shut down PaheFlow?</h2>
+    <p>
+      This will safely stop any active downloads and terminate the background server.
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-danger" id="confirmShutdownBtn">Shut down</button>
+      <button class="btn btn-ghost" id="cancelShutdownBtn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

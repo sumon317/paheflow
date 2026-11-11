@@ -2,9 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 <meta name="app-token" content="__APP_TOKEN__" />
-<title>AnimePahe GUI</title>
+<title>PaheFlow</title>
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg" />
+<link rel="alternate icon" type="image/png" href="/static/icon.png" />
 <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -14,7 +16,7 @@
     <div class="brand">
       <div class="logo" aria-hidden="true"></div>
       <div class="brand-text">
-        <h1>AnimePahe</h1>
+        <h1>PaheFlow</h1>
         <span>local downloader</span>
       </div>
     </div>
@@ -22,11 +24,11 @@
     <nav class="tabs" role="tablist">
       <button class="tab is-active" data-tab="browse" role="tab">Browse</button>
       <button class="tab" data-tab="episodes" role="tab">Episodes</button>
-      <button class="tab" data-tab="library" role="tab">Library</button>
       <button class="tab" data-tab="settings" role="tab">Settings</button>
     </nav>
 
     <div class="topbar-right">
+      <button class="btn btn-ghost btn-sm" id="topbarSolveCf" title="Solve Cloudflare verification challenge in a compact window">🛡️ Solve Cloudflare</button>
       <label class="theme-select" title="Color theme">
         <select id="themeSelect" aria-label="Color theme">
           <option value="midnight">Midnight</option>
@@ -44,6 +46,12 @@
       <button class="btn btn-ghost btn-icon" id="toggleActivity" title="Show / hide activity panel" aria-label="Toggle activity panel">
         <span class="pulse-icon" aria-hidden="true"></span>
       </button>
+      <button class="btn btn-ghost btn-icon shutdown-icon-btn" id="shutdownBtnTop" title="Shut down PaheFlow" aria-label="Shut down app">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+          <line x1="12" y1="2" x2="12" y2="12"></line>
+        </svg>
+      </button>
     </div>
   </header>
 
@@ -55,9 +63,20 @@
       <div class="banner-body">
         <strong>animepahe.pw is refusing the requests.</strong>
         <span id="cookieBannerText">The cf_clearance cookie is missing or expired.</span>
-        <button class="btn btn-primary btn-sm" id="bannerSettings">Open settings</button>
+        <button class="btn btn-primary btn-sm" id="bannerSolveCookie">🛡️ Solve Cloudflare</button>
+        <button class="btn btn-ghost btn-sm" id="bannerSettings">Open settings</button>
       </div>
       <button class="banner-close" id="bannerClose" title="Dismiss">✕</button>
+    </div>
+
+    <div class="banner hidden" id="storagePermissionBanner" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.1);">
+      <div class="banner-icon" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b;">📁</div>
+      <div class="banner-body">
+        <strong>Storage permission needed to save downloads</strong>
+        <span id="storagePermissionBannerText">Grant "All files access" so PaheFlow can save videos directly to <code>Downloads/PaheFlow</code> without storage errors.</span>
+        <button class="btn btn-primary btn-sm" id="grantStoragePermBtn" style="background: #f59e0b; border-color: #f59e0b; color: #000; font-weight: 600;">📁 Grant Permission</button>
+      </div>
+      <button class="banner-close" id="storagePermClose" title="Dismiss">✕</button>
     </div>
 
     <!-- ─────────────────────────────  BROWSE  ───────────────────────────── -->
@@ -109,6 +128,11 @@
 
       <div class="ep-toolbar">
         <input id="epFilter" type="search" placeholder="Filter episodes…" autocomplete="off" />
+        <div class="segmented ep-audio-seg" id="epAudioSegmented" role="group" aria-label="Audio filter">
+          <button class="seg is-active" data-audio="" id="btnAudioAll" title="Show all episodes">All</button>
+          <button class="seg" data-audio="sub" id="btnAudioSub" title="Filter to Japanese Sub episodes">Sub</button>
+          <button class="seg" data-audio="dub" id="btnAudioDub" title="Filter to English Dub episodes">Dub</button>
+        </div>
         <div class="toolbar-buttons">
           <button class="btn btn-ghost btn-sm" data-ep="all">All</button>
           <button class="btn btn-ghost btn-sm" data-ep="none">None</button>
@@ -144,20 +168,12 @@
           <label for="optAudio">Audio language</label>
           <div class="option-control">
             <select id="optAudio">
-              <option value="">Default</option>
+              <option value="">Default (All)</option>
+              <option value="jpn">Japanese (Sub)</option>
+              <option value="eng">English (Dub)</option>
             </select>
           </div>
-          <p class="option-hint" id="audioHint">Empty = the source's own audio track.</p>
-        </div>
-
-        <div class="option">
-          <label for="optFragments">Concurrent fragments</label>
-          <div class="option-control stepper">
-            <button class="step-btn" id="fragMinus" title="Decrease concurrent fragments" aria-label="Decrease concurrent fragments">−</button>
-            <input id="optFragments" type="number" min="1" max="64" step="1" value="8" />
-            <button class="step-btn" id="fragPlus" title="Increase concurrent fragments" aria-label="Increase concurrent fragments">+</button>
-          </div>
-          <p class="option-hint">How many HLS fragments yt-dlp fetches at once. Higher = faster, more bandwidth.</p>
+          <p class="option-hint" id="audioHint">Selecting Dub or Sub filters the catalogue to available episodes.</p>
         </div>
 
         <div class="option">
@@ -166,17 +182,17 @@
             <label class="switch">
               <input type="checkbox" id="optListOnly" />
               <span class="switch-track"><span class="switch-thumb"></span></span>
-              <span class="switch-label">Playlist link only <em>(-l)</em></span>
+              <span class="switch-label">Playlist link only</span>
             </label>
             <label class="switch">
               <input type="checkbox" id="optDebug" />
               <span class="switch-track"><span class="switch-thumb"></span></span>
-              <span class="switch-label">Debug mode <em>(-d)</em></span>
+              <span class="switch-label">Debug mode</span>
             </label>
             <label class="switch">
               <input type="checkbox" id="optReplace" />
               <span class="switch-track"><span class="switch-thumb"></span></span>
-              <span class="switch-label">Replace existing <em>(-R)</em></span>
+              <span class="switch-label">Replace existing</span>
             </label>
           </div>
           <p class="option-hint">"Playlist link only" resolves the m3u8 without downloading the video. "Replace existing" downloads a fresh copy to a temporary file and swaps it in only after success; off skips episodes you already have.</p>
@@ -184,26 +200,9 @@
       </div>
 
       <div class="command-preview">
-        <span class="command-label">Command</span>
-        <code id="commandPreview">./animepahe-dl.sh -s <slug> -e *</code>
+        <span class="command-label">Job summary</span>
+        <code id="commandPreview">Select an anime to preview the job</code>
         <button class="btn btn-ghost btn-sm" id="copyCommand">Copy</button>
-      </div>
-    </section>
-
-    <!-- ────────────────────────────  LIBRARY  ──────────────────────────── -->
-    <section class="panel" id="panel-library">
-      <div class="panel-head">
-        <div>
-          <h2>Downloaded episodes</h2>
-          <p class="panel-sub" id="libraryMeta">Nothing scanned yet.</p>
-        </div>
-        <div class="panel-actions">
-          <button class="btn btn-ghost" id="rescanLibrary">Rescan</button>
-          <button class="btn btn-ghost" id="openLibraryFolder">Open folder</button>
-        </div>
-      </div>
-      <div id="libraryList">
-        <div class="empty"><p class="empty-title">No downloaded episodes yet</p></div>
       </div>
     </section>
 
@@ -257,8 +256,9 @@
           </li>
         </ol>
         <div class="setup-actions">
+          <button class="btn btn-primary" id="setupAutoDetect">✨ Auto-Detect from Browser</button>
           <button class="btn btn-ghost" id="setupUseBrowserUa">Use this browser's User-Agent</button>
-          <button class="btn btn-primary" id="setupSaveTest">Save &amp; test connection</button>
+          <button class="btn btn-ghost" id="setupSaveTest">Save &amp; test connection</button>
         </div>
         <p class="option-hint" id="setupHint"></p>
       </div>
@@ -279,7 +279,7 @@
           </label>
           <p class="option-hint">
             Choosing a folder saves it immediately and makes it the default for future
-            downloads. Existing files are not moved. The Library scans this folder.
+            downloads. Existing files are not moved.
           </p>
         </div>
 
@@ -292,6 +292,7 @@
             <span>cf_clearance cookie</span>
             <div class="field-row">
               <input id="cfgCf" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the cf_clearance cookie value" />
+              <button class="btn btn-outline btn-sm" id="autoDetectCf" title="Automatically read Cloudflare cookie from your local browser">✨ Auto-Detect</button>
               <button class="btn btn-ghost btn-sm" id="pasteCf" title="Paste from clipboard">Paste</button>
               <button class="btn btn-ghost btn-sm" id="toggleCf" title="Show / hide">Show</button>
               <button class="btn btn-ghost btn-sm" id="clearCf" title="Delete the stored cookie">Clear</button>
@@ -341,7 +342,7 @@
               <button class="step-btn" id="cfgFragPlus" title="Increase" aria-label="Increase concurrent fragments">+</button>
             </div>
           </label>
-          <p class="option-hint">Used by yt-dlp <code>--concurrent-fragments</code>. 1–64.</p>
+          <p class="option-hint">Number of parallel HLS fragment downloads in the native engine. 1–64.</p>
         </div>
 
         <div class="card">
@@ -364,6 +365,15 @@
           <button class="btn btn-ghost" id="clearLogs">Clear activity log</button>
           <button class="btn btn-ghost" id="copyConfig">Copy config.json</button>
         </div>
+        <div class="settings-actions" style="margin-top: 10px;">
+          <button class="btn btn-danger" id="shutdownBtnSettings" style="width: 100%;">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: -2px; margin-right: 6px;" aria-hidden="true">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+              <line x1="12" y1="2" x2="12" y2="12"></line>
+            </svg>
+            Shut down PaheFlow
+          </button>
+        </div>
       </div>
     </section>
 
@@ -376,6 +386,7 @@
       <div class="activity-head-actions">
         <button class="btn btn-ghost btn-sm" id="clearLogsTop" title="Clear the log">Clear</button>
         <button class="btn btn-ghost btn-sm" id="copyLogs" title="Copy the log">Copy</button>
+        <button class="btn btn-ghost btn-sm btn-icon" id="closeActivity" title="Hide activity panel" aria-label="Close activity panel">✕</button>
       </div>
     </div>
 
@@ -442,6 +453,46 @@
     </div>
   </footer>
 
+</div>
+
+<!-- In-App Cloudflare Solver Modal -->
+<div id="cfSolverModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <div class="modal-icon">🛡️</div>
+    <h2>Cloudflare Human Verification</h2>
+    <p id="cfSolverDesc">
+      AnimePahe is protected by Cloudflare. Click the button below to open AnimePahe in Firefox.
+      Once you check the "Verify you are human" box in Firefox, the app will <strong>automatically capture the cookie and connect</strong>!
+    </p>
+    <div class="cf-status-box" id="cfSolverStatus">
+      <span class="spinner-sm hidden" id="cfSolverSpinner"></span>
+      <span id="cfSolverStatusText">Ready to verify</span>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="cfStartSolverBtn">🚀 Solve Cloudflare in Firefox</button>
+      <button class="btn btn-ghost" id="cfCancelSolverBtn">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Shutdown Confirmation Modal -->
+<div id="shutdownModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal-card">
+    <div class="modal-icon" style="margin-bottom: 0.75rem; color: var(--err, #ff4c6a);">
+      <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+        <line x1="12" y1="2" x2="12" y2="12"></line>
+      </svg>
+    </div>
+    <h2>Shut down PaheFlow?</h2>
+    <p>
+      This will safely stop any active downloads and terminate the background server.
+    </p>
+    <div class="modal-actions">
+      <button class="btn btn-danger" id="confirmShutdownBtn">Shut down</button>
+      <button class="btn btn-ghost" id="cancelShutdownBtn">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <div class="toasts" id="toasts"></div>

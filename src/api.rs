@@ -1,0 +1,1075 @@
+use chrono::TimeZone;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
+
+use crate::client::HttpClient;
+use crate::config::{data_dir, resource_dir, AppConfig};
+
+pub const HOST: &str = "https://animepahe.pw";
+pub const API_URL: &str = "https://animepahe.pw/api";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchItem {
+    pub slug: String,
+    pub title: String,
+    pub r#type: String,
+    pub episodes: serde_json::Value,
+    pub status: String,
+    pub score: serde_json::Value,
+    pub year: serde_json::Value,
+    pub poster: String,
+    pub cover: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeItem {
+    pub episode: serde_json::Value,
+    pub audio: String,
+    pub created_at: String,
+    pub duration: String,
+    pub session: String,
+    pub episode2: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaySource {
+    pub url: String,
+    pub resolution: String,
+    pub audio: String,
+    pub av1: String,
+    pub kwik: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesize: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableOptions {
+    pub episode: serde_json::Value,
+    pub session: String,
+    pub resolutions: Vec<String>,
+    pub audios: Vec<String>,
+    pub combinations: Vec<serde_json::Value>,
+    pub source_count: usize,
+    #[serde(default)]
+    pub filesizes: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub slug: String,
+    pub title: String,
+}
+
+fn cache_dir() -> PathBuf {
+    let dir = data_dir().join("cache");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn cache_file(slug: &str) -> PathBuf {
+    let safe: String = slug
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    cache_dir().join(format!("{}.json", safe))
+}
+
+pub fn load_release_cache_with_meta(slug: &str) -> (Vec<EpisodeItem>, Option<i64>) {
+    let path = cache_file(slug);
+    if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            let saved_at = val.get("savedAt").and_then(|v| v.as_i64());
+            if let Some(items) = val.get("items") {
+                if let Ok(episodes) = serde_json::from_value::<Vec<EpisodeItem>>(items.clone()) {
+                    return (episodes, saved_at);
+                }
+            }
+        }
+    }
+    (Vec::new(), None)
+}
+
+pub fn cache_warning(error: &str, count: usize, saved_at: Option<i64>) -> String {
+    let when = saved_at
+        .and_then(|ts| chrono::Local.timestamp_opt(ts, 0).single())
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "an earlier run".to_string());
+    format!(
+        "Live episode fetch failed ({}). Showing {} cached episode(s) saved at {}.",
+        error, count, when
+    )
+}
+
+pub fn save_release_cache(slug: &str, episodes: &[EpisodeItem]) {
+    let path = cache_file(slug);
+    let payload = serde_json::json!({
+        "slug": slug,
+        "savedAt": chrono::Utc::now().timestamp(),
+        "items": episodes
+    });
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, payload.to_string()).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+fn options_cache_file(slug: &str, episode_num: &str) -> PathBuf {
+    let safe_slug: String = slug
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let safe_ep: String = episode_num
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    cache_dir().join(format!("{}.opts.{}.json", safe_slug, safe_ep))
+}
+
+pub fn load_options_cache(slug: &str, episode_num: &str) -> Option<AvailableOptions> {
+    let path = options_cache_file(slug, episode_num);
+    if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(opts) = serde_json::from_str::<AvailableOptions>(&content) {
+            return Some(opts);
+        }
+    }
+    None
+}
+
+pub fn save_options_cache(slug: &str, episode_num: &str, opts: &AvailableOptions) {
+    let path = options_cache_file(slug, episode_num);
+    if let Ok(content) = serde_json::to_string(opts) {
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, content).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
+pub async fn search(
+    client: &HttpClient,
+    query: &str,
+    cfg: &AppConfig,
+) -> Result<Vec<SearchItem>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!("{}/?m=search&q={}", API_URL, urlencoding::encode(trimmed));
+    let json = client.fetch_json(&url, None, cfg).await?;
+
+    let mut results = Vec::new();
+    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+        for item in data {
+            results.push(SearchItem {
+                slug: item
+                    .get("session")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                title: item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                r#type: item
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                episodes: item
+                    .get("episodes")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                status: item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                score: item
+                    .get("score")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                year: item.get("year").cloned().unwrap_or(serde_json::Value::Null),
+                poster: item
+                    .get("poster")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                cover: item
+                    .get("cover")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    Ok(results)
+}
+
+pub async fn release_page(
+    client: &HttpClient,
+    slug: &str,
+    page: u32,
+    cfg: &AppConfig,
+) -> Result<(Vec<EpisodeItem>, u32), String> {
+    let url = format!(
+        "{}/?m=release&id={}&sort=episode_asc&page={}",
+        API_URL,
+        urlencoding::encode(slug),
+        page.max(1)
+    );
+    let json = client.fetch_json(&url, None, cfg).await?;
+
+    let last_page = json
+        .get("last_page")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(1);
+
+    let mut items = Vec::new();
+    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+        for item in data {
+            items.push(EpisodeItem {
+                episode: item
+                    .get("episode")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                audio: item
+                    .get("audio")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                created_at: item
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                duration: item
+                    .get("duration")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                session: item
+                    .get("session")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                episode2: item
+                    .get("episode2")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+        }
+    }
+
+    Ok((items, last_page))
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseList {
+    pub items: Vec<EpisodeItem>,
+    pub stale: bool,
+    pub warning: Option<String>,
+}
+
+pub async fn release_with_status(
+    client: &HttpClient,
+    slug: &str,
+    cfg: &AppConfig,
+) -> Result<ReleaseList, String> {
+    let mut all_episodes = Vec::new();
+    let mut seen_sessions = HashSet::new();
+
+    let (first_items, last_page) = match release_page(client, slug, 1, cfg).await {
+        Ok(res) => res,
+        Err(err) => {
+            let (cached, saved_at) = load_release_cache_with_meta(slug);
+            if !cached.is_empty() {
+                let warning = cache_warning(&err, cached.len(), saved_at);
+                return Ok(ReleaseList {
+                    items: cached,
+                    stale: true,
+                    warning: Some(warning),
+                });
+            }
+            return Err(err);
+        }
+    };
+
+    for item in first_items {
+        if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
+            all_episodes.push(item);
+        }
+    }
+
+    let mut page_errors = Vec::new();
+    const MAX_RELEASE_PAGES: u32 = 200;
+    if last_page > MAX_RELEASE_PAGES {
+        page_errors.push(format!(
+            "only the first {} of {} pages were fetched",
+            MAX_RELEASE_PAGES, last_page
+        ));
+    }
+
+    for page in 2..=last_page.min(MAX_RELEASE_PAGES) {
+        match release_page(client, slug, page, cfg).await {
+            Ok((page_items, _)) => {
+                for item in page_items {
+                    if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
+                        all_episodes.push(item);
+                    }
+                }
+            }
+            Err(err) => page_errors.push(format!("page {}: {}", page, err)),
+        }
+    }
+
+    // Never replace a complete cached list with a partial one.
+    if page_errors.is_empty() {
+        save_release_cache(slug, &all_episodes);
+    }
+
+    Ok(ReleaseList {
+        items: all_episodes,
+        stale: false,
+        warning: if page_errors.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Some episode pages could not be loaded ({}). The list may be incomplete and was not cached.",
+                page_errors.join("; ")
+            ))
+        },
+    })
+}
+
+pub async fn release(
+    client: &HttpClient,
+    slug: &str,
+    cfg: &AppConfig,
+) -> Result<Vec<EpisodeItem>, String> {
+    Ok(release_with_status(client, slug, cfg).await?.items)
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else {
+        format!("{:.0} MB", (bytes as f64 / MB as f64).round())
+    }
+}
+
+pub fn normalize_size_string(size: &str) -> String {
+    let clean = size
+        .trim()
+        .trim_matches(|c| c == '(' || c == ')' || c == '[' || c == ']');
+    if let Ok(re) = Regex::new(r#"(?i)(\d+(?:\.\d+)?)\s*(MB|GB|KB)"#) {
+        if let Some(caps) = re.captures(clean) {
+            let val = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let unit = caps
+                .get(2)
+                .map(|m| m.as_str().to_uppercase())
+                .unwrap_or_default();
+            return format!("{} {}", val, unit);
+        }
+    }
+    clean.to_string()
+}
+
+pub fn parse_sources_from_html(html: &str) -> Vec<PlaySource> {
+    let btn_re = Regex::new(r#"(?i)<button\b([^>]*)>"#).ok();
+    let attr_re = Regex::new(r#"(?i)data-(src|resolution|audio|av1)\s*=\s*"([^"]*)""#).ok();
+    let size_re = Regex::new(r#"(?i)(\d+(?:\.\d+)?)\s*(MB|GB|KB)"#).ok();
+    let res_re = Regex::new(r#"(?i)\b(360|480|720|1080)p?\b"#).ok();
+    let audio_re = Regex::new(r#"(?i)\b(eng|dub|jpn|sub)\b"#).ok();
+
+    let mut sources = Vec::new();
+
+    // 1. Parse streaming buttons on the player page
+    if let (Some(btn_re), Some(attr_re)) = (&btn_re, &attr_re) {
+        for cap in btn_re.captures_iter(html) {
+            let tag_attrs = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let inner_text = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
+
+            let mut src = String::new();
+            let mut resolution = String::new();
+            let mut audio = String::new();
+            let mut av1 = String::from("0");
+
+            for attr_cap in attr_re.captures_iter(tag_attrs) {
+                let key = attr_cap
+                    .get(1)
+                    .map(|m| m.as_str().to_lowercase())
+                    .unwrap_or_default();
+                let val = attr_cap
+                    .get(2)
+                    .map(|m| m.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                match key.as_str() {
+                    "src" => src = val,
+                    "resolution" => resolution = val,
+                    "audio" => audio = val,
+                    "av1" => av1 = val,
+                    _ => {}
+                }
+            }
+
+            let mut filesize = None;
+            if let Some(ref sz_re) = size_re {
+                if let Some(m) = sz_re
+                    .captures(inner_text)
+                    .or_else(|| sz_re.captures(tag_attrs))
+                {
+                    if let Some(sz) = m.get(0) {
+                        filesize = Some(normalize_size_string(sz.as_str()));
+                    }
+                }
+            }
+
+            if !src.is_empty() && av1 != "1" {
+                let is_kwik = src.contains("kwik");
+                sources.push(PlaySource {
+                    url: src,
+                    resolution,
+                    audio,
+                    av1,
+                    kwik: is_kwik,
+                    filesize,
+                });
+            }
+        }
+    }
+
+    // 2. Parse download links from #pickDownload or dropdown items
+    // e.g. <a href="https://pahe.win/..." class="dropdown-item" target="_blank">Show - 720p (145MB)</a>
+    if let (Some(res_re), Some(size_re)) = (&res_re, &size_re) {
+        if let Ok(a_re) = Regex::new(r#"(?i)<a\b([^>]*)>(.*?)</a>"#) {
+            if let Ok(href_re) = Regex::new(r#"(?i)href\s*=\s*"([^"]*)""#) {
+                for cap in a_re.captures_iter(html) {
+                    let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+                    let text = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
+
+                    let is_download_link = attrs.contains("dropdown-item")
+                        || attrs.contains("pahe.win")
+                        || text.contains("MB")
+                        || text.contains("GB");
+
+                    if !is_download_link {
+                        continue;
+                    }
+
+                    let href = href_re
+                        .captures(attrs)
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
+
+                    let res = res_re
+                        .captures(text)
+                        .and_then(|c| c.get(1))
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
+
+                    let size = size_re
+                        .captures(text)
+                        .and_then(|c| c.get(0))
+                        .map(|m| normalize_size_string(m.as_str()));
+
+                    let audio_tag = audio_re.as_ref().and_then(|a_re| {
+                        a_re.captures(text).and_then(|c| c.get(1)).map(|m| {
+                            let l = m.as_str().to_lowercase();
+                            if l == "dub" || l == "eng" {
+                                "eng".to_string()
+                            } else {
+                                "jpn".to_string()
+                            }
+                        })
+                    });
+
+                    if let Some(ref sz) = size {
+                        let mut matched = false;
+                        for s in sources.iter_mut() {
+                            let res_match = res.is_empty() || s.resolution == res;
+                            let audio_match = match &audio_tag {
+                                Some(a) => s.audio.eq_ignore_ascii_case(a) || s.audio.is_empty(),
+                                None => true,
+                            };
+                            if res_match && audio_match {
+                                if s.filesize.is_none() {
+                                    s.filesize = Some(sz.clone());
+                                }
+                                matched = true;
+                            }
+                        }
+                        if !matched && !res.is_empty() && !href.is_empty() {
+                            let is_kwik = href.contains("kwik");
+                            sources.push(PlaySource {
+                                url: href,
+                                resolution: res,
+                                audio: audio_tag.unwrap_or_else(|| "jpn".to_string()),
+                                av1: String::from("0"),
+                                kwik: is_kwik,
+                                filesize: Some(sz.clone()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sources
+}
+
+pub async fn play_sources(
+    client: &HttpClient,
+    slug: &str,
+    session: &str,
+    cfg: &AppConfig,
+) -> Result<Vec<PlaySource>, String> {
+    let url = format!(
+        "{}/play/{}/{}",
+        HOST,
+        urlencoding::encode(slug),
+        urlencoding::encode(session)
+    );
+    let html = client.fetch(&url, None, cfg).await?;
+
+    let mut sources = parse_sources_from_html(&html);
+
+    // Fallback: If no filesizes were extracted, query the links API: api?m=links&id={session}&p=kwik
+    if sources.iter().all(|s| s.filesize.is_none()) {
+        let links_url = format!(
+            "{}/api?m=links&id={}&p=kwik",
+            HOST,
+            urlencoding::encode(session)
+        );
+        if let Ok(json_str) = client.fetch(&links_url, Some(&url), cfg).await {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if let Some(data) = val.get("data").and_then(|v| v.as_array()) {
+                    for item in data {
+                        if let Some(obj) = item.as_object() {
+                            for (res_key, sub_val) in obj {
+                                let res = res_key.trim();
+                                let audio = sub_val
+                                    .get("audio")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("jpn");
+                                let size_str = sub_val
+                                    .get("filesize")
+                                    .and_then(|v| v.as_u64())
+                                    .map(format_bytes);
+                                let kwik_url = sub_val
+                                    .get("kwik")
+                                    .or_else(|| sub_val.get("kwik_pahewin"))
+                                    .and_then(|v| v.as_str());
+
+                                let mut matched = false;
+                                for s in sources.iter_mut() {
+                                    if s.resolution == res
+                                        && (s.audio == audio
+                                            || s.audio.is_empty()
+                                            || audio.is_empty())
+                                    {
+                                        if s.filesize.is_none() {
+                                            s.filesize = size_str.clone();
+                                        }
+                                        matched = true;
+                                    }
+                                }
+                                if !matched {
+                                    if let Some(kurl) = kwik_url {
+                                        sources.push(PlaySource {
+                                            url: kurl.to_string(),
+                                            resolution: res.to_string(),
+                                            audio: audio.to_string(),
+                                            av1: String::from("0"),
+                                            kwik: kurl.contains("kwik"),
+                                            filesize: size_str,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(sources)
+}
+
+pub async fn available_options(
+    client: &HttpClient,
+    slug: &str,
+    episode_num: &str,
+    cfg: &AppConfig,
+) -> Result<AvailableOptions, String> {
+    let episodes = match release(client, slug, cfg).await {
+        Ok(eps) => eps,
+        Err(e) => {
+            let (cached_eps, _) = load_release_cache_with_meta(slug);
+            if !cached_eps.is_empty() {
+                cached_eps
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    let target = episodes
+        .iter()
+        .find(|e| {
+            let ep_str = match &e.episode {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            ep_str == episode_num
+                || ep_str.trim_start_matches('0') == episode_num.trim_start_matches('0')
+        })
+        .ok_or_else(|| format!("Episode {} not found for this anime", episode_num))?;
+
+    let sources = match play_sources(client, slug, &target.session, cfg).await {
+        Ok(s) => s,
+        Err(err) => {
+            if let Some(cached) = load_options_cache(slug, episode_num) {
+                return Ok(cached);
+            }
+            return Err(err);
+        }
+    };
+
+    let mut resolutions_set = HashSet::new();
+    let mut audios_set = HashSet::new();
+    let mut combinations = Vec::new();
+    let mut seen_pairs = HashSet::new();
+    let mut filesizes = HashMap::new();
+
+    for s in &sources {
+        if !s.resolution.is_empty() {
+            resolutions_set.insert(s.resolution.clone());
+            if let Some(ref sz) = s.filesize {
+                filesizes
+                    .entry(s.resolution.clone())
+                    .or_insert_with(|| sz.clone());
+            }
+        }
+        if !s.audio.is_empty() {
+            audios_set.insert(s.audio.clone());
+        }
+        let pair = (s.resolution.clone(), s.audio.clone());
+        if !s.resolution.is_empty() && seen_pairs.insert(pair) {
+            let mut combo = serde_json::json!({
+                "resolution": s.resolution,
+                "audio": s.audio
+            });
+            if let Some(ref sz) = s.filesize {
+                combo["filesize"] = serde_json::Value::String(sz.clone());
+            }
+            combinations.push(combo);
+        }
+    }
+
+    let mut resolutions: Vec<String> = resolutions_set.into_iter().collect();
+    resolutions.sort_by(|a, b| {
+        let an: u32 = a.parse().unwrap_or(0);
+        let bn: u32 = b.parse().unwrap_or(0);
+        bn.cmp(&an)
+    });
+
+    let mut audios: Vec<String> = audios_set.into_iter().collect();
+    audios.sort();
+
+    let res = AvailableOptions {
+        episode: target.episode.clone(),
+        session: target.session.clone(),
+        resolutions,
+        audios,
+        combinations,
+        source_count: sources.len(),
+        filesizes,
+    };
+
+    save_options_cache(slug, episode_num, &res);
+
+    Ok(res)
+}
+
+pub fn catalog_path() -> PathBuf {
+    let dir = data_dir();
+    let _ = fs::create_dir_all(&dir);
+    dir.join("anime.list")
+}
+
+fn ensure_catalog_seeded() {
+    let path = catalog_path();
+    if path.exists() {
+        return;
+    }
+    let bundled = resource_dir().join("anime.list");
+    if bundled.is_file() && bundled != path {
+        let _ = fs::copy(&bundled, &path);
+    }
+}
+
+pub fn catalog() -> Vec<CatalogEntry> {
+    ensure_catalog_seeded();
+    let path = catalog_path();
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(raw) = fs::read_to_string(&path) {
+        let line_re = Regex::new(r#"^\[([^\]]+)\]\s*(.*?)\s*$"#).unwrap();
+        for line in raw.lines() {
+            if let Some(caps) = line_re.captures(line.trim()) {
+                let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+                if !slug.is_empty() && seen.insert(slug.to_string()) {
+                    entries.push(CatalogEntry {
+                        slug: slug.to_string(),
+                        title: title.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    entries
+}
+
+pub fn title_for_slug(slug: &str) -> String {
+    for entry in catalog() {
+        if entry.slug == slug {
+            return entry.title;
+        }
+    }
+    String::new()
+}
+
+fn catalog_line(slug: &str, title: &str) -> String {
+    let title = title.replace(['\r', '\n'], " ");
+    format!("[{}] {}   \n", slug, title.trim())
+}
+
+fn write_catalog_atomic(content: &str) -> Result<(), String> {
+    let path = catalog_path();
+    let tmp = path.with_extension("list.tmp");
+    fs::write(&tmp, content).map_err(|e| format!("Cannot write anime.list: {}", e))?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Cannot replace anime.list: {}", e));
+    }
+    Ok(())
+}
+
+pub fn ensure_entry(slug: &str, title: &str) {
+    let path = catalog_path();
+    let current = catalog();
+    if current.iter().any(|e| e.slug == slug) {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(catalog_line(slug, title).as_bytes());
+    }
+}
+
+pub fn update_slug_in_catalog(old_slug: &str, new_slug: &str, title: &str) {
+    let mut current = catalog();
+
+    // Remove old_slug or existing duplicate entries for the same title
+    current.retain(|e| {
+        e.slug != old_slug && !(e.title.eq_ignore_ascii_case(title) && e.slug != new_slug)
+    });
+
+    if !current.iter().any(|e| e.slug == new_slug) {
+        current.push(CatalogEntry {
+            slug: new_slug.to_string(),
+            title: title.to_string(),
+        });
+    }
+
+    let mut content = String::with_capacity(current.len() * 80);
+    for e in &current {
+        content.push_str(&catalog_line(&e.slug, &e.title));
+    }
+    let _ = write_catalog_atomic(&content);
+}
+
+pub async fn refresh_catalog(
+    client: &HttpClient,
+    cfg: &AppConfig,
+) -> Result<Vec<CatalogEntry>, String> {
+    let url = format!("{}/anime", HOST);
+    let html = client.fetch(&url, None, cfg).await?;
+    let anchor_re = Regex::new(r#"<a\s+href="/anime/([0-9a-fA-F-]+)"[^>]*title="([^"]*)""#)
+        .map_err(|e| e.to_string())?;
+
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for caps in anchor_re.captures_iter(&html) {
+        let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        if !slug.is_empty() && seen.insert(slug.to_string()) {
+            entries.push(CatalogEntry {
+                slug: slug.to_string(),
+                title: title.to_string(),
+            });
+        }
+    }
+
+    if entries.is_empty() {
+        return Err(
+            "Could not read anime listing — the cf_clearance cookie may be expired.".to_string(),
+        );
+    }
+
+    let mut content = String::with_capacity(entries.len() * 80);
+    for e in &entries {
+        content.push_str(&catalog_line(&e.slug, &e.title));
+    }
+    write_catalog_atomic(&content)?;
+
+    Ok(entries)
+}
+
+pub async fn resolve_active_slug(
+    client: &HttpClient,
+    slug: &str,
+    preferred_title: Option<&str>,
+    cfg: &AppConfig,
+) -> Option<String> {
+    let title = match preferred_title {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => title_for_slug(slug),
+    };
+    if title.is_empty() {
+        return None;
+    }
+    if let Ok(results) = search(client, &title, cfg).await {
+        for res in results {
+            if res.title.trim().eq_ignore_ascii_case(title.trim())
+                || res.title.to_lowercase().starts_with(&title.to_lowercase())
+                || title.to_lowercase().starts_with(&res.title.to_lowercase())
+            {
+                let new_slug = res.slug;
+                if !new_slug.is_empty() && new_slug != slug {
+                    update_slug_in_catalog(slug, &new_slug, &title);
+                    return Some(new_slug);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn detect_available_audios(items: &[EpisodeItem]) -> Vec<String> {
+    let mut audios = vec!["jpn".to_string()];
+    let has_eng = items
+        .iter()
+        .any(|it| it.audio.eq_ignore_ascii_case("eng") || it.audio.eq_ignore_ascii_case("dub"));
+
+    if has_eng {
+        audios.push("eng".to_string());
+    }
+    audios
+}
+
+pub fn filter_episodes_by_audio(items: &[EpisodeItem], audio_filter: &str) -> Vec<EpisodeItem> {
+    let norm = audio_filter.trim().to_lowercase();
+    if norm.is_empty() || norm == "all" || norm == "default" {
+        return items.to_vec();
+    }
+
+    match norm.as_str() {
+        "dub" | "eng" => items
+            .iter()
+            .filter(|it| {
+                it.audio.eq_ignore_ascii_case("eng") || it.audio.eq_ignore_ascii_case("dub")
+            })
+            .cloned()
+            .collect(),
+        "sub" | "jpn" => {
+            // Japanese Sub is universally available for all anime episodes
+            items.to_vec()
+        }
+        other => items
+            .iter()
+            .filter(|it| it.audio.eq_ignore_ascii_case(other))
+            .cloned()
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_lines_stay_single_line() {
+        let line = catalog_line("slug-1", "Title\nwith\rbreaks");
+        assert_eq!(line.matches('\n').count(), 1);
+        assert!(line.starts_with("[slug-1] Title with breaks"));
+    }
+
+    #[test]
+    fn filter_episodes_by_audio_handles_mixed_releases() {
+        let items = vec![
+            EpisodeItem {
+                episode: serde_json::json!(1),
+                audio: "eng".to_string(),
+                created_at: String::new(),
+                duration: String::new(),
+                session: "s1".to_string(),
+                episode2: serde_json::json!(0),
+            },
+            EpisodeItem {
+                episode: serde_json::json!(2),
+                audio: "eng".to_string(),
+                created_at: String::new(),
+                duration: String::new(),
+                session: "s2".to_string(),
+                episode2: serde_json::json!(0),
+            },
+            EpisodeItem {
+                episode: serde_json::json!(3),
+                audio: "eng".to_string(),
+                created_at: String::new(),
+                duration: String::new(),
+                session: "s3".to_string(),
+                episode2: serde_json::json!(0),
+            },
+            EpisodeItem {
+                episode: serde_json::json!(4),
+                audio: "jpn".to_string(),
+                created_at: String::new(),
+                duration: String::new(),
+                session: "s4".to_string(),
+                episode2: serde_json::json!(0),
+            },
+            EpisodeItem {
+                episode: serde_json::json!(5),
+                audio: "jpn".to_string(),
+                created_at: String::new(),
+                duration: String::new(),
+                session: "s5".to_string(),
+                episode2: serde_json::json!(0),
+            },
+        ];
+
+        let audios = detect_available_audios(&items);
+        assert_eq!(audios, vec!["jpn", "eng"]);
+
+        // Dub should only show the 3 dub episodes
+        let dub = filter_episodes_by_audio(&items, "dub");
+        assert_eq!(dub.len(), 3);
+        assert_eq!(dub[0].session, "s1");
+        assert_eq!(dub[1].session, "s2");
+        assert_eq!(dub[2].session, "s3");
+
+        let eng = filter_episodes_by_audio(&items, "eng");
+        assert_eq!(eng.len(), 3);
+
+        // Sub should include all episodes since original show is Japanese
+        let sub = filter_episodes_by_audio(&items, "sub");
+        assert_eq!(sub.len(), 5);
+
+        // "all" should return all
+        let all = filter_episodes_by_audio(&items, "all");
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn filter_episodes_by_audio_sub_only_anime() {
+        let items = vec![EpisodeItem {
+            episode: serde_json::json!(1),
+            audio: "jpn".to_string(),
+            created_at: String::new(),
+            duration: String::new(),
+            session: "s1".to_string(),
+            episode2: serde_json::json!(0),
+        }];
+
+        assert_eq!(detect_available_audios(&items), vec!["jpn"]);
+        assert_eq!(filter_episodes_by_audio(&items, "dub").len(), 0);
+        assert_eq!(filter_episodes_by_audio(&items, "sub").len(), 1);
+    }
+
+    #[test]
+    fn filter_episodes_by_audio_fully_dubbed_anime() {
+        // Many popular anime on AnimePahe (Solo Leveling, AOT, Demon Slayer) have all episodes marked "eng"
+        let items = vec![
+            EpisodeItem {
+                episode: serde_json::json!(1),
+                audio: "eng".to_string(),
+                created_at: String::new(),
+                duration: String::new(),
+                session: "s1".to_string(),
+                episode2: serde_json::json!(0),
+            },
+            EpisodeItem {
+                episode: serde_json::json!(2),
+                audio: "eng".to_string(),
+                created_at: String::new(),
+                duration: String::new(),
+                session: "s2".to_string(),
+                episode2: serde_json::json!(0),
+            },
+        ];
+
+        // Both JPN and ENG must be available!
+        assert_eq!(detect_available_audios(&items), vec!["jpn", "eng"]);
+        // Dub returns both episodes
+        assert_eq!(filter_episodes_by_audio(&items, "dub").len(), 2);
+        // Sub ALSO returns both episodes (not 0!)
+        assert_eq!(filter_episodes_by_audio(&items, "sub").len(), 2);
+    }
+
+    #[test]
+    fn formats_bytes_and_normalizes_size_strings() {
+        assert_eq!(format_bytes(1024 * 1024), "1 MB");
+        assert_eq!(format_bytes(152043520), "145 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 2), "2.0 GB");
+
+        assert_eq!(normalize_size_string("720p (145MB)"), "145 MB");
+        assert_eq!(normalize_size_string("1080p (285 MB)"), "285 MB");
+        assert_eq!(normalize_size_string("(1.2GB)"), "1.2 GB");
+        assert_eq!(normalize_size_string("65MB"), "65 MB");
+    }
+
+    #[test]
+    fn parses_sources_and_filesizes_from_html() {
+        let html = r#"
+            <div id="resolutionMenu">
+                <button type="button" class="btn btn-dark" data-src="https://kwik.cx/e/123" data-resolution="720" data-audio="jpn" data-av1="0">720p</button>
+                <button type="button" class="btn btn-dark" data-src="https://kwik.cx/e/456" data-resolution="1080" data-audio="jpn" data-av1="0">1080p</button>
+            </div>
+            <div class="dropdown-menu" id="pickDownload">
+                <a href="https://pahe.win/dl1" class="dropdown-item" target="_blank">Anime Ep 1 - 720p (145MB)</a>
+                <a href="https://pahe.win/dl2" class="dropdown-item" target="_blank">Anime Ep 1 - 1080p (285MB)</a>
+            </div>
+        "#;
+
+        let sources = parse_sources_from_html(html);
+        assert_eq!(sources.len(), 2);
+        let s720 = sources.iter().find(|s| s.resolution == "720").unwrap();
+        assert_eq!(s720.url, "https://kwik.cx/e/123");
+        assert_eq!(s720.filesize, Some("145 MB".to_string()));
+
+        let s1080 = sources.iter().find(|s| s.resolution == "1080").unwrap();
+        assert_eq!(s1080.url, "https://kwik.cx/e/456");
+        assert_eq!(s1080.filesize, Some("285 MB".to_string()));
+    }
+}

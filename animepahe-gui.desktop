@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=PaheFlow
+GenericName=Anime Downloader
+Comment=High-performance Native Anime Downloader and Library Manager
+Exec=sh -c 'cd "$(dirname "%k")" && exec ./target/release/animepahe-gui'
+Icon=animepahe-gui
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;Network;
+StartupNotify=true
+Keywords=anime;animepahe;download;hls;stream;

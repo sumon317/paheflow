@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 280px;
+      margin: 0;
+      padding: 16px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #14171f;
+      color: #e4e7eb;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid #232836;
+      padding-bottom: 10px;
+    }
+    .header h1 {
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0;
+      color: #f38ba8;
+    }
+    .status-card {
+      background: #1b202c;
+      border: 1px solid #2b3346;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .label {
+      color: #8b9bb4;
+    }
+    .val {
+      font-weight: 500;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .badge-ok {
+      background: rgba(166, 227, 161, 0.2);
+      color: #a6e3a1;
+    }
+    .badge-wait {
+      background: rgba(249, 226, 175, 0.2);
+      color: #f9e2af;
+    }
+    button {
+      width: 100%;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      background: #f38ba8;
+      color: #14171f;
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    button:hover {
+      background: #f5a0b8;
+    }
+    button:active {
+      transform: scale(0.98);
+    }
+    .hint {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #6c7c96;
+      text-align: center;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>AnimePahe Auto-Sync</h1>
+  </div>
+
+  <div class="status-card">
+    <div class="row">
+      <span class="label">Cookie Status:</span>
+      <span id="cookieBadge" class="badge badge-wait">Checking...</span>
+    </div>
+    <div class="row">
+      <span class="label">Last Synced:</span>
+      <span id="lastSync" class="val">Never</span>
+    </div>
+    <div class="row">
+      <span class="label">Target Server:</span>
+      <span class="val">127.0.0.1:8765</span>
+    </div>
+  </div>
+
+  <button id="syncBtn">Sync Now</button>
+  <div class="hint">Auto-sync activates whenever you open AnimePahe in a tab.</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AnimePahe GUI",
+  "version": "2.0.0",
+  "identifier": "com.animepahe.gui",
+  "build": {
+    "frontendDist": "../static"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AnimePahe GUI",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 880,
+        "minHeight": 620,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "AudioVideo",
+    "shortDescription": "Native AnimePahe GUI & HLS Downloader",
+    "longDescription": "High-performance native Linux AnimePahe desktop manager written in Rust with concurrent HLS streaming and offline library management."
+  }
+}

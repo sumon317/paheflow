@@ -1,53 +1,37 @@
 #!/usr/bin/env bash
-# AnimePahe GUI launcher — starts the local web server
+# AnimePahe GUI Native (Rust) Launcher
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$SCRIPT_DIR/target/release/animepahe-gui"
+
+# Run from the project root so the server finds static/ and anime.list and
+# keeps config.json/cache in project mode.
 cd "$SCRIPT_DIR"
 
-# requirements.sh installs yt-dlp, animepahe-curl and (when the system Python is
-# too old) a managed Python into the project-local .uv directory.
+# Ensure Cargo/Rust is in PATH if installed via rustup
+if [[ -d "$HOME/.cargo/bin" ]]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+if [[ -d "$HOME/.local/bin" ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+
+# Tools installed by requirements.sh live inside the project.
 if [[ -d "$SCRIPT_DIR/.uv/bin" ]]; then
-  PATH="$SCRIPT_DIR/.uv/bin:$PATH"
-  export PATH
+    export PATH="$SCRIPT_DIR/.uv/bin:$PATH"
 fi
 
-python_ok() {
-  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
-    >/dev/null 2>&1
-}
-
-PYTHON=""
-for candidate in python3 python3.14 python3.13 python3.12 python3.11 python; do
-  if command -v "$candidate" >/dev/null 2>&1 && python_ok "$candidate"; then
-    PYTHON="$candidate"
-    break
-  fi
-done
-
-missing=()
-if [[ -z "$PYTHON" ]]; then
-  missing+=("Python 3.11+ (run ./requirements.sh to install Python 3.12)")
-fi
-for cmd in jq ffmpeg yt-dlp; do
-  command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
-done
-if ! command -v curl-impersonate >/dev/null 2>&1 \
-  && ! command -v animepahe-curl >/dev/null 2>&1; then
-  missing+=("animepahe-curl (or curl-impersonate)")
+# Build release binary if not present
+if [[ ! -x "$BIN" ]]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "error: cargo was not found. Install Rust from https://rustup.rs and retry." >&2
+        exit 1
+    fi
+    echo "Building native AnimePahe GUI (Rust)..."
+    cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 fi
 
-if (( ${#missing[@]} > 0 )); then
-  echo "ERROR: missing dependencies:" >&2
-  printf '  - %s\n' "${missing[@]}" >&2
-  echo >&2
-  echo "Run ./requirements.sh to install them, then try again." >&2
-  exit 1
-fi
-
-# Ensure backend script is executable
-chmod +x animepahe-dl.sh 2>/dev/null || true
-
-# Launch the Python server
-exec "$PYTHON" -m app.server "$@"
+exec "$BIN" "$@"

@@ -20,3 +20,12 @@ __pycache__/
 # Editor and OS noise
 .DS_Store
 *.swp
+
+# Rust and native build artifacts
+target/
+.cargo/
+android/.gradle/
+android/build/
+android/**/build/
+android/app/src/main/jniLibs/
+*.apk

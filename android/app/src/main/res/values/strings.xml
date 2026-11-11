@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">PaheFlow</string>
+    <string name="service_running">PaheFlow service is running in background</string>
+    <string name="downloading">Downloading episode…</string>
+    <string name="cf_solver_title">Solve Cloudflare Challenge</string>
+    <string name="cf_solver_hint">Tap the checkbox to verify. The app will automatically continue once solved.</string>
+</resources>

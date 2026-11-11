@@ -1,0 +1,38 @@
+[package]
+name = "paheflow"
+version = "2.0.0"
+edition = "2021"
+description = "Fast, lightweight native AnimePahe stream extractor and concurrent downloader for Android & Linux"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "animepahe_gui"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+jni = "0.21"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["tokio"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2", "gzip"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["block-padding"] }
+regex = "1"
+futures-util = "0.3"
+fastrand = "2"
+chrono = "0.4"
+async-stream = "0.3"
+which = "7"
+base64 = "0.22"
+mime_guess = "2"
+urlencoding = "2"
+url = "2"
+
+[profile.release]
+strip = true
+opt-level = 3
+lto = "thin"
+panic = "abort"

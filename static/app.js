@@ -13,6 +13,12 @@
     const d = new Date(ts);
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   };
+  // Keep concurrency within the range the native engine accepts.
+  const clampFragments = (value, fallback = 8) => {
+    const parsed = parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(64, Math.max(1, parsed));
+  };
   const fmtBytes = (b) => {
     if (!Number.isFinite(b)) return "—";
     const units = ["B", "KB", "MB", "GB", "TB"];
@@ -42,11 +48,13 @@
     const cf = config.cf || "";
     return {
       ua: config.ua || "",
-      concurrent_fragments: config.concurrent_fragments ?? 8,
-      downloadDir: config.downloadDir || "",
-      defaultDownloadDir: config.defaultDownloadDir || config.downloadDir || "",
-      cfConfigured: config.cfConfigured ?? Boolean(cf),
-      cfLength: config.cfLength ?? cf.length,
+      // The Rust API uses camelCase; older Python responses used snake_case.
+      concurrent_fragments: config.concurrentFragments ?? config.concurrent_fragments ?? 8,
+      downloadDir: config.downloadDir || config.download_dir || "",
+      defaultDownloadDir:
+        config.defaultDownloadDir || config.default_download_dir || config.downloadDir || config.download_dir || "",
+      cfConfigured: config.cfConfigured ?? config.cf_configured ?? Boolean(cf),
+      cfLength: config.cfLength ?? config.cf_length ?? cf.length,
     };
   };
 
@@ -59,9 +67,7 @@
   // bounded so a long batch cannot turn every SSE event into a layout pass.
   const MAX_LOG_LINES = 1000;
   const MAX_QUEUED_LOGS = MAX_LOG_LINES * 2;
-  const LIBRARY_AUTO_EXPAND_GROUPS = 5;
-  const LIBRARY_AUTO_EXPAND_FILES = 200;
-  const emptyOptions = () => ({ resolutions: [], audios: [], combinations: [], sourceCount: 0, episode: "", session: "" });
+  const emptyOptions = () => ({ resolutions: [], audios: [], combinations: [], sourceCount: 0, episode: "", session: "", filesizes: {} });
 
   let state = {
     localCatalog: [],
@@ -74,6 +80,11 @@
     epPage: 1,
     epLastPage: 1,
     epFilter: "",
+    audioFilter: "",
+    epTotal: 0,
+    epTotalAll: 0,
+    availableAudios: [],
+    episodeSizes: {},
     episodesSelected: [],
     options: emptyOptions(),
     config: { ua: "", concurrent_fragments: 8, cfConfigured: false, cfLength: 0 },
@@ -83,9 +94,8 @@
     lastLogSeq: 0,
     logFilter: "all",
     autoscroll: true,
-    activityHidden: false,
+    activityVisible: window.innerWidth > 900,
     lastDoneJob: "",
-    libraryItems: [],
     epStatusKey: "",
     playlistKey: "",
   };
@@ -149,10 +159,41 @@
       text.includes("403 challenge");
     if (!broken) return;
     const banner = $("cookieBanner");
-    if (!banner) return;
-    $("cookieBannerText").textContent = message;
-    banner.classList.remove("hidden");
+    if (banner) {
+      $("cookieBannerText").textContent = message;
+      banner.classList.remove("hidden");
+    }
+    openCfSolverModal();
   }
+
+  /* ─────────────────────────────────────────────────────────────────
+   *  Android storage permission check & banner
+   * ───────────────────────────────────────────────────────────────── */
+  function checkAndroidStoragePermission() {
+    if (window.AndroidBridge && typeof window.AndroidBridge.hasStoragePermission === "function") {
+      const hasPerm = window.AndroidBridge.hasStoragePermission();
+      const banner = $("storagePermissionBanner");
+      if (banner) {
+        if (!hasPerm && !sessionStorage.getItem("storage_banner_dismissed")) {
+          banner.classList.remove("hidden");
+        } else {
+          banner.classList.add("hidden");
+        }
+      }
+    }
+  }
+
+  window.onStoragePermissionChanged = function(hasPerm) {
+    const banner = $("storagePermissionBanner");
+    if (banner) {
+      if (hasPerm) {
+        banner.classList.add("hidden");
+        sessionStorage.removeItem("storage_banner_dismissed");
+      } else if (!sessionStorage.getItem("storage_banner_dismissed")) {
+        banner.classList.remove("hidden");
+      }
+    }
+  };
 
   /* ─────────────────────────────────────────────────────────────────
    *  toasts
@@ -275,11 +316,14 @@
    *  render: episodes
    * ───────────────────────────────────────────────────────────────── */
 
-  async function loadEpisodes(slug, page = 1) {
+  async function loadEpisodes(slug, page = 1, audio = null) {
     if (!slug) return;
     const animeChanged = state.selectedSlug !== slug;
     state.selectedSlug = slug;
     state.epPage = page;
+    if (audio !== null) {
+      state.audioFilter = audio;
+    }
     state.episodes = [];
     state.epLastPage = 1;
     if (animeChanged) {
@@ -288,19 +332,41 @@
       state.episodesSelected = [];
       state.epFilter = "";
       $("epFilter").value = "";
+      if (audio === null) {
+        state.audioFilter = "";
+      }
+      state.availableAudios = [];
+      state.episodeSizes = {};
       state.options = emptyOptions();
       fillOptionSelects();
     }
+    syncAudioControlUI();
     renderEpGrid();
     updatePagination();
     updateCommandPreview();
     setBusy($("reloadEpisodes"), true);
     try {
-      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&page=${page}`);
+      const titleParam = state.selectedTitle ? `&title=${encodeURIComponent(state.selectedTitle)}` : "";
+      const audioParam = state.audioFilter ? `&audio=${encodeURIComponent(state.audioFilter)}` : "";
+      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&page=${page}${titleParam}${audioParam}`);
+      if (res.slug && res.slug !== slug) {
+        state.selectedSlug = res.slug;
+        slug = res.slug;
+      }
       if (state.selectedSlug !== slug || state.epPage !== page) return;
-      state.episodes = res.items;
+      state.episodes = res.items || [];
       state.epLastPage = res.lastPage ?? 1;
       state.epPage = res.page ?? page;
+      state.epTotal = res.total ?? state.episodes.length;
+      state.epTotalAll = res.totalAll ?? state.epTotal;
+      state.availableAudios = res.availableAudios || [];
+
+      // Prune any selected episodes not present in the filtered set
+      const displayList = getDisplayEpisodes();
+      const validEpIds = new Set(displayList.map(e => epId(e.episode)));
+      state.episodesSelected = state.episodesSelected.filter(id => validEpIds.has(id));
+
+      syncAudioControlUI();
       renderEpGrid();
       updatePagination();
       probeFirstEpisode();
@@ -316,6 +382,38 @@
     finally { setBusy($("reloadEpisodes"), false); }
   }
 
+  function syncAudioControlUI() {
+    const norm = (state.audioFilter || "").toLowerCase();
+    const segs = $$("#epAudioSegmented .seg");
+    segs.forEach(b => {
+      const bAud = (b.dataset.audio || "").toLowerCase();
+      const isActive = (norm === "" && bAud === "")
+        || ((norm === "dub" || norm === "eng") && bAud === "dub")
+        || ((norm === "sub" || norm === "jpn") && bAud === "sub");
+      b.classList.toggle("is-active", isActive);
+    });
+
+    const optAudio = $("optAudio");
+    if (optAudio) {
+      if (norm === "dub" || norm === "eng") {
+        optAudio.value = "eng";
+      } else if (norm === "sub" || norm === "jpn") {
+        optAudio.value = "jpn";
+      } else {
+        optAudio.value = "";
+      }
+    }
+
+    const btnDub = $("btnAudioDub");
+    if (btnDub) {
+      if (state.availableAudios.length && !state.availableAudios.includes("eng")) {
+        btnDub.title = "No English Dub episodes released for this anime yet";
+      } else {
+        btnDub.title = "Filter to English Dub episodes";
+      }
+    }
+  }
+
   function updatePagination() {
     const pager = $("epPager");
     if (!pager) return;
@@ -326,26 +424,74 @@
     $("epNext").disabled = state.epPage >= pages;
   }
 
+  function getDisplayEpisodes() {
+    const list = state.episodes || [];
+    const norm = (state.audioFilter || "").toLowerCase();
+    if (norm === "dub" || norm === "eng") {
+      return list.filter(e => {
+        const a = (e.audio || "").toLowerCase();
+        return a === "eng" || a === "dub";
+      });
+    }
+    return list;
+  }
+
   function renderEpGrid() {
     const box = $("epGrid");
-    const filtered = state.episodes.filter(e => {
+    const displayList = getDisplayEpisodes();
+    const filtered = displayList.filter(e => {
       const hay = ("E" + epId(e.episode) + " " + epId(e.episode) + " " + (e.audio || "") + " " + (e.created_at || "")).toLowerCase();
       return hay.includes(state.epFilter.toLowerCase());
     });
     if (!filtered.length) {
-      box.innerHTML = `<div class="empty"><p class="empty-title">No episodes match</p></div>`;
+      let title = "No episodes match";
+      let text = "Try adjusting your search filter.";
+      if (state.audioFilter === "dub" || state.audioFilter === "eng") {
+        title = "No Dub episodes available";
+        text = "English Dub episodes have not been released yet for this anime. Try switching to Sub or All.";
+      } else if (state.audioFilter === "sub" || state.audioFilter === "jpn") {
+        title = "No Sub episodes available";
+        text = "No Japanese Sub episodes are available. Try switching to All.";
+      }
+      box.innerHTML = `<div class="empty"><p class="empty-title">${escapeHtml(title)}</p><p class="empty-text">${escapeHtml(text)}</p></div>`;
+      updateEpSelectionUI();
       return;
     }
+    function formatEpDur(dur) {
+      if (!dur) return "";
+      const parts = String(dur).trim().split(":");
+      if (parts.length === 3) {
+        const mins = parseInt(parts[1], 10);
+        return mins ? `${mins}m` : "";
+      }
+      return "";
+    }
+
+    const norm = (state.audioFilter || "").toLowerCase();
     box.innerHTML = filtered.map((e) => {
       const id = epId(e.episode);
       const checked = state.episodesSelected.includes(id);
+      const isEng = (e.audio || "").toLowerCase() === "eng" || (e.audio || "").toLowerCase() === "dub";
+      let audioTag;
+      if (norm === "dub" || norm === "eng") {
+        audioTag = "DUB";
+      } else if (norm === "sub" || norm === "jpn") {
+        audioTag = isEng ? "SUB (DUB)" : "SUB";
+      } else {
+        audioTag = isEng ? "DUB" : (e.audio === "jpn" ? "SUB" : (e.audio || "—").toUpperCase());
+      }
+      const dur = formatEpDur(e.duration);
+      const sizeTag = getEpisodeSizeBadge(e);
       return `
-      <div class="ep ${checked ? "is-checked" : ""}" data-ep="${escapeHtml(id)}">
+      <div class="ep ${checked ? "is-checked" : ""}" data-ep="${escapeHtml(id)}" title="Episode ${escapeHtml(id)}${dur ? ` · ${dur}` : ""}${sizeTag ? ` · ${sizeTag}` : ""}">
         <input type="checkbox" ${checked ? "checked" : ""} />
         <span class="ep-num">E${escapeHtml(id)}</span>
         <div class="ep-info">
-          <small>${escapeHtml(e.audio || "—")}</small>
-          <small>${escapeHtml(e.created_at || "")}</small>
+          <div class="ep-tags">
+            <span class="ep-audio-tag">${escapeHtml(audioTag)}</span>
+            ${sizeTag ? `<span class="ep-size-tag">${escapeHtml(sizeTag)}</span>` : ""}
+          </div>
+          ${dur ? `<span class="ep-dur">${dur}</span>` : ""}
         </div>
       </div>`;
     }).join("");
@@ -355,6 +501,98 @@
       el.querySelector("input").onclick = (e) => { e.stopPropagation(); toggleEpisode(ep); };
     });
     updateEpSelectionUI();
+  }
+
+  function parseDurSecs(dur) {
+    if (!dur) return 0;
+    const parts = String(dur).trim().split(":");
+    if (parts.length === 3) {
+      return (parseInt(parts[0], 10) || 0) * 3600 + (parseInt(parts[1], 10) || 0) * 60 + (parseInt(parts[2], 10) || 0);
+    }
+    return 0;
+  }
+
+  function parseSizeToBytes(str) {
+    if (!str) return 0;
+    const m = String(str).match(/([\d\.]+)\s*(MB|GB|KB)/i);
+    if (!m) return 0;
+    const val = parseFloat(m[1]);
+    const unit = m[2].toUpperCase();
+    if (unit === "GB") return Math.round(val * 1024 * 1024 * 1024);
+    if (unit === "MB") return Math.round(val * 1024 * 1024);
+    if (unit === "KB") return Math.round(val * 1024);
+    return 0;
+  }
+
+  function formatBytes(bytes) {
+    if (!bytes || isNaN(bytes)) return "";
+    const mb = bytes / (1024 * 1024);
+    if (mb >= 1000) {
+      return `${(mb / 1024).toFixed(1)} GB`;
+    }
+    return `${Math.round(mb)} MB`;
+  }
+
+  function getActiveResolution() {
+    return $("optResolution")?.value || (state.options?.resolutions?.[0] || "");
+  }
+
+  function getEpisodeSizeBadge(e, res) {
+    if (!e) return "";
+    const id = epId(e.episode);
+    const targetRes = res || getActiveResolution();
+
+    // 1. Direct probed size
+    const probed = state.episodeSizes?.[id]?.[targetRes] ||
+      (state.options?.episode && epId(state.options.episode) === id ? state.options?.filesizes?.[targetRes] : null);
+    if (probed) return probed;
+
+    // 2. Estimate based on base episode duration and size
+    const baseEp = state.episodes.find(ep => {
+      const ep_id = epId(ep.episode);
+      return state.episodeSizes?.[ep_id]?.[targetRes] ||
+        (state.options?.episode && epId(state.options.episode) === ep_id && state.options?.filesizes?.[targetRes]);
+    }) || (state.options?.filesizes?.[targetRes] ? state.episodes[0] : null);
+
+    if (!baseEp) return "";
+
+    const baseSize = state.episodeSizes?.[epId(baseEp.episode)]?.[targetRes] || state.options?.filesizes?.[targetRes];
+    const baseBytes = parseSizeToBytes(baseSize);
+    if (!baseBytes) return "";
+
+    const baseDurSecs = parseDurSecs(baseEp.duration);
+    const epDurSecs = parseDurSecs(e.duration);
+
+    if (baseDurSecs > 0 && epDurSecs > 0) {
+      const estimated = Math.round(baseBytes * (epDurSecs / baseDurSecs));
+      return `~${formatBytes(estimated)}`;
+    }
+    return `~${baseSize}`;
+  }
+
+  function calculateTotalSelectedSize() {
+    if (!state.episodesSelected.length) return "";
+    const activeRes = getActiveResolution();
+    const baseEp = state.episodes.find(e => state.episodeSizes?.[epId(e.episode)]?.[activeRes]) || state.episodes[0];
+    const baseDurSecs = parseDurSecs(baseEp?.duration);
+    const baseSizeStr = state.episodeSizes?.[epId(baseEp?.episode)]?.[activeRes] || state.options?.filesizes?.[activeRes];
+    const baseBytes = parseSizeToBytes(baseSizeStr);
+    if (!baseBytes) return "";
+
+    let totalBytes = 0;
+    for (const id of state.episodesSelected) {
+      const ep = state.episodes.find(e => epId(e.episode) === id);
+      const probed = state.episodeSizes?.[id]?.[activeRes];
+      if (probed) {
+        totalBytes += parseSizeToBytes(probed) || baseBytes;
+      } else if (ep && baseDurSecs > 0) {
+        const d = parseDurSecs(ep.duration);
+        totalBytes += d > 0 ? Math.round(baseBytes * (d / baseDurSecs)) : baseBytes;
+      } else {
+        totalBytes += baseBytes;
+      }
+    }
+    return formatBytes(totalBytes);
   }
 
   function probeFirstEpisode() {
@@ -371,7 +609,13 @@
       const opts = await api.get(`/api/episode-options?slug=${encodeURIComponent(slug)}&episode=${encodeURIComponent(episode)}`);
       if (state.selectedSlug !== slug) return;
       state.options = opts;
+      if (opts.filesizes) {
+        const epKey = epId(opts.episode || episode);
+        state.episodeSizes[epKey] = opts.filesizes;
+      }
       fillOptionSelects();
+      renderEpGrid();
+      updateEpSelectionUI();
       updateCommandPreview();
     } catch (e) { /* silent */ }
     finally { setBusy($("probeOptions"), false); }
@@ -399,7 +643,11 @@
     const select = $("optResolution");
     const values = resolutionsForAudio(audio);
     select.innerHTML = '<option value="">Auto — highest available</option>' +
-      values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}p</option>`).join("");
+      values.map(v => {
+        const sz = state.options?.filesizes?.[v];
+        const label = sz ? `${escapeHtml(v)}p (${escapeHtml(sz)})` : `${escapeHtml(v)}p`;
+        return `<option value="${escapeHtml(v)}">${label}</option>`;
+      }).join("");
     select.value = values.includes(selected) ? selected : "";
     return select.value;
   }
@@ -407,9 +655,14 @@
   function renderAudioOptions(resolution, selected) {
     const select = $("optAudio");
     const values = audiosForResolution(resolution);
-    select.innerHTML = '<option value="">Default</option>' +
-      values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v).toUpperCase()}</option>`).join("");
-    select.value = values.includes(selected) ? selected : "";
+    const tracks = Array.from(new Set(["", "jpn", "eng", ...values, ...state.availableAudios]));
+    select.innerHTML = tracks.map(v => {
+      if (!v) return '<option value="">Default (All)</option>';
+      if (v === "jpn") return '<option value="jpn">Japanese (Sub)</option>';
+      if (v === "eng") return '<option value="eng">English (Dub)</option>';
+      return `<option value="${escapeHtml(v)}">${escapeHtml(v).toUpperCase()}</option>`;
+    }).join("");
+    select.value = tracks.includes(selected) ? selected : "";
     return select.value;
   }
 
@@ -429,17 +682,19 @@
   function fillOptionSelects() {
     const r = $("optResolution"), a = $("optAudio");
     const previousResolution = r.value;
-    const previousAudio = a.value;
+    let preferredAudio = a.value;
+    if (state.audioFilter === "dub" || state.audioFilter === "eng") preferredAudio = "eng";
+    else if (state.audioFilter === "sub" || state.audioFilter === "jpn") preferredAudio = "jpn";
 
     // Rebuild both lists from the probe result. Preserve the chosen audio
     // first; if its resolution is gone, fall back to Auto within that audio.
     renderResolutionOptions("", "");
-    renderAudioOptions("", "");
-    if (previousAudio && state.options.audios.includes(previousAudio)) {
-      const keptResolution = renderResolutionOptions(previousAudio, previousResolution);
-      renderAudioOptions(keptResolution, previousAudio);
+    renderAudioOptions("", preferredAudio);
+    if (preferredAudio && state.options.audios.includes(preferredAudio)) {
+      const keptResolution = renderResolutionOptions(preferredAudio, previousResolution);
+      renderAudioOptions(keptResolution, preferredAudio);
     } else if (previousResolution && state.options.resolutions.includes(previousResolution)) {
-      const keptAudio = renderAudioOptions(previousResolution, previousAudio);
+      const keptAudio = renderAudioOptions(previousResolution, preferredAudio);
       renderResolutionOptions(keptAudio, previousResolution);
     }
     updateOptionHints();
@@ -459,7 +714,8 @@
   }
 
   function selectAll() {
-    state.episodesSelected = state.episodes.map(e => epId(e.episode));
+    const displayList = getDisplayEpisodes();
+    state.episodesSelected = displayList.map(e => epId(e.episode));
     renderEpGrid();
     updateCommandPreview();
   }
@@ -469,28 +725,36 @@
     updateCommandPreview();
   }
   function invertSelection() {
-    const all = state.episodes.map(e => epId(e.episode));
+    const displayList = getDisplayEpisodes();
+    const all = displayList.map(e => epId(e.episode));
     state.episodesSelected = all.filter(ep => !state.episodesSelected.includes(ep));
     renderEpGrid();
     updateCommandPreview();
   }
   function selectRange() {
-    const first = prompt("First episode number:");
+    const displayList = getDisplayEpisodes();
+    if (!displayList.length) return;
+    const first = prompt("First episode number:", epId(displayList[0].episode));
     if (!first) return;
-    const last = prompt("Last episode number:");
+    const last = prompt("Last episode number:", epId(displayList[displayList.length - 1].episode));
     if (!last) return;
     const a = parseInt(first, 10), b = parseInt(last, 10);
     if (isNaN(a) || isNaN(b)) return;
     const lo = Math.min(a, b), hi = Math.max(a, b);
+    const availableIds = new Set(displayList.map(e => epId(e.episode)));
     const range = [];
-    for (let n = lo; n <= hi; n++) range.push(String(n));
+    for (let n = lo; n <= hi; n++) {
+      const s = String(n);
+      if (availableIds.has(s)) range.push(s);
+    }
     state.episodesSelected = [...new Set([...state.episodesSelected, ...range])];
     renderEpGrid();
     updateCommandPreview();
   }
   function selectLatest() {
-    if (!state.episodes.length) return;
-    const latest = state.episodes.slice(-5).map(e => epId(e.episode));
+    const displayList = getDisplayEpisodes();
+    if (!displayList.length) return;
+    const latest = displayList.slice(-5).map(e => epId(e.episode));
     state.episodesSelected = [...new Set([...state.episodesSelected, ...latest])];
     renderEpGrid();
     updateCommandPreview();
@@ -498,8 +762,18 @@
 
   function updateEpSelectionUI() {
     const count = state.episodesSelected.length;
-    $("epTitle").textContent = state.selectedTitle || state.selectedSlug;
-    $("epSubtitle").textContent = `${state.episodes.length} episodes • ${count} selected${count ? " — " + compressEpisodes(state.episodesSelected) : ""}`;
+    $("epTitle").textContent = state.selectedTitle || state.selectedSlug || "Episodes";
+    const displayList = getDisplayEpisodes();
+    const shownCount = displayList.length;
+    let base = `${shownCount} episodes`;
+    if (state.audioFilter === "dub" || state.audioFilter === "eng") {
+      base = `Showing ${shownCount} Dub episode${shownCount === 1 ? "" : "s"}${state.epTotalAll ? ` (${state.epTotalAll} total)` : ""}`;
+    } else if (state.audioFilter === "sub" || state.audioFilter === "jpn") {
+      base = `Showing ${shownCount} Sub episode${shownCount === 1 ? "" : "s"}${state.epTotalAll ? ` (${state.epTotalAll} total)` : ""}`;
+    }
+    const totalSize = calculateTotalSelectedSize();
+    const sizeStr = totalSize ? ` (~${totalSize})` : "";
+    $("epSubtitle").textContent = `${base} • ${count} selected${sizeStr}${count ? " — " + compressEpisodes(state.episodesSelected) : ""}`;
     $("startBtn").disabled = count === 0;
     updateActionSummary();
   }
@@ -519,24 +793,46 @@
   }
 
   function updateCommandPreview() {
-    if (!state.selectedSlug) { $("commandPreview").textContent = "./animepahe-dl.sh -s <slug> -e *"; return; }
-    const eps = state.episodesSelected.length ? compressEpisodes(state.episodesSelected) : "*";
-    const parts = ["./animepahe-dl.sh", "-s", state.selectedSlug, "-e", eps];
-    if ($("optResolution").value) parts.push("-r", $("optResolution").value);
-    if ($("optAudio").value) parts.push("-o", $("optAudio").value);
-    if ($("optReplace").checked) parts.push("-R");
-    if ($("optListOnly").checked) parts.push("-l");
-    if ($("optDebug").checked) parts.push("-d");
-    $("commandPreview").textContent = parts.join(" ");
+    if (!state.selectedSlug) {
+      $("commandPreview").textContent = "Select an anime to preview the job";
+      return;
+    }
+    const eps = state.episodesSelected.length ? compressEpisodes(state.episodesSelected) : "all episodes";
+    const parts = [`Native engine: ${state.selectedSlug}`, `episodes ${eps}`];
+    if ($("optResolution").value) parts.push(`${$("optResolution").value}p`);
+    if ($("optAudio").value) parts.push($("optAudio").value.toUpperCase());
+    if ($("optReplace").checked) parts.push("replace existing");
+    if ($("optListOnly").checked) parts.push("playlist link only");
+    if ($("optDebug").checked) parts.push("debug");
+    parts.push(`${clampFragments(state.config.concurrent_fragments)} fragments`);
+    $("commandPreview").textContent = parts.join(" · ");
   }
 
   function updateActionSummary() {
     const ep = state.job?.episodes || {};
+    const isRunning = Boolean(state.job && (state.job.running || state.job.paused));
     const cur = ep.current ? "E" + ep.current : "—";
-    const total = ep.requested?.length ? ep.requested.length : (ep.completed?.length || 0) + (ep.failed?.length || 0);
+    const requestedAll = (ep.requested || []).includes("*");
+    const total = requestedAll
+      ? state.episodes.length
+      : ep.requested?.length
+        ? ep.requested.length
+        : (ep.completed?.length || 0) + (ep.failed?.length || 0);
+
     $("actionAnime").textContent = state.selectedTitle || state.selectedSlug || "—";
-    $("actionEpisodes").textContent = total ? `${cur} / ${total}` : "—";
-    const res = ($("optResolution").value || "Auto") + "p";
+    if (isRunning && total) {
+      $("actionEpisodes").textContent = `${cur} / ${total}`;
+    } else if (state.episodesSelected.length) {
+      const totalSize = calculateTotalSelectedSize();
+      const sizeStr = totalSize ? ` (~${totalSize})` : "";
+      $("actionEpisodes").textContent = `${state.episodesSelected.length} selected${sizeStr}`;
+    } else {
+      $("actionEpisodes").textContent = "—";
+    }
+
+    const rVal = $("optResolution").value;
+    const szVal = state.options?.filesizes?.[rVal];
+    const res = rVal ? (szVal ? `${rVal}p (${szVal})` : `${rVal}p`) : "Auto";
     const aud = ($("optAudio").value || "default").toUpperCase();
     const replace = $("optReplace").checked ? " • replace" : "";
     $("actionQuality").textContent = `${res} • ${aud}${replace}`;
@@ -553,8 +849,7 @@
       ? `Saved: ${c.cfLength} characters — leave blank to keep`
       : "Paste the cf_clearance cookie value";
     $("cfgUa").value = c.ua || "";
-    $("cfgFrag").value = c.concurrent_fragments ?? 8;
-    $("optFragments").value = c.concurrent_fragments ?? 8;
+    $("cfgFrag").value = clampFragments(c.concurrent_fragments);
     $("cfgDownloadDir").value = c.downloadDir || c.defaultDownloadDir || "";
     updateBadges();
     updateDownloadDirBadge();
@@ -576,7 +871,10 @@
       .filter(d => d.required && !d.found)
       .map(d => d.name);
     const hint = $("setupHint");
-    if (missing.length) {
+    if (window.AndroidBridge) {
+      hint.textContent = "All dependencies are built directly into the Android app. No extra installation required!";
+      hint.className = "option-hint";
+    } else if (missing.length) {
       hint.textContent = `Missing required tools: ${missing.join(", ")}. Run ./requirements.sh, then restart the GUI.`;
       hint.className = "option-hint save-hint err";
     } else {
@@ -678,7 +976,7 @@
     const previousDir = state.config.downloadDir;
     const payload = {
       ua: $("cfgUa").value.trim(),
-      concurrent_fragments: parseInt($("cfgFrag").value || "8", 10),
+      concurrent_fragments: clampFragments($("cfgFrag").value),
       download_dir: $("cfgDownloadDir").value.trim(),
     };
     // Omitting the cookie means "keep the stored value"; the server never
@@ -688,15 +986,190 @@
       const saved = await api.post("/api/config", payload);
       state.config = normalizeConfig(saved);
       renderSettings();
+      updateCommandPreview();
       updateSaveHint("ok", "Saved");
       toast("Configuration saved", "ok");
-      if (state.config.downloadDir !== previousDir) rescanLibrary();
       return true;
     } catch (e) {
       updateSaveHint("err", "Failed: " + e.message);
       toast("Save failed: " + e.message, "error");
       return false;
     }
+  }
+
+  async function autoDetectCookie() {
+    const btn1 = $("autoDetectCf");
+    const btn2 = $("setupAutoDetect");
+    if (btn1) setBusy(btn1, true);
+    if (btn2) setBusy(btn2, true);
+    try {
+      const res = await api.post("/api/auto-detect-cookie", {});
+      if (res && res.ok) {
+        state.config = normalizeConfig(res.config);
+        renderSettings();
+        toast("✨ Cloudflare cookie auto-detected from local browser!", "ok");
+        await testConnection();
+      } else {
+        toast("No cookie found. Open animepahe.pw in your browser first!", "warn");
+      }
+    } catch (err) {
+      toast(err.message || "Could not auto-detect cookie.", "err");
+    } finally {
+      if (btn1) setBusy(btn1, false);
+      if (btn2) setBusy(btn2, false);
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
+   *  cloudflare solver modal
+   * ───────────────────────────────────────────────────────────────── */
+
+  let cfSolverPollTimer = null;
+  let cfSolverWindow = null;
+
+  function openCfSolverModal() {
+    if (window.AndroidBridge && typeof window.AndroidBridge.openCloudflareSolver === "function") {
+      window.AndroidBridge.openCloudflareSolver();
+      return;
+    }
+    const modal = $("cfSolverModal");
+    if (!modal) return;
+    modal.classList.remove("hidden");
+    $("cfSolverStatusText").textContent = "Click 'Solve Cloudflare' to open the verification window.";
+    $("cfSolverSpinner").classList.add("hidden");
+    $("cfStartSolverBtn").disabled = false;
+  }
+
+  function closeCfSolverModal() {
+    const modal = $("cfSolverModal");
+    if (modal) modal.classList.add("hidden");
+    if (cfSolverPollTimer) {
+      clearInterval(cfSolverPollTimer);
+      cfSolverPollTimer = null;
+    }
+    if (cfSolverWindow && !cfSolverWindow.closed) {
+      cfSolverWindow.close();
+      cfSolverWindow = null;
+    }
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
+   *  shutdown modal & execution
+   * ───────────────────────────────────────────────────────────────── */
+
+  function openShutdownModal() {
+    const modal = $("shutdownModal");
+    if (!modal) return;
+    modal.classList.remove("hidden");
+  }
+
+  function closeShutdownModal() {
+    const modal = $("shutdownModal");
+    if (!modal) return;
+    modal.classList.add("hidden");
+  }
+
+  async function performShutdown() {
+    const btn = $("confirmShutdownBtn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Shutting down…";
+    }
+
+    if (window.AndroidBridge && typeof window.AndroidBridge.shutdownApp === "function") {
+      window.AndroidBridge.shutdownApp();
+      return;
+    }
+
+    try {
+      await api.post("/api/shutdown");
+    } catch (_) {}
+
+    document.body.innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#0b0813;color:#f0eef5;font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:24px;">
+        <div style="font-size:3rem;margin-bottom:12px;color:#ff4c6a;">⏻</div>
+        <h2 style="font-size:1.4rem;font-weight:700;margin-bottom:8px;">PaheFlow has shut down</h2>
+        <p style="color:#9f9baa;font-size:0.95rem;max-width:380px;">The background service has stopped. You can safely close this window.</p>
+      </div>
+    `;
+  }
+
+  async function startCfSolver() {
+    if (window.AndroidBridge) {
+      closeCfSolverModal();
+      if (typeof window.AndroidBridge.openInFirefox === "function") {
+        window.AndroidBridge.openInFirefox();
+      } else if (typeof window.AndroidBridge.openCloudflareSolver === "function") {
+        window.AndroidBridge.openCloudflareSolver();
+      }
+      return;
+    }
+
+    const btn = $("cfStartSolverBtn");
+    const statusText = $("cfSolverStatusText");
+    const spinner = $("cfSolverSpinner");
+
+    btn.disabled = true;
+    spinner.classList.remove("hidden");
+    statusText.textContent = "AnimePahe opened in Firefox. Complete the 'Verify you are human' check...";
+
+    // Launch AnimePahe directly in Firefox via backend
+    try {
+      await api.post("/api/open-cf-page", {});
+    } catch (e) {
+      // Fallback: open standard new tab
+      try {
+        cfSolverWindow = window.open("https://animepahe.pw/", "_blank");
+      } catch (err) {
+        // Ignored
+      }
+    }
+
+    if (cfSolverPollTimer) clearInterval(cfSolverPollTimer);
+
+    let attempts = 0;
+    cfSolverPollTimer = setInterval(async () => {
+      attempts++;
+      try {
+        const res = await api.post("/api/auto-detect-cookie", {});
+        if (res && res.ok && res.config) {
+          state.config = normalizeConfig(res.config);
+          renderSettings();
+
+          const testRes = await api.post("/api/test-connection", {});
+          if (testRes && testRes.ok) {
+            clearInterval(cfSolverPollTimer);
+            cfSolverPollTimer = null;
+
+            spinner.classList.add("hidden");
+            statusText.textContent = "✅ Cloudflare verified! Connected!";
+            toast("Cloudflare verified and auto-configured from Firefox!", "ok");
+
+            if (cfSolverWindow && !cfSolverWindow.closed) {
+              cfSolverWindow.close();
+              cfSolverWindow = null;
+            }
+
+            setTimeout(() => {
+              closeCfSolverModal();
+              $("cookieBanner").classList.add("hidden");
+              renderCatalog();
+            }, 800);
+            return;
+          }
+        }
+      } catch (e) {
+        // Continue polling
+      }
+
+      if (attempts > 90) { // 90 * 800ms = ~72s timeout
+        clearInterval(cfSolverPollTimer);
+        cfSolverPollTimer = null;
+        spinner.classList.add("hidden");
+        btn.disabled = false;
+        statusText.textContent = "Timeout waiting for verification. Click to try again.";
+      }
+    }, 800);
   }
 
   async function setupSaveAndTest() {
@@ -719,6 +1192,10 @@
     const btn = $("browseDownloadDir");
     setBusy(btn, true);
     try {
+      if (window.AndroidBridge && typeof window.AndroidBridge.openFolderPicker === "function") {
+        window.AndroidBridge.openFolderPicker();
+        return;
+      }
       const choice = await api.post("/api/pick-folder", {
         current: $("cfgDownloadDir").value.trim(),
       });
@@ -729,16 +1206,33 @@
       updateDownloadDirBadge();
       updateSaveHint("");
       toast("Download folder saved", "ok");
-      rescanLibrary();
     } catch (e) {
       toast("Could not choose folder: " + e.message, "error");
     } finally {
-      setBusy(btn, false);
+      if (!window.AndroidBridge || typeof window.AndroidBridge.openFolderPicker !== "function") {
+        setBusy(btn, false);
+      }
     }
   }
 
+  window.onFolderPicked = async function(chosenPath) {
+    const btn = $("browseDownloadDir");
+    if (btn) setBusy(btn, false);
+    if (!chosenPath) return;
+    try {
+      const saved = await api.post("/api/config", { download_dir: chosenPath });
+      state.config = normalizeConfig(saved);
+      $("cfgDownloadDir").value = state.config.downloadDir;
+      updateDownloadDirBadge();
+      updateSaveHint("");
+      toast("Download folder saved: " + chosenPath, "ok");
+    } catch (e) {
+      toast("Could not save download folder: " + e.message, "error");
+    }
+  };
+
   async function resetDownloadDir() {
-    if (!confirm("Use the project folder as the destination for future downloads?")) return;
+    if (!confirm("Reset download folder to default (Downloads/PaheFlow)?")) return;
     const btn = $("resetDownloadDir");
     setBusy(btn, true);
     try {
@@ -747,8 +1241,7 @@
       $("cfgDownloadDir").value = state.config.downloadDir;
       updateDownloadDirBadge();
       updateSaveHint("");
-      toast("Download folder reset to the project default", "ok");
-      rescanLibrary();
+      toast("Download folder reset to default", "ok");
     } catch (e) {
       toast("Could not reset the download folder: " + e.message, "error");
     } finally {
@@ -808,111 +1301,6 @@
   }
 
   /* ─────────────────────────────────────────────────────────────────
-   *  render: library
-   * ───────────────────────────────────────────────────────────────── */
-
-  async function rescanLibrary() {
-    setBusy($("rescanLibrary"), true);
-    try {
-      const { items } = await api.get("/api/library");
-      renderLibrary(items);
-    } catch (e) { toast("Library scan failed: " + e.message, "error"); }
-    finally { setBusy($("rescanLibrary"), false); }
-  }
-
-  function renderLibrary(items) {
-    state.libraryItems = items;
-    const box = $("libraryList");
-    if (!items.length) {
-      box.innerHTML = `<div class="empty"><p class="empty-title">No downloaded episodes yet</p></div>`;
-      $("libraryMeta").textContent = "No anime folders found";
-      return;
-    }
-    const totalFiles = items.reduce((a, b) => a + b.count, 0);
-    // Small libraries stay fully expanded. Large ones render only the series
-    // headers and build episode rows on demand, so a big collection cannot
-    // create tens of thousands of DOM nodes on every scan.
-    const autoExpand = items.length <= LIBRARY_AUTO_EXPAND_GROUPS
-      && totalFiles <= LIBRARY_AUTO_EXPAND_FILES;
-    box.innerHTML = items.map((g, index) => `
-      <div class="lib-group" data-index="${index}">
-        <div class="lib-head">
-          <span class="lib-name">${escapeHtml(g.name)}</span>
-          <span class="badge">${g.count} file${g.count !== 1 ? "s" : ""} • ${escapeHtml(g.totalText)}</span>
-          <div class="lib-head-actions">
-            <button class="btn btn-ghost btn-sm lib-toggle" data-index="${index}" aria-expanded="${autoExpand}">${autoExpand ? "Hide episodes" : "Show episodes"}</button>
-            <button class="btn btn-ghost btn-sm lib-open" data-path="${escapeHtml(g.path)}">Open</button>
-            <button class="btn btn-ghost btn-sm lib-delete-folder" data-path="${escapeHtml(g.path)}" data-name="${escapeHtml(g.name)}">Delete series</button>
-          </div>
-        </div>
-        <div class="lib-files"${autoExpand ? "" : " hidden"}></div>
-      </div>
-    `).join("");
-    if (autoExpand) items.forEach((_, index) => renderLibraryFiles(index));
-    $("libraryMeta").textContent = `${items.length} anime folder${items.length !== 1 ? "s" : ""} • ${totalFiles} episode${totalFiles !== 1 ? "s" : ""} total`;
-  }
-
-  function renderLibraryFiles(index) {
-    const group = state.libraryItems[index];
-    const box = $("libraryList").querySelector(`.lib-group[data-index="${index}"] .lib-files`);
-    if (!group || !box || box.dataset.rendered === "1") return;
-    box.innerHTML = group.episodes.map(f => `
-      <div class="lib-file">
-        <span class="lib-file-name">${escapeHtml(f.file)}</span>
-        <span class="lib-file-size">${escapeHtml(f.sizeText)}</span>
-        <span class="lib-file-date">${escapeHtml(f.modifiedText)}</span>
-        <div class="lib-file-actions">
-          <button class="btn btn-ghost btn-sm lib-open" data-path="${escapeHtml(f.path)}">Open</button>
-          <button class="btn btn-ghost btn-sm lib-delete-file" data-path="${escapeHtml(f.path)}" data-name="${escapeHtml(f.file)}">Delete</button>
-        </div>
-      </div>
-    `).join("");
-    box.dataset.rendered = "1";
-  }
-
-  function toggleLibraryGroup(index) {
-    const group = $("libraryList").querySelector(`.lib-group[data-index="${index}"]`);
-    if (!group) return;
-    const files = group.querySelector(".lib-files");
-    const button = group.querySelector(".lib-toggle");
-    const expand = files.hidden;
-    if (expand) renderLibraryFiles(index);
-    files.hidden = !expand;
-    button.textContent = expand ? "Hide episodes" : "Show episodes";
-    button.setAttribute("aria-expanded", String(expand));
-  }
-
-  async function openLibraryPath(path) {
-    try {
-      await api.post("/api/open", { path });
-    } catch (e) {
-      toast("Could not open path: " + e.message, "error");
-    }
-  }
-
-  async function deleteLibraryPath(path, kind, name) {
-    const prompt = kind === "folder"
-      ? `Delete "${name}" and all of its episodes?`
-      : `Delete "${name}"?`;
-    if (!confirm(prompt)) return;
-    try {
-      if (kind === "folder") {
-        await api.post("/api/library/delete-folder", { path });
-      } else {
-        await api.post("/api/library/delete", { path });
-      }
-      toast(kind === "folder" ? "Anime folder deleted" : "Episode deleted", "ok");
-      await rescanLibrary();
-    } catch (e) {
-      toast("Delete failed: " + e.message, "error");
-    }
-  }
-
-  function openLibraryFolder() {
-    openLibraryPath(state.config.downloadDir || ".");
-  }
-
-  /* ─────────────────────────────────────────────────────────────────
    *  job / activity panel
    * ───────────────────────────────────────────────────────────────── */
 
@@ -925,10 +1313,12 @@
   }
 
   function updateProgressUI() {
+    updateActionBarVisibility();
     if (!state.job || !state.job.running) {
       $("progressLabel").textContent = "Idle";
       $("progressPercent").textContent = "—";
       $("progressFill").style.width = "0%";
+      $("progressFill").classList.remove("is-paused");
       $("progressEpisode").textContent = "";
       $("progressSpeed").textContent = "";
       $("progressEta").textContent = "";
@@ -936,19 +1326,27 @@
       return;
     }
     const p = state.job.progress || {};
-    if (p.percent !== null && p.percent !== undefined) {
-      $("progressFill").style.width = Math.max(0, Math.min(100, p.percent)) + "%";
-      $("progressPercent").textContent = p.percent.toFixed(1) + "%";
-      $("progressLabel").textContent = "Downloading…";
+    if (state.job.paused) {
+      $("progressLabel").textContent = "Paused";
+      $("progressFill").classList.add("is-paused");
+      $("progressSpeed").textContent = "⏸ Paused";
+      updatePill("paused");
     } else {
-      $("progressFill").style.width = "0%";
-      $("progressPercent").textContent = "—";
-      $("progressLabel").textContent = state.job.progress?.file ? "Starting…" : "Downloading…";
+      $("progressFill").classList.remove("is-paused");
+      if (p.percent !== null && p.percent !== undefined) {
+        $("progressFill").style.width = Math.max(0, Math.min(100, p.percent)) + "%";
+        $("progressPercent").textContent = p.percent.toFixed(1) + "%";
+        $("progressLabel").textContent = "Downloading…";
+      } else {
+        $("progressFill").style.width = "0%";
+        $("progressPercent").textContent = "—";
+        $("progressLabel").textContent = state.job.progress?.file ? "Starting…" : "Downloading…";
+      }
+      $("progressSpeed").textContent = state.job.progress?.speed ? "⚡ " + state.job.progress.speed : "";
+      updatePill("running");
     }
     $("progressEpisode").textContent = state.job.progress?.file ? "💾 " + state.job.progress.file.split("/").pop() : "";
-    $("progressSpeed").textContent = state.job.progress?.speed ? "⚡ " + state.job.progress.speed : "";
     $("progressEta").textContent = state.job.progress?.eta ? "⏱ " + state.job.progress.eta : "";
-    updatePill("running");
   }
 
   function updateEpStatus() {
@@ -1002,6 +1400,7 @@
     el.dataset.state = st;
     switch (st) {
       case "running": txt.textContent = "Running"; break;
+      case "paused": txt.textContent = "Paused"; break;
       case "done": txt.textContent = "Done"; break;
       case "error": txt.textContent = "Error"; break;
       default: txt.textContent = "Idle";
@@ -1012,11 +1411,19 @@
     applyJob(msg);
     if (typeof msg.logSeq === "number") state.logSeq = msg.logSeq;
     if (msg.running) {
-      $("startBtn").disabled = true;
       $("stopBtn").disabled = false;
-      updatePill("running");
+      if (msg.paused) {
+        $("startBtn").textContent = "Resume";
+        $("startBtn").disabled = false;
+        updatePill("paused");
+      } else {
+        $("startBtn").textContent = "Pause";
+        $("startBtn").disabled = false;
+        updatePill("running");
+      }
       return;
     }
+    $("startBtn").textContent = "Start download";
     if (msg.exitCode === null || msg.exitCode === undefined) return;
     updatePill(msg.stopped ? "idle" : (msg.exitCode === 0 ? "done" : "error"));
     $("startBtn").disabled = state.episodesSelected.length === 0;
@@ -1034,7 +1441,6 @@
       const ok = msg.exitCode === 0;
       toast(ok ? "Download finished" : "Download failed (exit " + msg.exitCode + ")", ok ? "ok" : "error");
     }
-    rescanLibrary();
   }
 
   function logMatchesFilter(level) {
@@ -1081,7 +1487,7 @@
       div.dataset.level = level;
       const time = document.createElement("span");
       time.className = "log-time";
-      time.textContent = fmtTime((entry.ts || Date.now() / 1000) * 1000);
+      time.textContent = fmtTime((entry.ts ?? entry.time ?? Date.now() / 1000) * 1000);
       const text = document.createElement("span");
       text.className = "log-text";
       text.textContent = entry.text;
@@ -1100,6 +1506,12 @@
 
   function startJob() {
     if (!state.selectedSlug) { toast("Select an anime first", "warn"); return; }
+    if (window.AndroidBridge && typeof window.AndroidBridge.hasStoragePermission === "function") {
+      if (!window.AndroidBridge.hasStoragePermission()) {
+        const banner = $("storagePermissionBanner");
+        if (banner) banner.classList.remove("hidden");
+      }
+    }
     const episodes = state.episodesSelected.length ? compressEpisodes(state.episodesSelected) : "*";
     const payload = {
       slug: state.selectedSlug,
@@ -1107,7 +1519,7 @@
       episodes,
       resolution: $("optResolution").value.trim(),
       audio: $("optAudio").value.trim(),
-      concurrent_fragments: parseInt($("optFragments").value || "8", 10),
+      concurrent_fragments: clampFragments(state.config.concurrent_fragments),
       replace: $("optReplace").checked,
       listOnly: $("optListOnly").checked,
       debug: $("optDebug").checked,
@@ -1123,17 +1535,54 @@
       $$(".log-line", $("logs")).forEach(line => {
         if (Number(line.dataset.seq || 0) <= clearThrough) line.remove();
       });
-      $("startBtn").disabled = true;
+      $("startBtn").textContent = "Pause";
+      $("startBtn").disabled = false;
       $("stopBtn").disabled = false;
       updatePill("running");
     }).catch(e => toast("Start failed: " + e.message, "error"));
   }
 
+  function pauseJob() {
+    api.post("/api/pause", {}).then(() => {
+      if (state.job) state.job.paused = true;
+      $("startBtn").textContent = "Resume";
+      updatePill("paused");
+      updateProgressUI();
+      toast("Download paused", "warn");
+    }).catch(e => toast("Pause failed: " + e.message, "error"));
+  }
+
+  function resumeJob() {
+    api.post("/api/resume", {}).then(() => {
+      if (state.job) state.job.paused = false;
+      $("startBtn").textContent = "Pause";
+      updatePill("running");
+      updateProgressUI();
+      toast("Download resumed", "ok");
+    }).catch(e => toast("Resume failed: " + e.message, "error"));
+  }
+
+  function handleMainAction() {
+    if (!state.job?.running) {
+      startJob();
+    } else if (state.job?.paused) {
+      resumeJob();
+    } else {
+      pauseJob();
+    }
+  }
+
   function stopJob() {
     api.post("/api/stop", {}).then(() => {
-      updatePill("idle");
-      $("startBtn").disabled = false;
+      if (state.job) {
+        state.job.running = false;
+        state.job.paused = false;
+      }
+      $("startBtn").textContent = "Start download";
+      $("startBtn").disabled = state.episodesSelected.length === 0;
       $("stopBtn").disabled = true;
+      updatePill("idle");
+      updateProgressUI();
     }).catch(e => toast("Stop failed: " + e.message, "error"));
   }
 
@@ -1141,9 +1590,20 @@
    *  tab navigation
    * ───────────────────────────────────────────────────────────────── */
 
+  function updateActionBarVisibility() {
+    const isJobActive = Boolean(state.job && (state.job.running || state.job.paused));
+    const show = isJobActive || (state.activeTab || "browse") === "episodes";
+    const bar = document.querySelector(".actionbar");
+    if (bar) {
+      bar.classList.toggle("hidden", !show);
+    }
+  }
+
   function showTab(name) {
+    state.activeTab = name;
     $$(".panel").forEach(p => p.classList.toggle("is-active", p.id === "panel-" + name));
     $$(".tab").forEach(t => t.classList.toggle("is-active", t.dataset.tab === name));
+    updateActionBarVisibility();
   }
 
   /* ─────────────────────────────────────────────────────────────────
@@ -1159,26 +1619,65 @@
       state.catalogLimit = CATALOG_PAGE_SIZE;
       renderSettings();
       renderCatalog();
-      if (!state.config.cfConfigured) showTab("settings");
+      if (!state.config.cfConfigured) {
+        showTab("settings");
+        openCfSolverModal();
+      }
       applyJob(init.job);
       if (init.job?.logSeq !== undefined) state.logSeq = init.job.logSeq;
       if (init.job?.running) {
-        $("startBtn").disabled = true;
         $("stopBtn").disabled = false;
-        updatePill("running");
-      } else if (init.job?.exitCode !== null && init.job?.exitCode !== undefined) {
-        updatePill(init.job.stopped ? "idle" : (init.job.exitCode === 0 ? "done" : "error"));
+        if (init.job?.paused) {
+          $("startBtn").textContent = "Resume";
+          $("startBtn").disabled = false;
+          updatePill("paused");
+        } else {
+          $("startBtn").textContent = "Pause";
+          $("startBtn").disabled = false;
+          updatePill("running");
+        }
+      } else {
+        $("startBtn").textContent = "Start download";
+        if (init.job?.exitCode !== null && init.job?.exitCode !== undefined) {
+          updatePill(init.job.stopped ? "idle" : (init.job.exitCode === 0 ? "done" : "error"));
+        }
         $("startBtn").disabled = state.episodesSelected.length === 0;
         $("stopBtn").disabled = true;
       }
+      updateActionBarVisibility();
     } catch (e) {
       toast("Failed to load initial state: " + e.message, "error");
     }
-    try {
-      const lib = await api.get("/api/library");
-      renderLibrary(lib.items);
-    } catch (e) { /* the library is optional */ }
   }
+
+  function toggleActivityPanel(forceState = null) {
+    const isMobile = window.innerWidth <= 900;
+    if (forceState !== null) {
+      state.activityVisible = forceState;
+    } else {
+      state.activityVisible = !state.activityVisible;
+    }
+
+    if (isMobile) {
+      document.body.classList.toggle("show-mobile-activity", state.activityVisible);
+      document.body.classList.remove("activity-hidden");
+      const layout = $("layout");
+      if (layout) layout.classList.remove("activity-hidden");
+    } else {
+      document.body.classList.remove("show-mobile-activity");
+      document.body.classList.toggle("activity-hidden", !state.activityVisible);
+      const layout = $("layout");
+      if (layout) layout.classList.toggle("activity-hidden", !state.activityVisible);
+    }
+
+    const btn = $("toggleActivity");
+    if (btn) {
+      btn.classList.toggle("is-active", state.activityVisible);
+      btn.title = state.activityVisible ? "Hide activity panel" : "Show activity panel";
+      btn.setAttribute("aria-expanded", String(state.activityVisible));
+    }
+  }
+  window.toggleActivityPanel = toggleActivityPanel;
 
   /* ─────────────────────────────────────────────────────────────────
    *  bindings
@@ -1199,10 +1698,23 @@
     $("refreshCatalog").onclick = refreshCatalog;
 
     // episodes
-    $("reloadEpisodes").onclick = () => loadEpisodes(state.selectedSlug, 1);
-    $("epPrev").onclick = () => { if (state.epPage > 1) loadEpisodes(state.selectedSlug, state.epPage - 1); };
-    $("epNext").onclick = () => { if (state.epPage < state.epLastPage) loadEpisodes(state.selectedSlug, state.epPage + 1); };
+    $("reloadEpisodes").onclick = () => loadEpisodes(state.selectedSlug, 1, state.audioFilter);
+    $("epPrev").onclick = () => { if (state.epPage > 1) loadEpisodes(state.selectedSlug, state.epPage - 1, state.audioFilter); };
+    $("epNext").onclick = () => { if (state.epPage < state.epLastPage) loadEpisodes(state.selectedSlug, state.epPage + 1, state.audioFilter); };
     $("epFilter").addEventListener("input", debounce(() => { state.epFilter = $("epFilter").value; renderEpGrid(); }));
+    $$("#epAudioSegmented .seg").forEach(btn => {
+      btn.onclick = () => {
+        const audio = btn.dataset.audio || "";
+        if (state.audioFilter === audio) return;
+        state.audioFilter = audio;
+        const displayList = getDisplayEpisodes();
+        const validIds = new Set(displayList.map(e => epId(e.episode)));
+        state.episodesSelected = state.episodesSelected.filter(id => validIds.has(id));
+        syncAudioControlUI();
+        renderEpGrid();
+        loadEpisodes(state.selectedSlug, 1, audio);
+      };
+    });
     $$(".toolbar-buttons [data-ep]").forEach(btn => {
       btn.onclick = () => {
         switch (btn.dataset.ep) {
@@ -1221,11 +1733,27 @@
       // the audio list, and an unavailable audio resets to Default.
       const audio = renderAudioOptions($("optResolution").value, $("optAudio").value);
       renderResolutionOptions(audio, $("optResolution").value);
+      renderEpGrid();
+      updateEpSelectionUI();
       updateOptionHints();
       updateActionSummary();
       updateCommandPreview();
     };
     $("optAudio").onchange = () => {
+      const chosen = $("optAudio").value;
+      let newFilter = "";
+      if (chosen === "eng") newFilter = "dub";
+      else if (chosen === "jpn") newFilter = "sub";
+
+      if (state.audioFilter !== newFilter) {
+        state.audioFilter = newFilter;
+        const displayList = getDisplayEpisodes();
+        const validIds = new Set(displayList.map(e => epId(e.episode)));
+        state.episodesSelected = state.episodesSelected.filter(id => validIds.has(id));
+        syncAudioControlUI();
+        renderEpGrid();
+        loadEpisodes(state.selectedSlug, 1, newFilter);
+      }
       // Choosing audio narrows resolutions; an unavailable resolution resets
       // to Auto so the selected audio track is preserved.
       const resolution = renderResolutionOptions($("optAudio").value, $("optResolution").value);
@@ -1234,14 +1762,21 @@
       updateActionSummary();
       updateCommandPreview();
     };
+    try {
+      const savedReplace = localStorage.getItem("animepahe_replace");
+      if (savedReplace !== null) {
+        $("optReplace").checked = savedReplace === "true";
+      }
+    } catch (_) {}
     $("optReplace").onchange = () => {
+      try {
+        localStorage.setItem("animepahe_replace", String($("optReplace").checked));
+      } catch (_) {}
       updateActionSummary();
       updateCommandPreview();
     };
     $("optListOnly").onchange = updateCommandPreview;
     $("optDebug").onchange = updateCommandPreview;
-    $("fragMinus").onclick = () => { const v = parseInt($("optFragments").value, 10); if (v > 1) { $("optFragments").value = v - 1; updateCommandPreview(); } };
-    $("fragPlus").onclick = () => { const v = parseInt($("optFragments").value, 10); if (v < 64) { $("optFragments").value = v + 1; updateCommandPreview(); } };
     $("probeOptions").onclick = () => probeOptions(state.options?.episode || state.episodes[0]?.episode || 1);
 
     // command
@@ -1253,8 +1788,9 @@
     $("testConnection").onclick = testConnection;
     $("copyConfig").onclick = copyConfig;
     $("clearLogs").onclick = clearLogs;
-    $("cfgFragMinus").onclick = () => { const v = parseInt($("cfgFrag").value, 10); if (v > 1) $("cfgFrag").value = v - 1; };
-    $("cfgFragPlus").onclick = () => { const v = parseInt($("cfgFrag").value, 10); if (v < 64) $("cfgFrag").value = v + 1; };
+    $("cfgFragMinus").onclick = () => { $("cfgFrag").value = Math.max(1, clampFragments($("cfgFrag").value) - 1); };
+    $("cfgFragPlus").onclick = () => { $("cfgFrag").value = Math.min(64, clampFragments($("cfgFrag").value) + 1); };
+    $("cfgFrag").onchange = () => { $("cfgFrag").value = clampFragments($("cfgFrag").value); };
     $("toggleCf").onclick = () => { const i = $("cfgCf"); i.type = i.type === "password" ? "text" : "password"; $("toggleCf").textContent = i.type === "password" ? "Show" : "Hide"; };
     $("pasteCf").onclick = async () => {
       try {
@@ -1268,6 +1804,22 @@
       }
     };
     $("clearCf").onclick = clearCookie;
+    if ($("autoDetectCf")) $("autoDetectCf").onclick = autoDetectCookie;
+    if ($("setupAutoDetect")) $("setupAutoDetect").onclick = autoDetectCookie;
+    if ($("topbarSolveCf")) $("topbarSolveCf").onclick = openCfSolverModal;
+    if ($("bannerSolveCookie")) $("bannerSolveCookie").onclick = openCfSolverModal;
+    if ($("cfStartSolverBtn")) $("cfStartSolverBtn").onclick = startCfSolver;
+    if ($("cfCancelSolverBtn")) $("cfCancelSolverBtn").onclick = closeCfSolverModal;
+    if ($("shutdownBtnTop")) $("shutdownBtnTop").onclick = openShutdownModal;
+    if ($("shutdownBtnSettings")) $("shutdownBtnSettings").onclick = openShutdownModal;
+    if ($("confirmShutdownBtn")) $("confirmShutdownBtn").onclick = performShutdown;
+    if ($("cancelShutdownBtn")) $("cancelShutdownBtn").onclick = closeShutdownModal;
+    const shutdownModal = $("shutdownModal");
+    if (shutdownModal) {
+      shutdownModal.onclick = (e) => {
+        if (e.target === shutdownModal) closeShutdownModal();
+      };
+    }
     $("browseDownloadDir").onclick = browseDownloadDir;
     $("resetDownloadDir").onclick = resetDownloadDir;
     $("uaPreset").onchange = (e) => { if (e.target.value) $("cfgUa").value = e.target.value; };
@@ -1277,12 +1829,21 @@
     $("setupSaveTest").onclick = setupSaveAndTest;
 
     // activity
-    $("toggleActivity").onclick = () => {
-      state.activityHidden = !state.activityHidden;
-      const mobile = window.innerWidth <= 900;
-      document.body.classList.toggle("activity-hidden", state.activityHidden && !mobile);
-      document.body.classList.toggle("show-mobile-activity", !state.activityHidden && mobile);
-    };
+    const toggleBtn = $("toggleActivity");
+    if (toggleBtn) {
+      toggleBtn.onclick = () => toggleActivityPanel();
+      toggleBtn.classList.toggle("is-active", state.activityVisible);
+      toggleBtn.setAttribute("aria-expanded", String(state.activityVisible));
+    }
+    const statusPill = $("statusPill");
+    if (statusPill) {
+      statusPill.onclick = () => toggleActivityPanel();
+      statusPill.style.cursor = "pointer";
+    }
+    const closeBtn = $("closeActivity");
+    if (closeBtn) {
+      closeBtn.onclick = () => toggleActivityPanel(false);
+    }
     $$(".log-filters .chip").forEach(btn => btn.onclick = () => {
       state.logFilter = btn.dataset.level;
       $$(".log-filters .chip").forEach(b => b.classList.toggle("is-active", b === btn));
@@ -1294,22 +1855,8 @@
     $("copyPlaylists").onclick = () => copyToClip(state.job?.playlists?.join("\n") || "", "All playlist links copied");
 
     // actions
-    $("startBtn").onclick = startJob;
+    $("startBtn").onclick = handleMainAction;
     $("stopBtn").onclick = stopJob;
-
-    // library
-    $("rescanLibrary").onclick = rescanLibrary;
-    $("openLibraryFolder").onclick = openLibraryFolder;
-    $("libraryList").addEventListener("click", (event) => {
-      const toggle = event.target.closest(".lib-toggle");
-      if (toggle) { toggleLibraryGroup(Number(toggle.dataset.index)); return; }
-      const open = event.target.closest(".lib-open");
-      if (open) { openLibraryPath(open.dataset.path); return; }
-      const file = event.target.closest(".lib-delete-file");
-      if (file) { deleteLibraryPath(file.dataset.path, "file", file.dataset.name); return; }
-      const folder = event.target.closest(".lib-delete-folder");
-      if (folder) deleteLibraryPath(folder.dataset.path, "folder", folder.dataset.name);
-    });
 
     // copy slug
     $("copySlug").onclick = () => { if (state.selectedSlug) copyToClip(state.selectedSlug, "Slug copied"); };
@@ -1317,6 +1864,23 @@
     // cookie banner
     $("bannerSettings").onclick = () => showTab("settings");
     $("bannerClose").onclick = () => $("cookieBanner").classList.add("hidden");
+
+    // storage permission banner
+    if ($("grantStoragePermBtn")) {
+      $("grantStoragePermBtn").onclick = () => {
+        if (window.AndroidBridge && typeof window.AndroidBridge.requestStoragePermission === "function") {
+          window.AndroidBridge.requestStoragePermission();
+        }
+      };
+    }
+    if ($("storagePermClose")) {
+      $("storagePermClose").onclick = () => {
+        sessionStorage.setItem("storage_banner_dismissed", "1");
+        const banner = $("storagePermissionBanner");
+        if (banner) banner.classList.add("hidden");
+      };
+    }
+    checkAndroidStoragePermission();
 
     // keyboard shortcuts
     document.addEventListener("keydown", (e) => {
@@ -1367,6 +1931,21 @@
   /* ─────────────────────────────────────────────────────────────────
    *  go
    * ───────────────────────────────────────────────────────────────── */
+
+  window.addEventListener("animepahe-cookie-synced", async () => {
+    try {
+      const init = await api.get("/api/state");
+      state.config = normalizeConfig(init.config);
+      renderSettings();
+    } catch (_) {}
+    const banner = $("cookieBanner");
+    if (banner) banner.classList.add("hidden");
+    closeCfSolverModal();
+    toast("Cloudflare credentials updated!", "ok");
+    if (state.selectedSlug) {
+      loadEpisodes(state.selectedSlug, state.epPage, state.audioFilter);
+    }
+  });
 
   bind();
   fillUAPresets();

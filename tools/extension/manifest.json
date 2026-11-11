@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "AnimePahe GUI Auto-Sync",
+  "version": "1.2.0",
+  "description": "Automatically syncs Cloudflare cf_clearance and User-Agent to your local AnimePahe GUI",
+  "permissions": [
+    "cookies",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.animepahe.pw/*",
+    "*://*.animepahe.org/*",
+    "*://*.animepahe.ru/*",
+    "*://*.animepahe.com/*",
+    "*://*.kwik.cx/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.animepahe.pw/*",
+        "*://*.animepahe.org/*",
+        "*://*.animepahe.ru/*",
+        "*://*.animepahe.com/*"
+      ],
+      "js": [
+        "content_animepahe.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "content_gui.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AnimePahe GUI Auto-Sync"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "animepahe-autosync@local"
+    }
+  }
+}
