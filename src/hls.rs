@@ -121,16 +121,17 @@ impl HlsDownloader {
             match req.send().await {
                 Ok(res) => {
                     if !res.status().is_success() {
-                        return Err(format!("m3u8 request failed with HTTP {}", res.status()));
-                    }
-                    match res.text().await {
-                        Ok(b) => {
-                            body = b;
-                            break;
-                        }
-                        Err(e) => {
-                            last_err =
-                                format!("Failed to read m3u8 body: {}", format_reqwest_err(&e));
+                        last_err = format!("m3u8 request failed with HTTP {}", res.status());
+                    } else {
+                        match res.text().await {
+                            Ok(b) => {
+                                body = b;
+                                break;
+                            }
+                            Err(e) => {
+                                last_err =
+                                    format!("Failed to read m3u8 body: {}", format_reqwest_err(&e));
+                            }
                         }
                     }
                 }
@@ -272,7 +273,7 @@ impl HlsDownloader {
             }
             let mut key_bytes = None;
             let mut last_err = String::new();
-            for attempt in 1..=4 {
+            for attempt in 1..=6 {
                 if stop_signal.load(Ordering::Relaxed) {
                     return Err("Cancelled by user".to_string());
                 }
@@ -314,8 +315,8 @@ impl HlsDownloader {
                         );
                     }
                 }
-                if attempt < 4 {
-                    tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
+                if attempt < 6 {
+                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
                 }
             }
             let bytes = key_bytes.ok_or(last_err)?;

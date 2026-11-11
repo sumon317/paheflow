@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::api::{self, PlaySource};
@@ -608,6 +609,40 @@ struct JobSpec {
     cfg: AppConfig,
 }
 
+struct RunGuard {
+    state: Arc<Mutex<JobState>>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let mut st = state.lock().await;
+            st.running = false;
+            st.episodes.current = None;
+            if st.finished_at.is_none() {
+                st.finished_at = Some(chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+            }
+        });
+    }
+}
+
+fn ep_matches(a: &str, b: &str) -> bool {
+    let a_clean = a.trim();
+    let b_clean = b.trim();
+    if a_clean.is_empty() || b_clean.is_empty() {
+        return false;
+    }
+    if a_clean.eq_ignore_ascii_case(b_clean) {
+        return true;
+    }
+    let a_trimmed = a_clean.trim_start_matches('0');
+    let b_trimmed = b_clean.trim_start_matches('0');
+    let a_norm = if a_trimmed.is_empty() { "0" } else { a_trimmed };
+    let b_norm = if b_trimmed.is_empty() { "0" } else { b_trimmed };
+    a_norm == b_norm
+}
+
 struct RunnerHelper {
     state: Arc<Mutex<JobState>>,
     stop: Arc<AtomicBool>,
@@ -642,6 +677,9 @@ impl RunnerHelper {
     }
 
     async fn run_job(&self, spec: JobSpec) {
+        let _run_guard = RunGuard {
+            state: self.state.clone(),
+        };
         let JobSpec {
             client,
             slug,
@@ -721,13 +759,16 @@ impl RunnerHelper {
         // Expand episode list
         let mut episode_numbers = Vec::new();
         if requested_episodes.iter().any(|s| s == "*") {
+            let mut seen = std::collections::HashSet::new();
             for item in &releases {
                 let ep_str = match &item.episode {
                     serde_json::Value::Number(n) => n.to_string(),
                     serde_json::Value::String(s) => s.clone(),
                     _ => continue,
                 };
-                episode_numbers.push(ep_str);
+                if seen.insert(ep_str.clone()) {
+                    episode_numbers.push(ep_str);
+                }
             }
         } else {
             for req in &requested_episodes {
@@ -795,14 +836,41 @@ impl RunnerHelper {
             self.log("info", &format!("Processing Episode {}...", ep_num))
                 .await;
 
-            let target_ep = releases.iter().find(|e| {
-                let ep_str = match &e.episode {
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::new(),
-                };
-                ep_str == ep_num || ep_str.trim_start_matches('0') == ep_num.trim_start_matches('0')
-            });
+            let audio_pref = audio.trim().to_lowercase();
+            let is_audio_match = |e: &api::EpisodeItem| -> bool {
+                if audio_pref.is_empty() {
+                    return true;
+                }
+                let a = e.audio.to_lowercase();
+                if audio_pref == "eng" || audio_pref == "dub" {
+                    a == "eng" || a == "dub"
+                } else if audio_pref == "jpn" || audio_pref == "sub" {
+                    a == "jpn" || a == "sub" || a.is_empty()
+                } else {
+                    a == audio_pref
+                }
+            };
+
+            let target_ep = releases
+                .iter()
+                .find(|e| {
+                    let ep_str = match &e.episode {
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => String::new(),
+                    };
+                    ep_matches(&ep_str, &ep_num) && is_audio_match(e)
+                })
+                .or_else(|| {
+                    releases.iter().find(|e| {
+                        let ep_str = match &e.episode {
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::String(s) => s.clone(),
+                            _ => String::new(),
+                        };
+                        ep_matches(&ep_str, &ep_num)
+                    })
+                });
 
             let ep_session = match target_ep {
                 Some(e) => &e.session,
@@ -831,39 +899,59 @@ impl RunnerHelper {
                 }
             };
 
-            let chosen_source = select_best_source(&sources, &resolution, &audio);
-            let source_url = match chosen_source {
-                Some(s) => &s.url,
-                None => {
-                    self.log(
-                        "warn",
-                        &format!("Episode {}: no playable source found.", ep_num),
-                    )
-                    .await;
-                    failures += 1;
-                    continue;
-                }
-            };
+            let candidate_sources = select_candidate_sources(&sources, &resolution, &audio);
+            if candidate_sources.is_empty() {
+                self.log(
+                    "warn",
+                    &format!("Episode {}: no playable source found.", ep_num),
+                )
+                .await;
+                failures += 1;
+                continue;
+            }
 
-            // Fetch Kwik page to extract m3u8
-            let kwik_html = match client
-                .fetch(source_url, Some("https://animepahe.pw/"), &cfg)
-                .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    self.log(
-                        "warn",
-                        &format!("Episode {}: could not load stream page: {}", ep_num, e),
-                    )
-                    .await;
-                    failures += 1;
-                    continue;
+            let mut resolved_stream: Option<(&PlaySource, String)> = None;
+            for (idx, src) in candidate_sources.iter().enumerate() {
+                let mut html_opt = None;
+                for attempt in 1..=2 {
+                    if self.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match client
+                        .fetch(&src.url, Some("https://animepahe.pw/"), &cfg)
+                        .await
+                    {
+                        Ok(h) => {
+                            html_opt = Some(h);
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 2 {
+                                tokio::time::sleep(Duration::from_millis(600)).await;
+                            } else if idx == candidate_sources.len() - 1 {
+                                self.log(
+                                    "warn",
+                                    &format!(
+                                        "Episode {}: could not load stream page: {}",
+                                        ep_num, e
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                    }
                 }
-            };
 
-            let m3u8_url = match kwik::extract_m3u8_from_kwik(&kwik_html) {
-                Some(u) => u,
+                if let Some(ref html) = html_opt {
+                    if let Some(m3u8) = kwik::extract_m3u8_from_kwik(html) {
+                        resolved_stream = Some((src, m3u8));
+                        break;
+                    }
+                }
+            }
+
+            let (chosen_source, m3u8_url) = match resolved_stream {
+                Some((s, u)) => (Some(s.clone()), u),
                 None => {
                     self.log(
                         "warn",
@@ -884,6 +972,7 @@ impl RunnerHelper {
             }
 
             let is_dub = chosen_source
+                .as_ref()
                 .map(|s| s.audio.eq_ignore_ascii_case("eng") || s.audio.eq_ignore_ascii_case("dub"))
                 .unwrap_or_else(|| {
                     audio.eq_ignore_ascii_case("eng") || audio.eq_ignore_ascii_case("dub")
@@ -906,6 +995,7 @@ impl RunnerHelper {
             }
 
             let size_info = chosen_source
+                .as_ref()
                 .and_then(|s| s.filesize.as_ref())
                 .map(|sz| format!(" ({})", sz))
                 .unwrap_or_default();
@@ -994,6 +1084,42 @@ impl RunnerHelper {
                     if dl_res.is_ok() {
                         anime_dir = app_ext_dir.clone();
                     }
+                } else if !self.stop.load(Ordering::Relaxed) {
+                    // Automatic retry with halved concurrency resuming cached fragments
+                    self.log(
+                        "warn",
+                        &format!(
+                            "Episode {} download encountered an interruption ({}). Resuming remaining fragments...",
+                            ep_num, e
+                        ),
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let retry_concurrency = (fragments / 2).max(1);
+                    let state_for_retry = self.state.clone();
+                    dl_res = downloader
+                        .download_stream(DownloadConfig {
+                            m3u8_url: m3u8_url.clone(),
+                            referer: Some("https://kwik.cx/".to_string()),
+                            dest_path: final_file.clone(),
+                            replace_existing: false, // Resume cached fragments!
+                            concurrency: retry_concurrency,
+                            stop_signal: self.stop.clone(),
+                            pause_signal: self.pause.clone(),
+                            pause_notify: self.pause_notify.clone(),
+                            progress_cb: move |update: ProgressUpdate| {
+                                let st_clone = state_for_retry.clone();
+                                tokio::spawn(async move {
+                                    let mut st = st_clone.lock().await;
+                                    st.progress.percent = Some(update.percent);
+                                    st.progress.size = Some(update.size_str);
+                                    st.progress.speed = Some(update.speed_str);
+                                    st.progress.eta = Some(update.eta_str);
+                                    st.progress.file = Some(update.file_name);
+                                });
+                            },
+                        })
+                        .await;
                 }
             }
 
@@ -1071,12 +1197,12 @@ fn send_desktop_notification(summary: &str, body: &str, is_error: bool) {
     }
 }
 
-fn select_best_source<'a>(
+fn select_candidate_sources<'a>(
     sources: &'a [PlaySource],
     resolution: &str,
     audio: &str,
-) -> Option<&'a PlaySource> {
-    let mut filtered: Vec<&PlaySource> = sources.iter().collect();
+) -> Vec<&'a PlaySource> {
+    let mut candidates: Vec<&PlaySource> = sources.iter().collect();
 
     let lowered = audio.trim().to_lowercase();
     let norm_audio = match lowered.as_str() {
@@ -1086,35 +1212,51 @@ fn select_best_source<'a>(
     };
 
     if !norm_audio.is_empty() {
-        let audio_matches: Vec<&PlaySource> = filtered
+        let audio_matches: Vec<&PlaySource> = candidates
             .iter()
             .cloned()
             .filter(|s| s.audio.eq_ignore_ascii_case(norm_audio))
             .collect();
         if !audio_matches.is_empty() {
-            filtered = audio_matches;
+            candidates = audio_matches;
         }
     }
 
-    if !resolution.is_empty() {
-        let res_matches: Vec<&PlaySource> = filtered
-            .iter()
-            .cloned()
-            .filter(|s| s.resolution == resolution)
-            .collect();
-        if !res_matches.is_empty() {
-            return res_matches.into_iter().next();
+    let target_res = resolution.trim();
+    candidates.sort_by(|a, b| {
+        let a_res_match = !target_res.is_empty() && a.resolution == target_res;
+        let b_res_match = !target_res.is_empty() && b.resolution == target_res;
+        if a_res_match != b_res_match {
+            return b_res_match.cmp(&a_res_match);
         }
-    }
 
-    // Prefer kwik sources, highest resolution
-    filtered.sort_by(|a, b| {
+        let a_av1 = a.av1 == "1";
+        let b_av1 = b.av1 == "1";
+        if a_av1 != b_av1 {
+            return a_av1.cmp(&b_av1);
+        }
+
+        if a.kwik != b.kwik {
+            return b.kwik.cmp(&a.kwik);
+        }
+
         let ar: u32 = a.resolution.parse().unwrap_or(0);
         let br: u32 = b.resolution.parse().unwrap_or(0);
         br.cmp(&ar)
     });
 
-    filtered.into_iter().next()
+    candidates
+}
+
+#[cfg(test)]
+fn select_best_source<'a>(
+    sources: &'a [PlaySource],
+    resolution: &str,
+    audio: &str,
+) -> Option<&'a PlaySource> {
+    select_candidate_sources(sources, resolution, audio)
+        .into_iter()
+        .next()
 }
 
 #[cfg(test)]
@@ -1170,6 +1312,52 @@ mod tests {
         assert_eq!(episode_filename("02", true), "02 (Dub).mp4");
         assert_eq!(episode_filename("12.5", false), "12.5.mp4");
         assert_eq!(episode_filename("12.5", true), "12.5 (Dub).mp4");
+    }
+
+    #[test]
+    fn test_ep_matches() {
+        assert!(ep_matches("0", "0"));
+        assert!(ep_matches("00", "0"));
+        assert!(ep_matches("01", "1"));
+        assert!(ep_matches("1", "01"));
+        assert!(ep_matches("12.5", "12.5"));
+        assert!(!ep_matches("0", ""));
+        assert!(!ep_matches("", "0"));
+        assert!(!ep_matches("1", "2"));
+    }
+
+    #[test]
+    fn test_select_candidate_sources_prioritizes_non_av1_and_audio() {
+        let s1 = PlaySource {
+            url: "https://kwik.cx/e1".to_string(),
+            resolution: "1080".to_string(),
+            audio: "jpn".to_string(),
+            av1: "1".to_string(),
+            kwik: true,
+            filesize: None,
+        };
+        let s2 = PlaySource {
+            url: "https://kwik.cx/e2".to_string(),
+            resolution: "1080".to_string(),
+            audio: "jpn".to_string(),
+            av1: "0".to_string(),
+            kwik: true,
+            filesize: None,
+        };
+        let s3 = PlaySource {
+            url: "https://kwik.cx/e3".to_string(),
+            resolution: "720".to_string(),
+            audio: "eng".to_string(),
+            av1: "0".to_string(),
+            kwik: true,
+            filesize: None,
+        };
+        let sources = vec![s1, s2, s3];
+        let chosen = select_best_source(&sources, "1080", "jpn").unwrap();
+        assert_eq!(chosen.url, "https://kwik.cx/e2");
+
+        let dub_chosen = select_best_source(&sources, "720", "eng").unwrap();
+        assert_eq!(dub_chosen.url, "https://kwik.cx/e3");
     }
 
     #[test]

@@ -43,7 +43,7 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         override fun run() {
             if (isSolved) return
             checkCookies(autoDismiss = true)
-            handler.postDelayed(this, 1000)
+            handler.postDelayed(this, 800)
         }
     }
 
@@ -173,12 +173,6 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         initialClearance = extractClearance(if (existingPw.isNotEmpty()) existingPw else existingRu)
         Log.d("CF_SHEET", "onViewCreated: initialClearance len=${initialClearance.length}")
 
-        // Clear stale cookies
-        cookieManager.removeAllCookies { success ->
-            Log.d("CF_SHEET", "removeAllCookies result: $success")
-            cookieManager.flush()
-        }
-
         val settings = wv.settings
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
@@ -205,8 +199,22 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
             }
         }
 
-        wv.loadUrl("https://animepahe.pw/api?m=search&q=animepahe")
-        handler.postDelayed(cookieChecker, 2000)
+        var urlLoaded = false
+        val doLoad = {
+            if (!urlLoaded && !isSolved && webView != null) {
+                urlLoaded = true
+                wv.loadUrl("https://animepahe.pw/api?m=search&q=animepahe")
+                handler.postDelayed(cookieChecker, 1000)
+            }
+        }
+
+        // Clear stale cookies first, then load AnimePahe cleanly
+        cookieManager.removeAllCookies { success ->
+            Log.d("CF_SHEET", "removeAllCookies result: $success")
+            cookieManager.flush()
+            wv.post { doLoad() }
+        }
+        handler.postDelayed({ doLoad() }, 600)
     }
 
     private fun extractClearance(cookieStr: String?): String {

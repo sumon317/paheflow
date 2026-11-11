@@ -399,8 +399,8 @@ pub fn normalize_size_string(size: &str) -> String {
 }
 
 pub fn parse_sources_from_html(html: &str) -> Vec<PlaySource> {
-    let btn_re = Regex::new(r#"(?i)<button\b([^>]*)>"#).ok();
-    let attr_re = Regex::new(r#"(?i)data-(src|resolution|audio|av1)\s*=\s*"([^"]*)""#).ok();
+    let btn_re = Regex::new(r#"(?is)<button\b([^>]*)>(.*?)</button>"#).ok();
+    let attr_re = Regex::new(r#"(?i)data-(src|resolution|audio|av1)\s*=\s*["']([^"']*)["']"#).ok();
     let size_re = Regex::new(r#"(?i)(\d+(?:\.\d+)?)\s*(MB|GB|KB)"#).ok();
     let res_re = Regex::new(r#"(?i)\b(360|480|720|1080)p?\b"#).ok();
     let audio_re = Regex::new(r#"(?i)\b(eng|dub|jpn|sub)\b"#).ok();
@@ -449,7 +449,7 @@ pub fn parse_sources_from_html(html: &str) -> Vec<PlaySource> {
                 }
             }
 
-            if !src.is_empty() && av1 != "1" {
+            if !src.is_empty() {
                 let is_kwik = src.contains("kwik");
                 sources.push(PlaySource {
                     url: src,

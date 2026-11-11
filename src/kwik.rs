@@ -4,8 +4,9 @@ use regex::Regex;
 /// eval(function(p,a,c,k,e,d){...}('payload', base, count, 'keywords'.split('|'), 0, {}))
 pub fn unpack_dean_edwards(packed_js: &str) -> Option<String> {
     let re = Regex::new(
-        r#"(?s)\}\s*\(\s*['"](?P<payload>.*)['"]\s*,\s*(?P<radix>\d+)\s*,\s*(?P<count>\d+)\s*,\s*['"](?P<kw>.*)['"]\s*\.split\s*\(\s*['"]\|['"]\s*\)"#
-    ).ok()?;
+        r#"(?s)\}\s*\(\s*['"](?P<payload>.*?)['"]\s*,\s*(?P<radix>\d+)\s*,\s*(?P<count>\d+)\s*,\s*['"](?P<kw>.*?)['"]\s*\.split\s*\(\s*['"]\|['"]\s*\)"#,
+    )
+    .ok()?;
 
     let caps = re.captures(packed_js)?;
     let payload = caps.name("payload")?.as_str();
@@ -93,8 +94,9 @@ fn parse_base(s: &str, radix: u32) -> Option<usize> {
 pub fn extract_m3u8_from_kwik(html: &str) -> Option<String> {
     // 1. Match each eval(function(p,a,c,k,e,d)...) block individually
     let eval_re = Regex::new(
-        r#"(?s)eval\s*\(\s*function\s*\(p,a,c,k,e,d\).*?\.split\s*\(\s*['"]\|['"]\s*\)\s*,\s*0\s*,\s*\{\}\s*\)\s*\)"#
-    ).ok()?;
+        r#"(?s)eval\s*\(\s*function\s*\([a-z0-9,\s]+\).*?\.split\s*\(\s*['"]\|['"]\s*\)\s*,\s*0\s*,\s*\{\}\s*\)\s*\)"#,
+    )
+    .ok()?;
 
     for m in eval_re.find_iter(html) {
         if let Some(unpacked) = unpack_dean_edwards(m.as_str()) {
@@ -109,8 +111,9 @@ pub fn extract_m3u8_from_kwik(html: &str) -> Option<String> {
 }
 
 fn find_m3u8(text: &str) -> Option<String> {
-    let m3u8_re = Regex::new(r#"https?://[^\s"'<>]+\.m3u8[^\s"'<>]*"#).ok()?;
-    m3u8_re.find(text).map(|m| m.as_str().to_string())
+    let unescaped = text.replace(r#"\/"#, "/");
+    let m3u8_re = Regex::new(r#"https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*"#).ok()?;
+    m3u8_re.find(&unescaped).map(|m| m.as_str().to_string())
 }
 
 #[cfg(test)]

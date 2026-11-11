@@ -50,6 +50,7 @@ class AnimePaheService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
     private var isPolling = false
     private var lastCompletedCount = 0
 
@@ -68,6 +69,7 @@ class AnimePaheService : Service() {
             }
             stopSelf()
             wakeLock?.let { if (it.isHeld) it.release() }
+            releaseWifiLock()
             MainActivity.currentInstance?.get()?.finishAndRemoveTask()
             android.os.Process.killProcess(android.os.Process.myPid())
             return START_NOT_STICKY
@@ -93,14 +95,44 @@ class AnimePaheService : Service() {
     }
 
     private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "PaheFlow::DownloadWakeLock"
-        ).apply {
-            setReferenceCounted(false)
-            acquire(10 * 60 * 1000L /* 10 minutes max fallback */)
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (wakeLock == null) {
+                wakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "PaheFlow::DownloadWakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld != true) {
+                wakeLock?.acquire()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not acquire WakeLock: ${e.message}")
         }
+    }
+
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+            wifiLock = wifiManager?.createWifiLock(
+                android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "PaheFlow::DownloadWifiLock"
+            )?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not acquire WifiLock: ${e.message}")
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            wifiLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Exception) {}
     }
 
     private fun startEngineAndMonitor() {
@@ -141,22 +173,32 @@ class AnimePaheService : Service() {
                 if (conn.responseCode == 200) {
                     val body = conn.inputStream.bufferedReader().readText()
                     val json = JSONObject(body)
-                    val job = json.optJSONObject("job")
-                    if (job != null && job.optBoolean("running", false)) {
-                        val percent = job.optDouble("percent", 0.0).toInt()
-                        val speed = job.optString("speed", "")
-                        val ep = job.optString("current_episode", "")
-                        val text = if (ep.isNotEmpty()) "Ep $ep • $speed" else "Downloading… $speed"
-                        updateNotification("Downloading anime", text, percent, true)
-                        wakeLock?.acquire(5 * 60 * 1000L)
+                    val job = json.optJSONObject("job") ?: json
+                    val isRunning = job.optBoolean("running", false)
+                    if (isRunning) {
+                        val progress = job.optJSONObject("progress")
+                        val percent = progress?.optDouble("percent", 0.0)?.toInt() ?: 0
+                        val speed = progress?.optString("speed", "") ?: ""
+                        val epObj = job.optJSONObject("episodes")
+                        val ep = epObj?.optString("current", "") ?: ""
+                        val animeObj = job.optJSONObject("anime")
+                        val animeTitle = animeObj?.optString("title", "") ?: "anime"
+                        val text = if (ep.isNotEmpty()) "Ep $ep • $speed" else "Downloading $animeTitle… $speed"
+                        updateNotification("Downloading $animeTitle", text, percent, true)
 
-                        val completedArr = job.optJSONObject("episodes")?.optJSONArray("completed")
+                        if (wakeLock?.isHeld != true) {
+                            acquireWakeLock()
+                        }
+                        acquireWifiLock()
+
+                        val completedArr = epObj?.optJSONArray("completed")
                         val completedCount = completedArr?.length() ?: 0
                         if (completedCount > lastCompletedCount) {
                             lastCompletedCount = completedCount
                             scanAllCompletedFiles()
                         }
                     } else {
+                        releaseWifiLock()
                         updateNotification("PaheFlow", "Idle • Tap to open", 0, false)
                         if (lastCompletedCount > 0) {
                             scanAllCompletedFiles()

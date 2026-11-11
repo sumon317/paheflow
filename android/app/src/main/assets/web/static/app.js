@@ -937,6 +937,9 @@
 
   function compressEpisodes(arr) {
     if (!arr.length) return "";
+    if (arr.some(n => String(n).includes(".") || isNaN(Number(n)))) {
+      return arr.join(", ");
+    }
     const nums = arr.map(n => parseInt(n, 10)).filter(n => !isNaN(n)).sort((a, b) => a - b);
     const parts = [];
     let start = nums[0], prev = nums[0];
@@ -1012,6 +1015,13 @@
     updateDownloadDirBadge();
     renderDeps();
     renderSetup();
+    const autoSolveCb = $("cfgAutoSolveOnLaunch");
+    if (autoSolveCb) {
+      autoSolveCb.checked = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "true") !== "false";
+      autoSolveCb.onchange = () => {
+        localStorage.setItem("paheflow_auto_solve_cf_on_launch", autoSolveCb.checked ? "true" : "false");
+      };
+    }
     updateSaveHint("");
   }
 
@@ -1776,9 +1786,14 @@
       state.catalogLimit = CATALOG_PAGE_SIZE;
       renderSettings();
       renderCatalog();
+      const autoSolveOnLaunch = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "true") !== "false";
       if (!state.config.cfConfigured) {
         showTab("settings");
         openCfSolverModal();
+      } else if (autoSolveOnLaunch) {
+        setTimeout(() => {
+          openCfSolverModal();
+        }, 350);
       }
       applyJob(init.job);
       if (init.job?.logSeq !== undefined) state.logSeq = init.job.logSeq;

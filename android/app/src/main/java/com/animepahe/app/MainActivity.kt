@@ -275,6 +275,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun showCloudflareSolver() {
+        if (isFinishing || isDestroyed) return
+        val existing = supportFragmentManager.findFragmentByTag(CloudflareBottomSheet.TAG)
+        if (existing != null && existing.isAdded) {
+            return
+        }
         val sheet = CloudflareBottomSheet.newInstance {
             // Dispatch event to app without reloading page to preserve user selections
             webView.evaluateJavascript(
