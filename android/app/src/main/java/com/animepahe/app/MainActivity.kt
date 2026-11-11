@@ -407,7 +407,7 @@ class MainActivity : AppCompatActivity() {
                         null
                     )
                 }
-                val cacheFolder = externalCacheDir ?: cacheDir
+                val cacheFolder = externalCacheDir ?: getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: cacheDir
                 val destFile = File(cacheFolder, "paheflow-update.apk")
                 if (destFile.exists()) {
                     destFile.delete()
@@ -421,6 +421,7 @@ class MainActivity : AppCompatActivity() {
                     connection = urlObj.openConnection() as java.net.HttpURLConnection
                     connection.instanceFollowRedirects = false
                     connection.setRequestProperty("User-Agent", "PaheFlow-Updater")
+                    connection.setRequestProperty("Accept-Encoding", "identity")
                     connection.connectTimeout = 15000
                     connection.readTimeout = 30000
                     val status = connection.responseCode
@@ -449,7 +450,11 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
 
-                val totalBytes = connection.contentLength.toLong()
+                val totalBytes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    connection.contentLengthLong
+                } else {
+                    connection.contentLength.toLong()
+                }
                 var downloadedBytes = 0L
                 val buffer = ByteArray(32 * 1024)
                 var lastPercent = -1
@@ -461,12 +466,25 @@ class MainActivity : AppCompatActivity() {
                             output.write(buffer, 0, read)
                             downloadedBytes += read
                             if (totalBytes > 0) {
-                                val percent = ((downloadedBytes * 100) / totalBytes).toInt()
+                                val percent = ((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 99)
                                 if (percent != lastPercent) {
                                     lastPercent = percent
                                     runOnUiThread {
                                         webView.evaluateJavascript(
                                             "if (typeof window.onUpdateDownloadProgress === 'function') window.onUpdateDownloadProgress($percent, '$percent%');",
+                                            null
+                                        )
+                                    }
+                                }
+                            } else {
+                                val mb = downloadedBytes / (1024f * 1024f)
+                                val text = String.format(java.util.Locale.US, "%.1f MB", mb)
+                                val approxPercent = ((downloadedBytes * 100) / (25 * 1024 * 1024)).toInt().coerceIn(1, 95)
+                                if (approxPercent != lastPercent) {
+                                    lastPercent = approxPercent
+                                    runOnUiThread {
+                                        webView.evaluateJavascript(
+                                            "if (typeof window.onUpdateDownloadProgress === 'function') window.onUpdateDownloadProgress($approxPercent, '$text');",
                                             null
                                         )
                                     }

@@ -229,19 +229,26 @@ impl HlsDownloader {
             return Ok(());
         }
 
-        let target_file = {
-            let file_stem = final_mp4.file_stem().unwrap_or_default().to_string_lossy();
-            final_mp4.with_file_name(format!("{}.part.mp4", file_stem))
-        };
+        // Store intermediate fragments and temporary assembly in the application cache.
+        // On Android, this avoids writing hundreds of tiny chunks and dot/temp files
+        // through the MediaProvider FUSE layer in public storage (e.g. Download/PaheFlow),
+        // which triggers "Operation not permitted" (EPERM / os error 1).
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        final_mp4.hash(&mut hasher);
+        let stream_hash = format!("{:016x}", hasher.finish());
 
-        let temp_ts = {
-            let file_stem = final_mp4.file_stem().unwrap_or_default().to_string_lossy();
-            final_mp4.with_file_name(format!("{}.part.ts", file_stem))
-        };
-        if let Some(parent) = temp_ts.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create destination folder {:?}: {}", parent, e))?;
-        }
+        let cache_frag_root = crate::config::cache_dir().join("fragments");
+        let temp_dir = cache_frag_root.join(&stream_hash);
+        let temp_ts = cache_frag_root.join(format!("{}.ts", stream_hash));
+        let target_file = cache_frag_root.join(format!("{}.part.mp4", stream_hash));
+
+        fs::create_dir_all(&cache_frag_root).map_err(|e| {
+            format!(
+                "Failed to create cache fragments root {:?}: {}",
+                cache_frag_root, e
+            )
+        })?;
 
         let segments = self.parse_playlist(m3u8_url, referer).await?;
         let total_segments = segments.len();
@@ -320,8 +327,7 @@ impl HlsDownloader {
         let downloaded_bytes = Arc::new(AtomicU64::new(0));
         let start_time = Instant::now();
 
-        // Create temporary directory for fragments
-        let temp_dir = temp_ts.with_extension("fragments");
+        // Prepare temporary directory for fragments in cache
         if replace_existing {
             // A replacement must never reuse fragments from a failed earlier
             // attempt; start from a clean slate.
@@ -632,12 +638,21 @@ impl HlsDownloader {
         }
 
         let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_file(&temp_ts);
+
+        // Ensure final destination directory exists before swapping
+        if let Some(parent) = final_mp4.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create destination folder {:?}: {}", parent, e))?;
+        }
 
         // Only swap in the finished file after stream assembly succeeds. A failed or
         // interrupted attempt therefore cannot masquerade as a completed
         // episode on the next run.
         safe_replace_file(&target_file, &final_mp4)
             .map_err(|e| format!("Replacing output file failed: {}", e))?;
+
+        let _ = fs::remove_file(&target_file);
 
         Ok(())
     }

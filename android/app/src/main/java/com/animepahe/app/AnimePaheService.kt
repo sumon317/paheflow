@@ -51,6 +51,7 @@ class AnimePaheService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var wakeLock: PowerManager.WakeLock? = null
     private var isPolling = false
+    private var lastCompletedCount = 0
 
     override fun onCreate() {
         super.onCreate()
@@ -73,14 +74,18 @@ class AnimePaheService : Service() {
         }
 
         val notification = buildNotification("PaheFlow is active", "Service is ready in background", 0, false)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground service: ${e.message}", e)
         }
 
         startEngineAndMonitor()
@@ -101,6 +106,13 @@ class AnimePaheService : Service() {
     private fun startEngineAndMonitor() {
         serviceScope.launch {
             val app = AnimePaheApp.instance
+            try {
+                android.system.Os.setenv("ANIMEPAHE_APP_EXT_DOWNLOAD_DIR", app.getExternalDownloadDir().absolutePath, true)
+                android.system.Os.setenv("ANIMEPAHE_GUI_CACHE_DIR", app.getAppCacheDir().absolutePath, true)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not set native storage environment variables: ${e.message}")
+            }
+
             val port = NativeEngine.startServer(
                 preferredPort = 8765,
                 resDir = app.getResourceDir().absolutePath,
@@ -137,14 +149,50 @@ class AnimePaheService : Service() {
                         val text = if (ep.isNotEmpty()) "Ep $ep • $speed" else "Downloading… $speed"
                         updateNotification("Downloading anime", text, percent, true)
                         wakeLock?.acquire(5 * 60 * 1000L)
+
+                        val completedArr = job.optJSONObject("episodes")?.optJSONArray("completed")
+                        val completedCount = completedArr?.length() ?: 0
+                        if (completedCount > lastCompletedCount) {
+                            lastCompletedCount = completedCount
+                            scanAllCompletedFiles()
+                        }
                     } else {
                         updateNotification("PaheFlow", "Idle • Tap to open", 0, false)
+                        if (lastCompletedCount > 0) {
+                            scanAllCompletedFiles()
+                            lastCompletedCount = 0
+                        }
                     }
                 }
                 conn.disconnect()
             } catch (e: Exception) {
                 // Ignore transient local connection blips
             }
+        }
+    }
+
+    private fun scanAllCompletedFiles() {
+        try {
+            val dirs = mutableListOf<java.io.File>()
+            val pubDir = java.io.File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "PaheFlow")
+            if (pubDir.exists()) dirs.add(pubDir)
+            val extDir = AnimePaheApp.instance.getExternalDownloadDir()
+            if (extDir.exists()) dirs.add(extDir)
+
+            dirs.forEach { base ->
+                base.walkTopDown().maxDepth(3).filter {
+                    it.isFile && (it.extension.equals("mp4", ignoreCase = true) || it.extension.equals("mkv", ignoreCase = true))
+                }.forEach { videoFile ->
+                    android.media.MediaScannerConnection.scanFile(
+                        this@AnimePaheService,
+                        arrayOf(videoFile.absolutePath),
+                        arrayOf("video/mp4"),
+                        null
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error scanning completed media files: ${e.message}")
         }
     }
 

@@ -124,6 +124,17 @@ pub fn data_dir() -> PathBuf {
     default_data_dir()
 }
 
+/// Directory for temporary download fragments, assembled streams, and cache.
+pub fn cache_dir() -> PathBuf {
+    if let Some(value) = std::env::var_os("ANIMEPAHE_GUI_CACHE_DIR") {
+        let path = PathBuf::from(value);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    data_dir().join("cache")
+}
+
 /// Backwards-compatible name for the writable application directory.
 pub fn project_base_dir() -> PathBuf {
     data_dir()

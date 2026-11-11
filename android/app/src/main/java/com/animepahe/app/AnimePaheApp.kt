@@ -23,6 +23,25 @@ class AnimePaheApp : Application() {
         instance = this
         createNotificationChannel()
         extractAssetsIfNeeded()
+        initStorageDirectories()
+    }
+
+    private fun initStorageDirectories() {
+        try {
+            getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)?.mkdirs()
+            (externalCacheDir ?: cacheDir).mkdirs()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not initialize app storage directories: ${e.message}")
+        }
+    }
+
+    fun getExternalDownloadDir(): File {
+        return getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+            ?: File(filesDir, "downloads")
+    }
+
+    fun getAppCacheDir(): File {
+        return (externalCacheDir ?: cacheDir).apply { mkdirs() }
     }
 
     private fun createNotificationChannel() {

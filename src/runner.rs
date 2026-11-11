@@ -129,7 +129,7 @@ fn probe_dir_writable(dir: &Path) -> bool {
         return false;
     }
     let test_file = dir.join(format!(
-        ".paheflow_probe_{}_{}.tmp",
+        "paheflow_probe_{}_{}.tmp",
         std::process::id(),
         fastrand::u32(..)
     ));
@@ -341,6 +341,13 @@ impl Runner {
         let mut anime_dir = planned_dir.clone();
         let mut storage_warning: Option<String> = None;
 
+        let app_ext_dir = std::env::var("ANIMEPAHE_APP_EXT_DOWNLOAD_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from("/storage/emulated/0/Android/data/com.animepahe.app/files/Download")
+            })
+            .join(&folder_name);
+
         if !probe_dir_writable(&anime_dir) {
             eprintln!("[Runner] Planned anime dir {:?} is not writable", anime_dir);
             let default_root = crate::config::default_download_dir();
@@ -352,30 +359,24 @@ impl Runner {
                     planned_dir.display(),
                     anime_dir.display()
                 ));
+            } else if probe_dir_writable(&app_ext_dir) {
+                anime_dir = app_ext_dir.clone();
+                storage_warning = Some(format!(
+                    "Storage permission missing for '{}' (Operation not permitted). Saving anime to app storage: '{}'. Grant 'All files access' in Android Settings to save directly to Download/PaheFlow.",
+                    planned_dir.display(),
+                    anime_dir.display()
+                ));
             } else {
-                let app_ext_dir = PathBuf::from(
-                    "/storage/emulated/0/Android/data/com.animepahe.app/files/Download",
-                )
-                .join(&folder_name);
-                if probe_dir_writable(&app_ext_dir) {
-                    anime_dir = app_ext_dir;
-                    storage_warning = Some(format!(
-                        "Storage permission missing for '{}' (Operation not permitted). Saving anime to app storage: '{}'. Grant 'All files access' in Android Settings to save directly to Download/PaheFlow.",
-                        planned_dir.display(),
-                        anime_dir.display()
-                    ));
-                } else {
-                    let internal_dir = crate::config::data_dir()
-                        .join("downloads")
-                        .join(&folder_name);
-                    let _ = std::fs::create_dir_all(&internal_dir);
-                    anime_dir = internal_dir;
-                    storage_warning = Some(format!(
-                        "Storage permission missing for '{}'. Saving to internal app storage: '{}'. Grant 'All files access' in Android Settings to save directly to Download/PaheFlow.",
-                        planned_dir.display(),
-                        anime_dir.display()
-                    ));
-                }
+                let internal_dir = crate::config::data_dir()
+                    .join("downloads")
+                    .join(&folder_name);
+                let _ = std::fs::create_dir_all(&internal_dir);
+                anime_dir = internal_dir;
+                storage_warning = Some(format!(
+                    "Storage permission missing for '{}'. Saving to internal app storage: '{}'. Grant 'All files access' in Android Settings to save directly to Download/PaheFlow.",
+                    planned_dir.display(),
+                    anime_dir.display()
+                ));
             }
         }
 
@@ -452,6 +453,7 @@ impl Runner {
                     list_only,
                     fragments,
                     anime_dir,
+                    app_ext_dir,
                     storage_warning,
                     cfg,
                 })
@@ -601,6 +603,7 @@ struct JobSpec {
     list_only: bool,
     fragments: usize,
     anime_dir: PathBuf,
+    app_ext_dir: PathBuf,
     storage_warning: Option<String>,
     cfg: AppConfig,
 }
@@ -649,7 +652,8 @@ impl RunnerHelper {
             replace,
             list_only,
             fragments,
-            anime_dir,
+            mut anime_dir,
+            app_ext_dir,
             storage_warning,
             cfg,
         } = spec;
@@ -909,7 +913,7 @@ impl RunnerHelper {
             let pause_for_dl = self.pause.clone();
             let pause_notify_for_dl = self.pause_notify.clone();
 
-            let dl_res = downloader
+            let mut dl_res = downloader
                 .download_stream(DownloadConfig {
                     m3u8_url: m3u8_url.clone(),
                     referer: Some("https://kwik.cx/".to_string()),
@@ -932,6 +936,55 @@ impl RunnerHelper {
                     },
                 })
                 .await;
+
+            if let Err(ref e) = dl_res {
+                let err_lower = e.to_lowercase();
+                if (err_lower.contains("operation not permitted")
+                    || err_lower.contains("permission denied")
+                    || err_lower.contains("failed to create destination folder")
+                    || err_lower.contains("replacing output file failed"))
+                    && anime_dir != app_ext_dir
+                {
+                    self.log(
+                        "warn",
+                        &format!(
+                            "Storage write to '{}' failed ({}). Retrying with app storage '{}'...",
+                            anime_dir.display(),
+                            e,
+                            app_ext_dir.display()
+                        ),
+                    )
+                    .await;
+                    let fallback_file = app_ext_dir.join(&filename);
+                    let state_for_retry = self.state.clone();
+                    dl_res = downloader
+                        .download_stream(DownloadConfig {
+                            m3u8_url: m3u8_url.clone(),
+                            referer: Some("https://kwik.cx/".to_string()),
+                            dest_path: fallback_file.clone(),
+                            replace_existing: replace,
+                            concurrency: fragments,
+                            stop_signal: self.stop.clone(),
+                            pause_signal: self.pause.clone(),
+                            pause_notify: self.pause_notify.clone(),
+                            progress_cb: move |update: ProgressUpdate| {
+                                let st_clone = state_for_retry.clone();
+                                tokio::spawn(async move {
+                                    let mut st = st_clone.lock().await;
+                                    st.progress.percent = Some(update.percent);
+                                    st.progress.size = Some(update.size_str);
+                                    st.progress.speed = Some(update.speed_str);
+                                    st.progress.eta = Some(update.eta_str);
+                                    st.progress.file = Some(update.file_name);
+                                });
+                            },
+                        })
+                        .await;
+                    if dl_res.is_ok() {
+                        anime_dir = app_ext_dir.clone();
+                    }
+                }
+            }
 
             match dl_res {
                 Ok(_) => {
