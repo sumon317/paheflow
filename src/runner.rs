@@ -670,14 +670,14 @@ impl RunnerHelper {
         let mut actual_slug = slug.clone();
         let mut releases_res = api::release_with_status(&client, &actual_slug, &cfg).await;
         if let Err(ref e) = releases_res {
-            if e.contains("slug may have rotated") || e.contains("returned HTML instead of JSON") {
+            if api::is_rotated_or_missing_error(e) {
                 if let Some(new_slug) =
                     api::resolve_active_slug(&client, &actual_slug, Some(&anime_title), &cfg).await
                 {
                     self.log(
                         "info",
                         &format!(
-                            "Detected rotated slug for '{}'. Auto-healed session to {}.",
+                            "Detected rotated or updated slug for '{}'. Auto-healed session to {}.",
                             anime_title, new_slug
                         ),
                     )
@@ -697,8 +697,19 @@ impl RunnerHelper {
                 list.items
             }
             Err(e) => {
-                self.log("error", &format!("Failed to fetch episodes: {}", e))
+                if api::is_rotated_or_missing_error(&e) {
+                    self.log(
+                        "error",
+                        &format!(
+                            "No releases found for '{}' (HTTP 404). The anime may have been removed or unavailable on AnimePahe.",
+                            anime_title
+                        ),
+                    )
                     .await;
+                } else {
+                    self.log("error", &format!("Failed to fetch episodes: {}", e))
+                        .await;
+                }
                 let mut st = self.state.lock().await;
                 st.running = false;
                 st.exit_code = Some(1);

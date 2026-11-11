@@ -468,6 +468,7 @@
     if (animeChanged) {
       // Episode numbers are only meaningful inside one anime. Keeping the
       // previous selection could silently download episodes of the new show.
+      state.epNotFound = false;
       state.episodesSelected = [];
       state.epFilter = "";
       $("epFilter").value = "";
@@ -493,6 +494,7 @@
         slug = res.slug;
       }
       if (state.selectedSlug !== slug || state.epPage !== page) return;
+      state.epNotFound = !!res.notFound;
       state.episodes = res.items || [];
       state.epLastPage = res.lastPage ?? 1;
       state.epPage = res.page ?? page;
@@ -508,15 +510,27 @@
       syncAudioControlUI();
       renderEpGrid();
       updatePagination();
-      probeFirstEpisode();
+      if (!res.notFound) {
+        probeFirstEpisode();
+      }
       $("cookieBanner").classList.add("hidden");
       if (res.stale) {
-        // The site refused the live request; this list came from the disk cache.
-        toast(res.warning || "Showing a cached episode list — the live request failed.", "warn");
+        // The site refused the live request; this list came from the disk cache or not found.
+        if (res.warning && !res.notFound) {
+          toast(res.warning, "warn");
+        }
       }
     } catch (e) {
-      toast("Failed to load episodes: " + e.message, "error");
-      noteApiError(e.message);
+      const is404 = String(e.message || "").includes("404") || String(e.message || "").toLowerCase().includes("not found");
+      if (is404) {
+        state.epNotFound = true;
+        state.episodes = [];
+        renderEpGrid();
+        updatePagination();
+      } else {
+        toast("Failed to load episodes: " + e.message, "error");
+        noteApiError(e.message);
+      }
     }
     finally { setBusy($("reloadEpisodes"), false); }
   }
@@ -585,7 +599,10 @@
     if (!filtered.length) {
       let title = "No episodes match";
       let text = "Try adjusting your search filter.";
-      if (state.audioFilter === "dub" || state.audioFilter === "eng") {
+      if (state.epNotFound) {
+        title = "No episodes found";
+        text = "This title appears to have no releases or was removed on AnimePahe.";
+      } else if (state.audioFilter === "dub" || state.audioFilter === "eng") {
         title = "No Dub episodes available";
         text = "English Dub episodes have not been released yet for this anime. Try switching to Sub or All.";
       } else if (state.audioFilter === "sub" || state.audioFilter === "jpn") {
@@ -745,7 +762,8 @@
     const slug = state.selectedSlug;
     setBusy($("probeOptions"), true);
     try {
-      const opts = await api.get(`/api/episode-options?slug=${encodeURIComponent(slug)}&episode=${encodeURIComponent(episode)}`);
+      const titleParam = state.selectedTitle ? `&title=${encodeURIComponent(state.selectedTitle)}` : "";
+      const opts = await api.get(`/api/episode-options?slug=${encodeURIComponent(slug)}&episode=${encodeURIComponent(episode)}${titleParam}`);
       if (state.selectedSlug !== slug) return;
       state.options = opts;
       if (opts.filesizes) {

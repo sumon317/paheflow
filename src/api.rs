@@ -162,7 +162,7 @@ pub async fn search(
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let url = format!("{}/?m=search&q={}", API_URL, urlencoding::encode(trimmed));
+    let url = format!("{}?m=search&q={}", API_URL, urlencoding::encode(trimmed));
     let json = client.fetch_json(&url, None, cfg).await?;
 
     let mut results = Vec::new();
@@ -221,12 +221,24 @@ pub async fn release_page(
     cfg: &AppConfig,
 ) -> Result<(Vec<EpisodeItem>, u32), String> {
     let url = format!(
-        "{}/?m=release&id={}&sort=episode_asc&page={}",
+        "{}?m=release&id={}&sort=episode_asc&page={}",
         API_URL,
         urlencoding::encode(slug),
         page.max(1)
     );
-    let json = client.fetch_json(&url, None, cfg).await?;
+    let json = match client.fetch_json(&url, None, cfg).await {
+        Ok(j) => j,
+        Err(e) if is_rotated_or_missing_error(&e) => {
+            let alt_url = format!(
+                "{}/?m=release&id={}&sort=episode_asc&page={}",
+                API_URL,
+                urlencoding::encode(slug),
+                page.max(1)
+            );
+            client.fetch_json(&alt_url, None, cfg).await?
+        }
+        Err(e) => return Err(e),
+    };
 
     let last_page = json
         .get("last_page")
@@ -845,6 +857,64 @@ pub async fn refresh_catalog(
     Ok(entries)
 }
 
+pub fn is_rotated_or_missing_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("404")
+        || lower.contains("not found")
+        || lower.contains("slug may have rotated")
+        || lower.contains("returned html instead of json")
+        || lower.contains("no data for this request")
+}
+
+fn generate_search_terms(title: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return terms;
+    }
+    terms.push(trimmed.to_string());
+
+    // Cleaned: replace non-alphanumeric with spaces, collapse spaces
+    let cleaned: String = trimmed
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if !cleaned.is_empty() && cleaned != trimmed {
+        terms.push(cleaned.clone());
+    }
+
+    // If title has multiple parts (e.g. separated by colon, slash, dash, semicolon)
+    if let Some(pos) = trimmed.find([':', '/', '-', ';']) {
+        let prefix = trimmed[..pos].trim();
+        if prefix.len() >= 3 && prefix != trimmed {
+            terms.push(prefix.to_string());
+            let clean_prefix: String = prefix
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !clean_prefix.is_empty() && clean_prefix != prefix {
+                terms.push(clean_prefix);
+            }
+        }
+    }
+
+    terms
+}
+
+fn normalize_for_match(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
 pub async fn resolve_active_slug(
     client: &HttpClient,
     slug: &str,
@@ -858,16 +928,27 @@ pub async fn resolve_active_slug(
     if title.is_empty() {
         return None;
     }
-    if let Ok(results) = search(client, &title, cfg).await {
-        for res in results {
-            if res.title.trim().eq_ignore_ascii_case(title.trim())
-                || res.title.to_lowercase().starts_with(&title.to_lowercase())
-                || title.to_lowercase().starts_with(&res.title.to_lowercase())
-            {
-                let new_slug = res.slug;
-                if !new_slug.is_empty() && new_slug != slug {
-                    update_slug_in_catalog(slug, &new_slug, &title);
-                    return Some(new_slug);
+
+    let search_terms = generate_search_terms(&title);
+    let norm_target = normalize_for_match(&title);
+
+    for term in search_terms {
+        if let Ok(results) = search(client, &term, cfg).await {
+            for res in results {
+                let norm_res = normalize_for_match(&res.title);
+                let is_match = res.title.trim().eq_ignore_ascii_case(title.trim())
+                    || (!norm_res.is_empty()
+                        && !norm_target.is_empty()
+                        && (norm_res == norm_target
+                            || norm_res.starts_with(&norm_target)
+                            || norm_target.starts_with(&norm_res)));
+
+                if is_match {
+                    let new_slug = res.slug;
+                    if !new_slug.is_empty() && new_slug != slug {
+                        update_slug_in_catalog(slug, &new_slug, &res.title);
+                        return Some(new_slug);
+                    }
                 }
             }
         }
@@ -1071,5 +1152,37 @@ mod tests {
         let s1080 = sources.iter().find(|s| s.resolution == "1080").unwrap();
         assert_eq!(s1080.url, "https://kwik.cx/e/456");
         assert_eq!(s1080.filesize, Some("285 MB".to_string()));
+    }
+
+    #[test]
+    fn detects_rotated_or_missing_errors() {
+        assert!(is_rotated_or_missing_error(
+            "HTTP request failed with status code 404 Not Found"
+        ));
+        assert!(is_rotated_or_missing_error("404 Not Found"));
+        assert!(is_rotated_or_missing_error("slug may have rotated"));
+        assert!(is_rotated_or_missing_error("returned HTML instead of JSON"));
+        assert!(!is_rotated_or_missing_error("Connection timed out"));
+        assert!(!is_rotated_or_missing_error("500 Internal Server Error"));
+    }
+
+    #[test]
+    fn generates_search_terms_for_punctuated_titles() {
+        let terms = generate_search_terms(".hack//Gift");
+        assert!(terms.contains(&".hack//Gift".to_string()));
+        assert!(terms.contains(&"hack Gift".to_string()));
+        assert!(terms.contains(&".hack".to_string()));
+        assert!(terms.contains(&"hack".to_string()));
+
+        let terms_simple = generate_search_terms("Naruto");
+        assert_eq!(terms_simple, vec!["Naruto".to_string()]);
+    }
+
+    #[test]
+    fn normalizes_titles_for_matching() {
+        assert_eq!(normalize_for_match(".hack//Gift"), "hackgift");
+        assert_eq!(normalize_for_match(".hack // Gift"), "hackgift");
+        assert_eq!(normalize_for_match("hack gift"), "hackgift");
+        assert_eq!(normalize_for_match(".hack//Roots"), "hackroots");
     }
 }

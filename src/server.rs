@@ -671,7 +671,7 @@ async fn get_episodes(
     if let Some(pg) = page {
         let mut res = api::release_page(&state.client, &slug, pg, &cfg).await;
         if let Err(ref e) = res {
-            if e.contains("slug may have rotated") || e.contains("returned HTML instead of JSON") {
+            if api::is_rotated_or_missing_error(e) {
                 if let Some(new_slug) =
                     api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg)
                         .await
@@ -718,6 +718,21 @@ async fn get_episodes(
             }
             Err(e) => {
                 if cached.is_empty() {
+                    if api::is_rotated_or_missing_error(&e) {
+                        return Ok(Json(serde_json::json!({
+                            "items": [],
+                            "lastPage": 1,
+                            "page": pg,
+                            "slug": slug,
+                            "total": 0,
+                            "totalAll": 0,
+                            "availableAudios": [],
+                            "audio": serde_json::Value::Null,
+                            "stale": true,
+                            "notFound": true,
+                            "warning": "No release data found on AnimePahe. This title may have been removed or unavailable.",
+                        })));
+                    }
                     return Err((
                         StatusCode::BAD_GATEWAY,
                         Json(serde_json::json!({ "error": e })),
@@ -745,7 +760,7 @@ async fn get_episodes(
     } else {
         let mut res = api::release_with_status(&state.client, &slug, &cfg).await;
         if let Err(ref e) = res {
-            if e.contains("slug may have rotated") || e.contains("returned HTML instead of JSON") {
+            if api::is_rotated_or_missing_error(e) {
                 if let Some(new_slug) =
                     api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg)
                         .await
@@ -776,10 +791,25 @@ async fn get_episodes(
                     "warning": list.warning,
                 })))
             }
-            Err(e) => Err((
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": e })),
-            )),
+            Err(e) => {
+                if cached.is_empty() && api::is_rotated_or_missing_error(&e) {
+                    return Ok(Json(serde_json::json!({
+                        "items": [],
+                        "slug": slug,
+                        "total": 0,
+                        "totalAll": 0,
+                        "availableAudios": [],
+                        "audio": serde_json::Value::Null,
+                        "stale": true,
+                        "notFound": true,
+                        "warning": "No release data found on AnimePahe. This title may have been removed or unavailable.",
+                    })));
+                }
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": e })),
+                ))
+            }
         }
     }
 }
@@ -796,13 +826,15 @@ async fn get_episode_options(
         ));
     }
     let mut slug = query.get("slug").cloned().unwrap_or_default();
+    let title_param = query.get("title").cloned();
     let episode = query.get("episode").cloned().unwrap_or_default();
     let cfg = read_config();
 
     let mut res = api::available_options(&state.client, &slug, &episode, &cfg).await;
     if let Err(ref e) = res {
-        if e.contains("slug may have rotated") || e.contains("returned HTML instead of JSON") {
-            if let Some(new_slug) = api::resolve_active_slug(&state.client, &slug, None, &cfg).await
+        if api::is_rotated_or_missing_error(e) {
+            if let Some(new_slug) =
+                api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg).await
             {
                 println!(
                     "[Slug Auto-Heal] Options self-healed rotated slug: {} -> {}",
@@ -815,10 +847,24 @@ async fn get_episode_options(
     }
     match res {
         Ok(opts) => Ok(Json(serde_json::to_value(&opts).unwrap_or_default())),
-        Err(e) => Err((
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": e })),
-        )),
+        Err(e) => {
+            if api::is_rotated_or_missing_error(&e) {
+                return Ok(Json(serde_json::json!({
+                    "episode": episode,
+                    "session": "",
+                    "resolutions": [],
+                    "audios": [],
+                    "combinations": [],
+                    "sourceCount": 0,
+                    "filesizes": {},
+                    "notFound": true,
+                })));
+            }
+            Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e })),
+            ))
+        }
     }
 }
 

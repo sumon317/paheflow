@@ -289,6 +289,8 @@ impl HttpClient {
 
                     if status.is_success() {
                         return Ok(text);
+                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                        return Err(format!("HTTP request failed with status code {}", status));
                     } else {
                         last_error = format!("HTTP request failed with status code {}", status);
                     }
