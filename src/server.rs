@@ -53,6 +53,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/deps", get(get_deps))
         .route("/api/catalog", get(get_catalog))
         .route("/api/search", get(get_search))
+        .route("/api/latest", get(get_latest_releases))
         .route("/api/episodes", get(get_episodes))
         .route("/api/episode-options", get(get_episode_options))
         .route("/api/status", get(get_status))
@@ -605,6 +606,32 @@ async fn get_search(
     let cfg = read_config();
     match api::search(&state.client, &q, &cfg).await {
         Ok(items) => Ok(Json(serde_json::json!({ "items": items }))),
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": e })),
+        )),
+    }
+}
+
+async fn get_latest_releases(
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let page = query
+        .get("page")
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(1);
+    let cfg = read_config();
+
+    match api::latest_releases(&state.client, page, &cfg).await {
+        Ok(res) => Ok(Json(serde_json::to_value(&res).unwrap_or_default())),
         Err(e) => Err((
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": e })),

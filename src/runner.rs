@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 
-use crate::api::{self, PlaySource};
+use crate::api::{self, ep_matches, PlaySource};
 use crate::client::HttpClient;
 use crate::config::{clamp_fragments, read_config, resolve_download_dir, AppConfig};
 use crate::hls::{DownloadConfig, HlsDownloader, ProgressUpdate};
@@ -625,22 +625,6 @@ impl Drop for RunGuard {
             }
         });
     }
-}
-
-fn ep_matches(a: &str, b: &str) -> bool {
-    let a_clean = a.trim();
-    let b_clean = b.trim();
-    if a_clean.is_empty() || b_clean.is_empty() {
-        return false;
-    }
-    if a_clean.eq_ignore_ascii_case(b_clean) {
-        return true;
-    }
-    let a_trimmed = a_clean.trim_start_matches('0');
-    let b_trimmed = b_clean.trim_start_matches('0');
-    let a_norm = if a_trimmed.is_empty() { "0" } else { a_trimmed };
-    let b_norm = if b_trimmed.is_empty() { "0" } else { b_trimmed };
-    a_norm == b_norm
 }
 
 struct RunnerHelper {

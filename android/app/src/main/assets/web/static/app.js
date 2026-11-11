@@ -87,6 +87,13 @@
     episodeSizes: {},
     episodesSelected: [],
     options: emptyOptions(),
+    recentItems: [],
+    recentPage: 1,
+    recentLastPage: 1,
+    recentTotal: 0,
+    recentLoading: false,
+    pendingSelectEpisode: null,
+    allKnownEpisodes: {},
     config: { ua: "", concurrent_fragments: 8, cfConfigured: false, cfLength: 0 },
     deps: [],
     job: null,
@@ -359,6 +366,10 @@
   }
 
   function renderCatalog() {
+    if (state.searchMode === "recent") {
+      renderRecentReleases();
+      return;
+    }
     const list = filteredCatalog();
     const shownList = list.slice(0, state.catalogLimit);
     const box = $("resultsList");
@@ -396,7 +407,10 @@
   }
 
   function updateCatalogMeta(shown, total) {
-    if (state.searchMode === "remote") {
+    if (state.searchMode === "recent") {
+      const totalStr = state.recentTotal ? ` of ${state.recentTotal.toLocaleString()}` : "";
+      $("catalogMeta").textContent = `Page ${state.recentPage}${totalStr} latest releases from AnimePahe`;
+    } else if (state.searchMode === "remote") {
       $("catalogMeta").textContent = total
         ? `${shown} of ${total} result(s) from animepahe.pw`
         : "No results from animepahe.pw";
@@ -411,7 +425,146 @@
     state.searchMode = mode;
     state.catalogLimit = CATALOG_PAGE_SIZE;
     $$("#resultModes .seg").forEach(b => b.classList.toggle("is-active", b.dataset.mode === mode));
-    renderCatalog();
+    const pager = $("recentPager");
+    if (pager) {
+      pager.classList.toggle("hidden", mode !== "recent");
+    }
+    if (mode === "recent") {
+      if (!state.recentItems.length && !state.recentLoading) {
+        loadRecentReleases(1);
+      } else {
+        renderRecentReleases();
+      }
+    } else {
+      renderCatalog();
+    }
+  }
+
+  function timeAgo(dateStr) {
+    if (!dateStr) return "";
+    try {
+      const d = new Date(dateStr.replace(" ", "T") + "Z");
+      const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+      if (isNaN(diff) || diff < 0) return dateStr;
+      if (diff < 60) return "Just now";
+      if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+      if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+      return `${Math.floor(diff / 86400)}d ago`;
+    } catch (_) {
+      return dateStr;
+    }
+  }
+
+  async function loadRecentReleases(page = 1) {
+    state.recentLoading = true;
+    state.recentPage = page;
+    const box = $("resultsList");
+    box.innerHTML = `<div class="ep-loading"><span class="spinner"></span> Loading recent releases from AnimePahe...</div>`;
+    $("catalogMeta").textContent = "Fetching latest releases...";
+    updateRecentPager();
+    try {
+      const res = await api.get(`/api/latest?page=${page}`);
+      state.recentItems = res.data || [];
+      state.recentPage = res.current_page || page;
+      state.recentLastPage = res.last_page || 1;
+      state.recentTotal = res.total || state.recentItems.length;
+      state.recentLoading = false;
+      if (state.searchMode === "recent") {
+        renderRecentReleases();
+      }
+    } catch (e) {
+      state.recentLoading = false;
+      if (state.searchMode === "recent") {
+        box.innerHTML = `<div class="empty"><p class="empty-title">Failed to load recent releases</p><p class="empty-text">${escapeHtml(e.message || "Network or Cloudflare error")}</p></div>`;
+        $("catalogMeta").textContent = "Failed to load latest releases";
+        updateRecentPager();
+      }
+      toast("Recent releases failed: " + e.message, "error");
+      noteApiError(e.message);
+    }
+  }
+
+  function renderRecentReleases() {
+    const box = $("resultsList");
+    const items = state.recentItems || [];
+    if (!items.length) {
+      box.innerHTML = `<div class="empty"><p class="empty-title">No recent releases found</p><p class="empty-text">Check your internet connection or Cloudflare clearance.</p></div>`;
+      $("catalogMeta").textContent = "No recent releases";
+      updateRecentPager();
+      return;
+    }
+
+    box.innerHTML = items.map(item => {
+      const isDub = (item.audio || "").toLowerCase() === "dub" || (item.audio || "").toLowerCase() === "eng";
+      const audioClass = isDub ? "recent-badge-dub" : "recent-badge-sub";
+      const audioLabel = isDub ? "DUB" : "SUB";
+      const timeStr = timeAgo(item.created_at);
+      const isSelected = item.anime_session === state.selectedSlug;
+
+      return `
+        <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(item.anime_session)}" data-title="${escapeHtml(item.anime_title)}" data-ep="${escapeHtml(String(item.episode))}">
+          <div class="recent-thumb-wrap">
+            ${item.snapshot ? `<img class="recent-thumb" src="${escapeHtml(item.snapshot)}" alt="${escapeHtml(item.anime_title)}" loading="lazy" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
+          </div>
+          <div class="result-main">
+            <div class="result-title">${escapeHtml(item.anime_title)}</div>
+            <div class="result-meta">
+              <span class="badge recent-badge-ep">EP ${escapeHtml(String(item.episode))}</span>
+              <span class="badge ${audioClass}">${audioLabel}</span>
+              ${item.duration ? `<span>${escapeHtml(item.duration)}</span>` : ""}
+              ${timeStr ? `<span class="recent-time">🕒 ${escapeHtml(timeStr)}</span>` : ""}
+            </div>
+          </div>
+          <div class="result-actions">
+            <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(String(item.episode))}">Open</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    $$$(".select-btn", box).forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const card = e.currentTarget.closest(".result");
+        selectRecentEpisode(card.dataset.session, card.dataset.title, card.dataset.ep);
+      };
+    });
+
+    $$$(".result.recent", box).forEach(el => {
+      el.onclick = (e) => {
+        if (!e.target.closest(".select-btn")) {
+          selectRecentEpisode(el.dataset.session, el.dataset.title, el.dataset.ep);
+        }
+      };
+    });
+
+    const totalStr = state.recentTotal ? ` of ${state.recentTotal.toLocaleString()}` : "";
+    $("catalogMeta").textContent = `Page ${state.recentPage}${totalStr} latest releases from AnimePahe`;
+    updateRecentPager();
+  }
+
+  function updateRecentPager() {
+    const pager = $("recentPager");
+    if (!pager) return;
+    if (state.searchMode !== "recent") {
+      pager.classList.add("hidden");
+      return;
+    }
+    const pages = Math.max(1, state.recentLastPage || 1);
+    pager.classList.toggle("hidden", pages <= 1 && !state.recentItems.length);
+    $("recentPageInfo").textContent = `Page ${state.recentPage} of ${pages}`;
+    $("recentPrev").disabled = state.recentLoading || state.recentPage <= 1;
+    $("recentNext").disabled = state.recentLoading || state.recentPage >= pages;
+  }
+
+  function selectRecentEpisode(slug, title, episodeNum) {
+    if (!slug) return;
+    state.selectedTitle = title || slug;
+    state.selectedSlug = slug;
+    state.pendingSelectEpisode = String(episodeNum);
+    $$(".result").forEach(el => el.classList.toggle("is-selected", el.dataset.session === slug || el.dataset.slug === slug));
+    showTab("episodes");
+    loadEpisodes(slug);
   }
 
   async function doSearch() {
@@ -470,6 +623,7 @@
       // previous selection could silently download episodes of the new show.
       state.epNotFound = false;
       state.episodesSelected = [];
+      state.allKnownEpisodes = {};
       state.epFilter = "";
       $("epFilter").value = "";
       if (audio === null) {
@@ -502,10 +656,23 @@
       state.epTotalAll = res.totalAll ?? state.epTotal;
       state.availableAudios = res.availableAudios || [];
 
-      // Prune any selected episodes not present in the filtered set
+      (res.items || []).forEach(e => {
+        state.allKnownEpisodes[epId(e.episode)] = e;
+      });
+
       const displayList = getDisplayEpisodes();
-      const validEpIds = new Set(displayList.map(e => epId(e.episode)));
-      state.episodesSelected = state.episodesSelected.filter(id => validEpIds.has(id));
+      if (state.pendingSelectEpisode) {
+        const targetEp = state.pendingSelectEpisode;
+        const exists = displayList.some(e => epId(e.episode) === targetEp);
+        if (exists) {
+          state.episodesSelected = [targetEp];
+        }
+        state.pendingSelectEpisode = null;
+      } else {
+        // Prune any selected episodes not present in the filtered set
+        const validEpIds = new Set(displayList.map(e => epId(e.episode)));
+        state.episodesSelected = state.episodesSelected.filter(id => validEpIds.has(id));
+      }
 
       syncAudioControlUI();
       renderEpGrid();
@@ -689,8 +856,31 @@
     return `${Math.round(mb)} MB`;
   }
 
+  const RES_WEIGHTS = {
+    "1080": 1.0,
+    "720": 0.58,
+    "480": 0.32,
+    "360": 0.20,
+  };
+
+  function estimateSizeForResolution(baseBytes, baseRes, targetRes) {
+    if (!baseBytes) return 0;
+    if (!baseRes || !targetRes || baseRes === targetRes) return baseBytes;
+    const wFrom = RES_WEIGHTS[baseRes] || (parseInt(baseRes, 10) / 1080) || 0.58;
+    const wTo = RES_WEIGHTS[targetRes] || (parseInt(targetRes, 10) / 1080) || 0.58;
+    if (!wFrom || !wTo) return baseBytes;
+    return Math.round(baseBytes * (wTo / wFrom));
+  }
+
   function getActiveResolution() {
-    return $("optResolution")?.value || (state.options?.resolutions?.[0] || "");
+    const chosen = $("optResolution")?.value;
+    if (chosen) return chosen;
+    if (state.options?.filesizes) {
+      for (const r of (state.options?.resolutions || [])) {
+        if (state.options.filesizes[r]) return r;
+      }
+    }
+    return state.options?.resolutions?.[0] || "720";
   }
 
   function getEpisodeSizeBadge(e, res) {
@@ -698,46 +888,101 @@
     const id = epId(e.episode);
     const targetRes = res || getActiveResolution();
 
-    // 1. Direct probed size
+    // 1. Direct probed size for this episode and resolution
     const probed = state.episodeSizes?.[id]?.[targetRes] ||
       (state.options?.episode && epId(state.options.episode) === id ? state.options?.filesizes?.[targetRes] : null);
     if (probed) return probed;
 
-    // 2. Estimate based on base episode duration and size
+    // 2. Find any base episode that has size in targetRes
     const baseEp = state.episodes.find(ep => {
       const ep_id = epId(ep.episode);
       return state.episodeSizes?.[ep_id]?.[targetRes] ||
         (state.options?.episode && epId(state.options.episode) === ep_id && state.options?.filesizes?.[targetRes]);
     }) || (state.options?.filesizes?.[targetRes] ? state.episodes[0] : null);
 
-    if (!baseEp) return "";
-
-    const baseSize = state.episodeSizes?.[epId(baseEp.episode)]?.[targetRes] || state.options?.filesizes?.[targetRes];
-    const baseBytes = parseSizeToBytes(baseSize);
-    if (!baseBytes) return "";
-
-    const baseDurSecs = parseDurSecs(baseEp.duration);
-    const epDurSecs = parseDurSecs(e.duration);
-
-    if (baseDurSecs > 0 && epDurSecs > 0) {
-      const estimated = Math.round(baseBytes * (epDurSecs / baseDurSecs));
-      return `~${formatBytes(estimated)}`;
+    if (baseEp) {
+      const baseSize = state.episodeSizes?.[epId(baseEp.episode)]?.[targetRes] || state.options?.filesizes?.[targetRes];
+      const baseBytes = parseSizeToBytes(baseSize);
+      if (baseBytes) {
+        const baseDurSecs = parseDurSecs(baseEp.duration);
+        const epDurSecs = parseDurSecs(e.duration);
+        if (baseDurSecs > 0 && epDurSecs > 0) {
+          const estimated = Math.round(baseBytes * (epDurSecs / baseDurSecs));
+          return `~${formatBytes(estimated)}`;
+        }
+        return `~${baseSize}`;
+      }
     }
-    return `~${baseSize}`;
+
+    // 3. Cross-resolution estimation: if targetRes has no probed size, but another resolution does
+    if (state.options?.filesizes) {
+      for (const [r, sz] of Object.entries(state.options.filesizes)) {
+        if (sz && r !== targetRes) {
+          const rawBytes = parseSizeToBytes(sz);
+          if (rawBytes) {
+            const scaledBytes = estimateSizeForResolution(rawBytes, r, targetRes);
+            const ep0 = state.episodes[0] || Object.values(state.allKnownEpisodes)[0];
+            const baseDurSecs = parseDurSecs(ep0?.duration);
+            const epDurSecs = parseDurSecs(e.duration);
+            if (baseDurSecs > 0 && epDurSecs > 0) {
+              const estimated = Math.round(scaledBytes * (epDurSecs / baseDurSecs));
+              return `~${formatBytes(estimated)}`;
+            }
+            return `~${formatBytes(scaledBytes)}`;
+          }
+        }
+      }
+    }
+
+    return "";
   }
 
   function calculateTotalSelectedSize() {
     if (!state.episodesSelected.length) return "";
     const activeRes = getActiveResolution();
-    const baseEp = state.episodes.find(e => state.episodeSizes?.[epId(e.episode)]?.[activeRes]) || state.episodes[0];
-    const baseDurSecs = parseDurSecs(baseEp?.duration);
-    const baseSizeStr = state.episodeSizes?.[epId(baseEp?.episode)]?.[activeRes] || state.options?.filesizes?.[activeRes];
-    const baseBytes = parseSizeToBytes(baseSizeStr);
+
+    // Find base size and duration from any known episode or options.filesizes
+    let baseBytes = 0;
+    let baseDurSecs = 0;
+
+    // A. Check if any known episode has probed size for activeRes
+    for (const ep of Object.values(state.allKnownEpisodes)) {
+      const ep_id = epId(ep.episode);
+      const sz = state.episodeSizes?.[ep_id]?.[activeRes];
+      if (sz) {
+        baseBytes = parseSizeToBytes(sz);
+        baseDurSecs = parseDurSecs(ep.duration);
+        break;
+      }
+    }
+
+    // B. Check options.filesizes for activeRes
+    if (!baseBytes && state.options?.filesizes?.[activeRes]) {
+      baseBytes = parseSizeToBytes(state.options.filesizes[activeRes]);
+      const ep0 = state.episodes[0] || Object.values(state.allKnownEpisodes)[0];
+      baseDurSecs = parseDurSecs(ep0?.duration);
+    }
+
+    // C. Check if any other resolution has size in options.filesizes
+    if (!baseBytes && state.options?.filesizes) {
+      for (const [r, sz] of Object.entries(state.options.filesizes)) {
+        if (sz) {
+          const raw = parseSizeToBytes(sz);
+          if (raw) {
+            baseBytes = estimateSizeForResolution(raw, r, activeRes);
+            const ep0 = state.episodes[0] || Object.values(state.allKnownEpisodes)[0];
+            baseDurSecs = parseDurSecs(ep0?.duration);
+            break;
+          }
+        }
+      }
+    }
+
     if (!baseBytes) return "";
 
     let totalBytes = 0;
     for (const id of state.episodesSelected) {
-      const ep = state.episodes.find(e => epId(e.episode) === id);
+      const ep = state.allKnownEpisodes[id] || state.episodes.find(e => epId(e.episode) === id);
       const probed = state.episodeSizes?.[id]?.[activeRes];
       if (probed) {
         totalBytes += parseSizeToBytes(probed) || baseBytes;
@@ -932,6 +1177,17 @@
     const sizeStr = totalSize ? ` (~${totalSize})` : "";
     $("epSubtitle").textContent = `${base} • ${count} selected${sizeStr}${count ? " — " + compressEpisodes(state.episodesSelected) : ""}`;
     $("startBtn").disabled = count === 0;
+
+    const pill = $("epCapacityPill");
+    if (pill) {
+      if (count > 0 && totalSize) {
+        pill.textContent = `📦 ~${totalSize} (${count} ep${count === 1 ? "" : "s"})`;
+        pill.classList.remove("hidden");
+      } else {
+        pill.classList.add("hidden");
+      }
+    }
+
     updateActionSummary();
   }
 
@@ -1869,6 +2125,16 @@
     $("clearSearch").onclick = () => { $("searchInput").value = ""; setCatalogMode("local"); };
     $$("#resultModes .seg").forEach(btn => btn.onclick = () => setCatalogMode(btn.dataset.mode));
     $("refreshCatalog").onclick = refreshCatalog;
+    $("recentPrev").onclick = () => {
+      if (state.recentPage > 1 && !state.recentLoading) {
+        loadRecentReleases(state.recentPage - 1);
+      }
+    };
+    $("recentNext").onclick = () => {
+      if (state.recentPage < state.recentLastPage && !state.recentLoading) {
+        loadRecentReleases(state.recentPage + 1);
+      }
+    };
 
     // episodes
     $("reloadEpisodes").onclick = () => loadEpisodes(state.selectedSlug, 1, state.audioFilter);

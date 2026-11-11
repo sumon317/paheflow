@@ -445,6 +445,21 @@ body.activity-hidden .activity {
 .title-block { min-width: 0; }
 .title-block h2 { overflow-wrap: anywhere; }
 .panel-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.capacity-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  letter-spacing: 0.2px;
+  user-select: none;
+}
+.capacity-pill.hidden { display: none !important; }
 
 /* ───────────────────────────── buttons ───────────────────────────── */
 
@@ -596,6 +611,54 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
 .badge.accent { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); background: var(--accent-soft); }
 
 .result-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+
+.result.recent {
+  cursor: pointer;
+  padding: 10px 14px;
+}
+.recent-thumb-wrap {
+  width: 88px;
+  height: 52px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-2);
+  flex: 0 0 auto;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-soft);
+}
+.recent-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.recent-thumb-placeholder {
+  font-size: 20px;
+  opacity: 0.4;
+}
+.recent-badge-ep {
+  font-weight: 700;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  background: var(--accent-soft);
+}
+.recent-badge-sub {
+  color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.3);
+  background: rgba(56, 189, 248, 0.1);
+}
+.recent-badge-dub {
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.3);
+  background: rgba(245, 158, 11, 0.1);
+}
+.recent-time {
+  color: var(--text-faint);
+  font-size: 11px;
+}
 
 .empty { text-align: center; padding: 54px 20px; color: var(--text-faint); }
 .empty-title { margin: 0 0 6px; color: var(--text-dim); font-size: 15px; font-weight: 550; }

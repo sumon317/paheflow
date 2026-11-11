@@ -64,6 +64,46 @@ pub struct CatalogEntry {
     pub title: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestReleaseItem {
+    pub id: Option<u64>,
+    pub anime_id: Option<u64>,
+    pub anime_title: String,
+    pub anime_session: String,
+    pub episode: serde_json::Value,
+    pub snapshot: Option<String>,
+    pub duration: Option<String>,
+    pub session: Option<String>,
+    pub created_at: Option<String>,
+    pub audio: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestReleasesPage {
+    pub page: u32,
+    pub last_page: u32,
+    pub total: usize,
+    pub items: Vec<LatestReleaseItem>,
+}
+
+pub fn ep_matches(a: &str, b: &str) -> bool {
+    let a_clean = a.trim();
+    let b_clean = b.trim();
+    if a_clean.is_empty() || b_clean.is_empty() {
+        return false;
+    }
+    if a_clean.eq_ignore_ascii_case(b_clean) {
+        return true;
+    }
+    let a_trimmed = a_clean.trim_start_matches('0');
+    let b_trimmed = b_clean.trim_start_matches('0');
+    let a_norm = if a_trimmed.is_empty() { "0" } else { a_trimmed };
+    let b_norm = if b_trimmed.is_empty() { "0" } else { b_trimmed };
+    a_norm == b_norm
+}
+
 fn cache_dir() -> PathBuf {
     let dir = data_dir().join("cache");
     let _ = fs::create_dir_all(&dir);
@@ -212,6 +252,91 @@ pub async fn search(
         }
     }
     Ok(results)
+}
+
+pub async fn latest_releases(
+    client: &HttpClient,
+    page: u32,
+    cfg: &AppConfig,
+) -> Result<LatestReleasesPage, String> {
+    let url = format!("{}?m=airing&page={}", API_URL, page.max(1));
+    let json = client.fetch_json(&url, None, cfg).await?;
+
+    let page_val = json
+        .get("current_page")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(page);
+
+    let last_page = json
+        .get("last_page")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(1);
+
+    let total = json
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(0);
+
+    let mut items = Vec::new();
+    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+        for it in data {
+            let anime_title = it
+                .get("anime_title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let anime_session = it
+                .get("anime_session")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            if anime_title.is_empty() || anime_session.is_empty() {
+                continue;
+            }
+
+            items.push(LatestReleaseItem {
+                id: it.get("id").and_then(|v| v.as_u64()),
+                anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
+                anime_title,
+                anime_session,
+                episode: it
+                    .get("episode")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                snapshot: it
+                    .get("snapshot")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                duration: it
+                    .get("duration")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                session: it
+                    .get("session")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                created_at: it
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                audio: it
+                    .get("audio")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            });
+        }
+    }
+
+    Ok(LatestReleasesPage {
+        page: page_val,
+        last_page,
+        total: if total > 0 { total } else { items.len() },
+        items,
+    })
 }
 
 pub async fn release_page(
@@ -648,8 +773,7 @@ pub async fn available_options(
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::new(),
             };
-            ep_str == episode_num
-                || ep_str.trim_start_matches('0') == episode_num.trim_start_matches('0')
+            ep_matches(&ep_str, episode_num)
         })
         .ok_or_else(|| format!("Episode {} not found for this anime", episode_num))?;
 

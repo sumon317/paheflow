@@ -209,6 +209,7 @@ class ServerHarness(unittest.TestCase):
             "/api/deps",
             "/api/catalog",
             "/api/search?q=x",
+            "/api/latest",
             "/api/episodes?slug=x",
             "/api/episode-options?slug=x&episode=1",
             "/api/status",

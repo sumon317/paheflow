@@ -113,6 +113,7 @@
       <div class="segmented" id="resultModes">
         <button class="seg is-active" data-mode="remote">Site results</button>
         <button class="seg" data-mode="local">Local catalog</button>
+        <button class="seg" data-mode="recent">Recent releases</button>
       </div>
 
       <div class="results" id="resultsList">
@@ -120,6 +121,12 @@
           <p class="empty-title">Type to search animepahe.pw</p>
           <p class="empty-text">The local catalog tab filters the 6 000+ cached slugs without touching the network.</p>
         </div>
+      </div>
+
+      <div class="pager hidden" id="recentPager">
+        <button class="btn btn-ghost btn-sm" id="recentPrev" title="Previous page">← Previous</button>
+        <span id="recentPageInfo">Page 1 of 1</span>
+        <button class="btn btn-ghost btn-sm" id="recentNext" title="Next page">Next →</button>
       </div>
     </section>
 
@@ -131,6 +138,7 @@
           <p class="panel-sub" id="epSubtitle">Pick something in the Browse tab first.</p>
         </div>
         <div class="panel-actions">
+          <span class="capacity-pill hidden" id="epCapacityPill" title="Estimated download size">📦 ~0 MB</span>
           <button class="btn btn-ghost btn-sm" id="copySlug" title="Copy the slug / uuid">Copy slug</button>
           <button class="btn btn-ghost btn-sm" id="reloadEpisodes" title="Reload the episode list">Reload</button>
         </div>
