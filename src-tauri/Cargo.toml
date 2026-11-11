@@ -1,6 +1,6 @@
 [package]
 name = "paheflow-desktop"
-version = "1.0.0"
+version = "1.0.1"
 description = "Native Linux PaheFlow Desktop Window (Tauri)"
 edition = "2021"
 
