@@ -421,7 +421,8 @@
     }
   }
 
-  function setCatalogMode(mode) {
+  function setCatalogMode(mode, forceReload = false) {
+    const isModeChange = state.searchMode !== mode;
     state.searchMode = mode;
     state.catalogLimit = CATALOG_PAGE_SIZE;
     $$("#resultModes .seg").forEach(b => b.classList.toggle("is-active", b.dataset.mode === mode));
@@ -430,8 +431,8 @@
       pager.classList.toggle("hidden", mode !== "recent");
     }
     if (mode === "recent") {
-      if (!state.recentItems.length && !state.recentLoading) {
-        loadRecentReleases(1);
+      if (!state.recentItems.length || !isModeChange || forceReload) {
+        loadRecentReleases(state.recentPage || 1);
       } else {
         renderRecentReleases();
       }
@@ -464,10 +465,11 @@
     updateRecentPager();
     try {
       const res = await api.get(`/api/latest?page=${page}`);
-      state.recentItems = res.data || [];
-      state.recentPage = res.current_page || page;
-      state.recentLastPage = res.last_page || 1;
-      state.recentTotal = res.total || state.recentItems.length;
+      const list = res.items || res.data || [];
+      state.recentItems = list;
+      state.recentPage = res.page || res.current_page || res.currentPage || page;
+      state.recentLastPage = res.lastPage || res.last_page || 1;
+      state.recentTotal = res.total ?? list.length;
       state.recentLoading = false;
       if (state.searchMode === "recent") {
         renderRecentReleases();
@@ -495,28 +497,33 @@
     }
 
     box.innerHTML = items.map(item => {
+      const title = item.anime_title || item.animeTitle || "";
+      const session = item.anime_session || item.animeSession || "";
+      const epNum = (item.episode !== undefined && item.episode !== null) ? String(item.episode) : "";
       const isDub = (item.audio || "").toLowerCase() === "dub" || (item.audio || "").toLowerCase() === "eng";
       const audioClass = isDub ? "recent-badge-dub" : "recent-badge-sub";
       const audioLabel = isDub ? "DUB" : "SUB";
-      const timeStr = timeAgo(item.created_at);
-      const isSelected = item.anime_session === state.selectedSlug;
+      const timeStr = timeAgo(item.created_at || item.createdAt);
+      const isSelected = session === state.selectedSlug;
+      const snapshot = item.snapshot || "";
+      const duration = item.duration || "";
 
       return `
-        <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(item.anime_session)}" data-title="${escapeHtml(item.anime_title)}" data-ep="${escapeHtml(String(item.episode))}">
+        <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(session)}" data-title="${escapeHtml(title)}" data-ep="${escapeHtml(epNum)}">
           <div class="recent-thumb-wrap">
-            ${item.snapshot ? `<img class="recent-thumb" src="${escapeHtml(item.snapshot)}" alt="${escapeHtml(item.anime_title)}" loading="lazy" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
+            ${snapshot ? `<img class="recent-thumb" src="${escapeHtml(snapshot)}" alt="${escapeHtml(title)}" loading="lazy" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
           </div>
           <div class="result-main">
-            <div class="result-title">${escapeHtml(item.anime_title)}</div>
+            <div class="result-title">${escapeHtml(title)}</div>
             <div class="result-meta">
-              <span class="badge recent-badge-ep">EP ${escapeHtml(String(item.episode))}</span>
+              <span class="badge recent-badge-ep">EP ${escapeHtml(epNum)}</span>
               <span class="badge ${audioClass}">${audioLabel}</span>
-              ${item.duration ? `<span>${escapeHtml(item.duration)}</span>` : ""}
+              ${duration ? `<span>${escapeHtml(duration)}</span>` : ""}
               ${timeStr ? `<span class="recent-time">🕒 ${escapeHtml(timeStr)}</span>` : ""}
             </div>
           </div>
           <div class="result-actions">
-            <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(String(item.episode))}">Open</button>
+            <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(epNum)}">Open</button>
           </div>
         </div>
       `;
@@ -585,6 +592,18 @@
   }
 
   async function refreshCatalog() {
+    if (state.searchMode === "recent") {
+      setBusy($("refreshCatalog"), true);
+      try {
+        await loadRecentReleases(state.recentPage || 1);
+        toast("Recent releases refreshed", "ok");
+      } catch (e) {
+        toast("Refresh failed: " + e.message, "error");
+      } finally {
+        setBusy($("refreshCatalog"), false);
+      }
+      return;
+    }
     setBusy($("refreshCatalog"), true);
     try {
       const { items } = await api.get("/api/catalog?refresh=1");
@@ -805,13 +824,14 @@
       }
       const dur = formatEpDur(e.duration);
       const sizeTag = getEpisodeSizeBadge(e);
+      const isDubTag = audioTag.includes("DUB");
       return `
       <div class="ep ${checked ? "is-checked" : ""}" data-ep="${escapeHtml(id)}" title="Episode ${escapeHtml(id)}${dur ? ` · ${dur}` : ""}${sizeTag ? ` · ${sizeTag}` : ""}">
         <input type="checkbox" ${checked ? "checked" : ""} />
         <span class="ep-num">E${escapeHtml(id)}</span>
         <div class="ep-info">
           <div class="ep-tags">
-            <span class="ep-audio-tag">${escapeHtml(audioTag)}</span>
+            <span class="ep-audio-tag ${isDubTag ? "is-dub" : "is-sub"}">${escapeHtml(audioTag)}</span>
             ${sizeTag ? `<span class="ep-size-tag">${escapeHtml(sizeTag)}</span>` : ""}
           </div>
           ${dur ? `<span class="ep-dur">${dur}</span>` : ""}

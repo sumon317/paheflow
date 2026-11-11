@@ -65,7 +65,6 @@ pub struct CatalogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LatestReleaseItem {
     pub id: Option<u64>,
     pub anime_id: Option<u64>,
@@ -80,12 +79,15 @@ pub struct LatestReleaseItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LatestReleasesPage {
     pub page: u32,
+    pub current_page: u32,
     pub last_page: u32,
+    #[serde(rename = "lastPage")]
+    pub last_page_camel: u32,
     pub total: usize,
     pub items: Vec<LatestReleaseItem>,
+    pub data: Vec<LatestReleaseItem>,
 }
 
 pub fn ep_matches(a: &str, b: &str) -> bool {
@@ -260,7 +262,13 @@ pub async fn latest_releases(
     cfg: &AppConfig,
 ) -> Result<LatestReleasesPage, String> {
     let url = format!("{}?m=airing&page={}", API_URL, page.max(1));
-    let json = client.fetch_json(&url, None, cfg).await?;
+    let json = match client.fetch_json(&url, None, cfg).await {
+        Ok(j) => j,
+        Err(_) => {
+            let alt_url = format!("{}/?m=airing&page={}", API_URL, page.max(1));
+            client.fetch_json(&alt_url, None, cfg).await?
+        }
+    };
 
     let page_val = json
         .get("current_page")
@@ -333,9 +341,12 @@ pub async fn latest_releases(
 
     Ok(LatestReleasesPage {
         page: page_val,
+        current_page: page_val,
         last_page,
+        last_page_camel: last_page,
         total: if total > 0 { total } else { items.len() },
-        items,
+        items: items.clone(),
+        data: items,
     })
 }
 
