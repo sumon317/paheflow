@@ -342,9 +342,18 @@ class MainActivity : AppCompatActivity() {
 
     fun hasStoragePermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
+            Environment.isExternalStorageManager() || canWriteToAppStorage()
         } else {
             ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun canWriteToAppStorage(): Boolean {
+        return try {
+            val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: return false
+            dir.exists() || dir.mkdirs()
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -571,8 +580,10 @@ class MainActivity : AppCompatActivity() {
             File(dirPath).mkdirs()
         } catch (_: Exception) {}
 
-        if (!hasStoragePermission()) {
-            promptStoragePermission()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            if (!hasStoragePermission()) {
+                promptStoragePermission()
+            }
         }
     }
 
