@@ -196,6 +196,145 @@
   };
 
   /* ─────────────────────────────────────────────────────────────────
+   *  In-App Auto Update
+   * ───────────────────────────────────────────────────────────────── */
+  let latestUpdateInfo = null;
+
+  async function checkAppUpdates(silent = true) {
+    const statusEl = $("updateCheckStatus");
+    const checkBtn = $("btnCheckUpdates");
+    if (statusEl && !silent) statusEl.textContent = "Checking GitHub…";
+    if (checkBtn) setBusy(checkBtn, true);
+
+    try {
+      const res = await api.get("/api/check-update");
+      if (!res.ok) {
+        if (!silent) {
+          toast(res.error || "Could not check updates", "warn");
+          if (statusEl) statusEl.textContent = "Check failed";
+        }
+        return;
+      }
+
+      if (res.current_version && $("appVersionBadge")) {
+        $("appVersionBadge").textContent = "v" + res.current_version;
+      }
+
+      latestUpdateInfo = res;
+
+      if (res.update_available) {
+        showUpdateBanner(res);
+        if (!silent) {
+          openUpdateModal(res);
+          if (statusEl) statusEl.textContent = `Update available: v${res.latest_version}`;
+        }
+      } else {
+        hideUpdateBanner();
+        if (!silent) {
+          toast(`✓ PaheFlow is up to date (v${res.current_version})`, "ok");
+          if (statusEl) statusEl.textContent = "Up to date";
+        }
+      }
+    } catch (e) {
+      if (!silent) {
+        toast("Check failed: " + e.message, "error");
+        if (statusEl) statusEl.textContent = "Error checking updates";
+      }
+    } finally {
+      if (checkBtn) setBusy(checkBtn, false);
+    }
+  }
+
+  function showUpdateBanner(info) {
+    const banner = $("updateBanner");
+    if (!banner) return;
+    if (sessionStorage.getItem("paheflow_update_dismissed_" + info.latest_version)) return;
+    const title = $("updateBannerHeading");
+    const text = $("updateBannerText");
+    if (title) title.textContent = `Update Available (v${info.latest_version})!`;
+    if (text) text.textContent = info.title || "A newer version of PaheFlow is ready to install.";
+    banner.classList.remove("hidden");
+  }
+
+  function hideUpdateBanner() {
+    const banner = $("updateBanner");
+    if (banner) banner.classList.add("hidden");
+  }
+
+  function openUpdateModal(info) {
+    if (!info) info = latestUpdateInfo;
+    if (!info) return;
+    const modal = $("updateModal");
+    if (!modal) return;
+    const ver = $("updateModalVersion");
+    const notes = $("updateModalNotes");
+    const progressCont = $("updateDownloadProgressContainer");
+    if (ver) ver.textContent = `v${info.current_version} → v${info.latest_version}`;
+    if (notes) notes.textContent = info.notes || "No release notes provided.";
+    if (progressCont) progressCont.classList.add("hidden");
+    const actionBtn = $("confirmUpdateBtn");
+    if (actionBtn) {
+      actionBtn.disabled = false;
+      actionBtn.textContent = "⬇️ Download & Install";
+    }
+    modal.classList.remove("hidden");
+  }
+
+  function closeUpdateModal() {
+    const modal = $("updateModal");
+    if (modal) modal.classList.add("hidden");
+  }
+
+  function performAppUpdate() {
+    if (!latestUpdateInfo) return;
+    const actionBtn = $("confirmUpdateBtn");
+    const progressCont = $("updateDownloadProgressContainer");
+    const progressFill = $("updateProgressFill");
+    const progressPercent = $("updateProgressPercent");
+    const progressLabel = $("updateProgressLabel");
+
+    if (window.AndroidBridge && typeof window.AndroidBridge.downloadAndInstallUpdate === "function") {
+      if (actionBtn) {
+        actionBtn.disabled = true;
+        actionBtn.textContent = "Downloading…";
+      }
+      if (progressCont) progressCont.classList.remove("hidden");
+      if (progressFill) progressFill.style.width = "0%";
+      if (progressPercent) progressPercent.textContent = "0%";
+      if (progressLabel) progressLabel.textContent = "Starting download…";
+
+      const apkUrl = latestUpdateInfo.apk_url || latestUpdateInfo.html_url;
+      window.AndroidBridge.downloadAndInstallUpdate(apkUrl);
+    } else {
+      // Desktop / Browser
+      const targetUrl = latestUpdateInfo.html_url || "https://github.com/sumon317/paheflow/releases/latest";
+      window.open(targetUrl, "_blank");
+      closeUpdateModal();
+      toast("Opened GitHub release in browser", "info");
+    }
+  }
+
+  window.onUpdateDownloadProgress = function(percent, statusText) {
+    const progressCont = $("updateDownloadProgressContainer");
+    const progressFill = $("updateProgressFill");
+    const progressPercent = $("updateProgressPercent");
+    const progressLabel = $("updateProgressLabel");
+    if (progressCont) progressCont.classList.remove("hidden");
+    if (progressFill) progressFill.style.width = `${percent}%`;
+    if (progressPercent) progressPercent.textContent = `${percent}%`;
+    if (progressLabel && statusText) progressLabel.textContent = statusText;
+  };
+
+  window.onUpdateDownloadFailed = function(errMsg) {
+    const actionBtn = $("confirmUpdateBtn");
+    if (actionBtn) {
+      actionBtn.disabled = false;
+      actionBtn.textContent = "Retry Download";
+    }
+    toast("Update download failed: " + errMsg, "error");
+  };
+
+  /* ─────────────────────────────────────────────────────────────────
    *  toasts
    * ───────────────────────────────────────────────────────────────── */
 
@@ -1645,6 +1784,7 @@
         $("stopBtn").disabled = true;
       }
       updateActionBarVisibility();
+      checkAppUpdates(true);
     } catch (e) {
       toast("Failed to load initial state: " + e.message, "error");
     }
@@ -1881,6 +2021,31 @@
       };
     }
     checkAndroidStoragePermission();
+
+    // auto update banner & modal
+    if ($("btnUpdateNow")) {
+      $("btnUpdateNow").onclick = () => openUpdateModal(latestUpdateInfo);
+    }
+    if ($("updateBannerClose")) {
+      $("updateBannerClose").onclick = () => {
+        if (latestUpdateInfo) {
+          sessionStorage.setItem("paheflow_update_dismissed_" + latestUpdateInfo.latest_version, "1");
+        }
+        hideUpdateBanner();
+      };
+    }
+    if ($("closeUpdateModalBtn")) {
+      $("closeUpdateModalBtn").onclick = closeUpdateModal;
+    }
+    if ($("dismissUpdateModalBtn")) {
+      $("dismissUpdateModalBtn").onclick = closeUpdateModal;
+    }
+    if ($("confirmUpdateBtn")) {
+      $("confirmUpdateBtn").onclick = performAppUpdate;
+    }
+    if ($("btnCheckUpdates")) {
+      $("btnCheckUpdates").onclick = () => checkAppUpdates(false);
+    }
 
     // keyboard shortcuts
     document.addEventListener("keydown", (e) => {

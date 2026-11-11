@@ -192,6 +192,18 @@ class MainActivity : AppCompatActivity() {
                     shutdown()
                 }
             }
+
+            @JavascriptInterface
+            fun downloadAndInstallUpdate(apkUrl: String) {
+                runOnUiThread {
+                    this@MainActivity.downloadAndInstallUpdate(apkUrl)
+                }
+            }
+
+            @JavascriptInterface
+            fun isAndroid(): Boolean {
+                return true
+            }
         }, "AndroidBridge")
 
         webView.webViewClient = object : WebViewClient() {
@@ -370,9 +382,165 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript("if (typeof window.onStoragePermissionChanged === 'function') window.onStoragePermissionChanged($hasPerm);", null)
     }
 
+    private var pendingInstallApk: File? = null
+
     override fun onResume() {
         super.onResume()
         checkAndNotifyStoragePermission()
+        if (pendingInstallApk != null) {
+            val apk = pendingInstallApk
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+                pendingInstallApk = null
+                if (apk != null && apk.exists()) {
+                    installDownloadedApk(apk)
+                }
+            }
+        }
+    }
+
+    fun downloadAndInstallUpdate(apkUrl: String) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                runOnUiThread {
+                    webView.evaluateJavascript(
+                        "if (typeof window.onUpdateDownloadProgress === 'function') window.onUpdateDownloadProgress(0, 'Connecting...');",
+                        null
+                    )
+                }
+                val cacheFolder = externalCacheDir ?: cacheDir
+                val destFile = File(cacheFolder, "paheflow-update.apk")
+                if (destFile.exists()) {
+                    destFile.delete()
+                }
+
+                var currentUrl = apkUrl
+                var connection: java.net.HttpURLConnection? = null
+                var redirects = 0
+                while (redirects < 8) {
+                    val urlObj = java.net.URL(currentUrl)
+                    connection = urlObj.openConnection() as java.net.HttpURLConnection
+                    connection.instanceFollowRedirects = false
+                    connection.setRequestProperty("User-Agent", "PaheFlow-Updater")
+                    connection.connectTimeout = 15000
+                    connection.readTimeout = 30000
+                    val status = connection.responseCode
+                    if (status == java.net.HttpURLConnection.HTTP_MOVED_PERM ||
+                        status == java.net.HttpURLConnection.HTTP_MOVED_TEMP ||
+                        status == 307 || status == 308
+                    ) {
+                        val location = connection.getHeaderField("Location") ?: break
+                        currentUrl = if (location.startsWith("http")) location else java.net.URL(urlObj, location).toString()
+                        redirects++
+                        connection.disconnect()
+                    } else {
+                        break
+                    }
+                }
+
+                if (connection == null || connection.responseCode != 200) {
+                    val code = connection?.responseCode ?: -1
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Failed to download update (HTTP $code)", Toast.LENGTH_LONG).show()
+                        webView.evaluateJavascript(
+                            "if (typeof window.onUpdateDownloadFailed === 'function') window.onUpdateDownloadFailed('HTTP $code');",
+                            null
+                        )
+                    }
+                    return@launch
+                }
+
+                val totalBytes = connection.contentLength.toLong()
+                var downloadedBytes = 0L
+                val buffer = ByteArray(32 * 1024)
+                var lastPercent = -1
+
+                connection.inputStream.use { input ->
+                    destFile.outputStream().use { output ->
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            downloadedBytes += read
+                            if (totalBytes > 0) {
+                                val percent = ((downloadedBytes * 100) / totalBytes).toInt()
+                                if (percent != lastPercent) {
+                                    lastPercent = percent
+                                    runOnUiThread {
+                                        webView.evaluateJavascript(
+                                            "if (typeof window.onUpdateDownloadProgress === 'function') window.onUpdateDownloadProgress($percent, '$percent%');",
+                                            null
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                runOnUiThread {
+                    webView.evaluateJavascript(
+                        "if (typeof window.onUpdateDownloadProgress === 'function') window.onUpdateDownloadProgress(100, 'Ready to install');",
+                        null
+                    )
+                    installDownloadedApk(destFile)
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Download error: ${e.message}", Toast.LENGTH_LONG).show()
+                    val escaped = e.message?.replace("'", "\\'") ?: "Unknown error"
+                    webView.evaluateJavascript(
+                        "if (typeof window.onUpdateDownloadFailed === 'function') window.onUpdateDownloadFailed('$escaped');",
+                        null
+                    )
+                }
+            }
+        }
+    }
+
+    fun installDownloadedApk(apkFile: File) {
+        if (!apkFile.exists() || apkFile.length() == 0L) {
+            Toast.makeText(this, "Downloaded update is empty or missing", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (!packageManager.canRequestPackageInstalls()) {
+                pendingInstallApk = apkFile
+                AlertDialog.Builder(this)
+                    .setTitle("Allow App Installation")
+                    .setMessage("To install the PaheFlow update, please allow installing unknown apps from PaheFlow in system Settings.")
+                    .setPositiveButton("Open Settings") { _, _ ->
+                        try {
+                            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                                data = Uri.parse("package:$packageName")
+                            }
+                            startActivity(intent)
+                        } catch (e: Exception) {
+                            Toast.makeText(this, "Could not open settings: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    .setNegativeButton("Cancel") { _, _ ->
+                        pendingInstallApk = null
+                    }
+                    .show()
+                return
+            }
+        }
+
+        try {
+            val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                this,
+                "${packageName}.fileprovider",
+                apkFile
+            )
+            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(apkUri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(installIntent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Could not launch package installer: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun ensureDirAndCheckPermission(dirPath: String) {

@@ -79,6 +79,16 @@
       <button class="banner-close" id="storagePermClose" title="Dismiss">✕</button>
     </div>
 
+    <div class="banner hidden" id="updateBanner" style="border-color: rgba(59, 130, 246, 0.4); background: rgba(59, 130, 246, 0.1);">
+      <div class="banner-icon" style="background: rgba(59, 130, 246, 0.2); color: #3b82f6;">🚀</div>
+      <div class="banner-body">
+        <strong id="updateBannerHeading">Update Available!</strong>
+        <span id="updateBannerText">A newer version of PaheFlow is ready to install.</span>
+        <button class="btn btn-primary btn-sm" id="btnUpdateNow" style="background: #3b82f6; border-color: #3b82f6; color: #fff; font-weight: 600;">Update Now</button>
+      </div>
+      <button class="banner-close" id="updateBannerClose" title="Dismiss">✕</button>
+    </div>
+
     <!-- ─────────────────────────────  BROWSE  ───────────────────────────── -->
     <section class="panel is-active" id="panel-browse">
       <div class="panel-head">
@@ -359,6 +369,20 @@
         <span class="save-hint" id="saveHint"></span>
       </div>
 
+      <div class="card" id="cardUpdates" style="margin-top: 15px;">
+        <div class="card-head">
+          <h3>Software Updates</h3>
+          <span class="badge" id="appVersionBadge">v1.0.0</span>
+        </div>
+        <p class="option-hint">
+          PaheFlow automatically checks GitHub for newer releases and updates seamlessly.
+        </p>
+        <div class="settings-actions no-margin" style="align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
+          <button class="btn btn-ghost" id="btnCheckUpdates">🔄 Check for Updates</button>
+          <span id="updateCheckStatus" class="save-hint"></span>
+        </div>
+      </div>
+
       <div class="card danger-zone">
         <div class="card-head"><h3>Maintenance</h3></div>
         <div class="settings-actions no-margin">
@@ -491,6 +515,43 @@
     <div class="modal-actions">
       <button class="btn btn-danger" id="confirmShutdownBtn">Shut down</button>
       <button class="btn btn-ghost" id="cancelShutdownBtn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- In-App Auto Update Modal -->
+<div id="updateModal" class="modal-overlay hidden" role="dialog" aria-modal="true">
+  <div class="modal-card" style="max-width: 520px; text-align: left;">
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span style="font-size: 1.5rem;">🚀</span>
+        <h2 style="margin: 0; font-size: 1.25rem;">Software Update</h2>
+      </div>
+      <button class="banner-close" id="closeUpdateModalBtn" title="Close" style="position: static; font-size: 1.1rem; width: 32px; height: 32px; border-radius: 6px;">✕</button>
+    </div>
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px; margin-bottom: 14px;">
+      <div>
+        <div style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted, #888);">Available Version</div>
+        <strong id="updateModalVersion" style="font-size: 1.05rem; color: #3b82f6;">v1.0.0 → v1.0.1</strong>
+      </div>
+      <span class="badge" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa; font-weight: 600;">Latest</span>
+    </div>
+    <div style="font-size: 0.85rem; font-weight: 600; margin-bottom: 6px; color: var(--text-muted, #aaa);">Release Notes:</div>
+    <div id="updateModalNotes" style="max-height: 180px; overflow-y: auto; background: var(--bg-card, #161922); padding: 12px; border-radius: 6px; font-size: 0.85rem; line-height: 1.5; margin-bottom: 16px; border: 1px solid var(--border, #2d3343); white-space: pre-wrap; font-family: inherit;"></div>
+    
+    <div id="updateDownloadProgressContainer" class="hidden" style="margin-bottom: 16px;">
+      <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 6px;">
+        <span id="updateProgressLabel">Downloading update…</span>
+        <strong id="updateProgressPercent" style="color: #3b82f6;">0%</strong>
+      </div>
+      <div class="progress-track" style="height: 8px; border-radius: 4px; overflow: hidden; background: rgba(255, 255, 255, 0.08);">
+        <div class="progress-fill" id="updateProgressFill" style="width: 0%; height: 100%; background: #3b82f6; transition: width 0.15s ease;"></div>
+      </div>
+    </div>
+
+    <div class="modal-actions" style="justify-content: flex-end; margin-top: 10px;">
+      <button class="btn btn-ghost" id="dismissUpdateModalBtn">Later</button>
+      <button class="btn btn-primary" id="confirmUpdateBtn" style="background: #3b82f6; border-color: #3b82f6; color: #fff;">⬇️ Download &amp; Install</button>
     </div>
   </div>
 </div>

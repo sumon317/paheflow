@@ -21,16 +21,28 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("release.keystore")
+            storePassword = System.getenv("SIGNING_PASSWORD")
+            keyAlias = "androiddebugkey"
+            keyPassword = System.getenv("SIGNING_PASSWORD")
+            enableV1Signing = true
+            enableV2Signing = true
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
         debug {
+            signingConfig = signingConfigs.getByName("release")
             isDebuggable = true
         }
     }

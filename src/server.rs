@@ -71,6 +71,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(post_library_delete_folder),
         )
         .route("/api/open", post(post_open))
+        .route("/api/check-update", get(get_check_update))
         .route("/api/test-connection", post(post_test_connection))
         .route("/api/pick-folder", post(post_pick_folder))
         .route("/api/sync-credentials", post(post_sync_credentials))
@@ -433,6 +434,121 @@ async fn get_state(
         "dependencies": deps_payload(),
         "catalog": { "items": catalog_items },
         "job": job_snap
+    })))
+}
+
+pub fn is_version_newer(latest: &str, current: &str) -> bool {
+    let parse_nums = |s: &str| -> Vec<u32> {
+        s.split('.')
+            .filter_map(|p| {
+                let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u32>().ok()
+            })
+            .collect()
+    };
+    let v_latest = parse_nums(latest);
+    let v_current = parse_nums(current);
+    for (l, c) in v_latest.iter().zip(v_current.iter()) {
+        if l > c {
+            return true;
+        }
+        if l < c {
+            return false;
+        }
+    }
+    v_latest.len() > v_current.len() && v_latest[v_current.len()..].iter().any(|&x| x > 0)
+}
+
+async fn get_check_update(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+
+    let current_version = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .user_agent(format!("PaheFlow/{}", current_version))
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let url = "https://api.github.com/repos/sumon317/paheflow/releases/latest";
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "update_available": false,
+                "current_version": current_version,
+                "error": format!("Network error: {}", e)
+            })));
+        }
+    };
+
+    if !resp.status().is_success() {
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "update_available": false,
+            "current_version": current_version,
+            "error": format!("GitHub returned status {}", resp.status())
+        })));
+    }
+
+    let release: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "update_available": false,
+                "current_version": current_version,
+                "error": format!("Failed to parse release JSON: {}", e)
+            })));
+        }
+    };
+
+    let tag = release
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let clean_tag = tag.trim_start_matches('v');
+    let title = release.get("name").and_then(|v| v.as_str()).unwrap_or(tag);
+    let body = release.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let html_url = release
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let mut apk_url = None;
+    if let Some(assets) = release.get("assets").and_then(|v| v.as_array()) {
+        for asset in assets {
+            if let Some(name) = asset.get("name").and_then(|v| v.as_str()) {
+                if name.ends_with(".apk") {
+                    if let Some(dl_url) = asset.get("browser_download_url").and_then(|v| v.as_str())
+                    {
+                        apk_url = Some(dl_url.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let is_newer = is_version_newer(clean_tag, current_version);
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "update_available": is_newer,
+        "current_version": current_version,
+        "latest_version": clean_tag,
+        "title": title,
+        "notes": body,
+        "html_url": html_url,
+        "apk_url": apk_url
     })))
 }
 
@@ -1232,5 +1348,16 @@ mod tests {
             other => other,
         };
         assert_eq!(norm_sub, "jpn");
+    }
+
+    #[test]
+    fn test_is_version_newer() {
+        assert!(is_version_newer("1.0.1", "1.0.0"));
+        assert!(is_version_newer("1.1.0", "1.0.0"));
+        assert!(is_version_newer("2.0.0", "1.0.0"));
+        assert!(is_version_newer("1.0.0.1", "1.0.0"));
+        assert!(!is_version_newer("1.0.0", "1.0.0"));
+        assert!(!is_version_newer("0.9.9", "1.0.0"));
+        assert!(!is_version_newer("1.0.0", "1.0.1"));
     }
 }
