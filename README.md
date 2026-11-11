@@ -85,7 +85,7 @@ Whether running as an APK on your phone or as a lightweight desktop service on L
 
 ### Android (APK)
 
-1. Grab the latest `paheflow-v2.0.0.apk` from the Releases page or build from source below.
+1. Grab the latest `paheflow-v1.0.0.apk` from the Releases page or build from source below.
 2. Install the APK on your device (Android 8.0+ / API 26+).
 3. Grant storage permissions when prompted so downloads can be saved directly to `Download/PaheFlow`.
 4. If prompted with a Cloudflare notice, tap **"Solve Cloudflare"**, solve the challenge in the sheet, and resume downloading immediately.
