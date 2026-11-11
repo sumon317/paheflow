@@ -1,3 +1,6 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -11,8 +14,8 @@ android {
         applicationId = "com.animepahe.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.1.1"
+        versionCode = 9
+        versionName = "1.1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -27,12 +30,21 @@ android {
         }
     }
 
+    val keystorePropertiesFile = file("keystore.properties")
+    val keystoreProperties = Properties()
+    if (keystorePropertiesFile.exists()) {
+        FileInputStream(keystorePropertiesFile).use { stream ->
+            keystoreProperties.load(stream)
+        }
+    }
+
     signingConfigs {
         create("release") {
-            storeFile = file("release.keystore")
-            storePassword = System.getenv("SIGNING_PASSWORD")
-            keyAlias = "androiddebugkey"
-            keyPassword = System.getenv("SIGNING_PASSWORD")
+            val keyPath = keystoreProperties.getProperty("storeFile") ?: "paheflow-release.keystore"
+            storeFile = file(keyPath)
+            storePassword = keystoreProperties.getProperty("storePassword") ?: System.getenv("SIGNING_PASSWORD")
+            keyAlias = keystoreProperties.getProperty("keyAlias") ?: "paheflow"
+            keyPassword = keystoreProperties.getProperty("keyPassword") ?: System.getenv("SIGNING_PASSWORD")
             enableV1Signing = true
             enableV2Signing = true
         }

@@ -74,6 +74,25 @@ impl Resolve for SmartDnsResolver {
                 let iter: Addrs = Box::new(addrs.into_iter());
                 return Ok(iter);
             }
+            if lower.ends_with(".animepahe.com")
+                || lower == "animepahe.com"
+                || lower.ends_with(".animepahe.org")
+                || lower == "animepahe.org"
+                || lower.ends_with(".animepahe.ru")
+                || lower == "animepahe.ru"
+            {
+                let addrs = vec![
+                    SocketAddr::from(([104, 21, 75, 223], 0)),
+                    SocketAddr::from(([172, 67, 182, 108], 0)),
+                ];
+                let iter: Addrs = Box::new(addrs.into_iter());
+                return Ok(iter);
+            }
+            if lower.ends_with(".animepahe.si") || lower == "animepahe.si" {
+                let addrs = vec![SocketAddr::from(([162, 4, 84, 239], 0))];
+                let iter: Addrs = Box::new(addrs.into_iter());
+                return Ok(iter);
+            }
 
             // 3. Fallback: Query Cloudflare DoH (1.1.1.1) directly by IP
             let cf_url = format!("https://1.1.1.1/dns-query?name={}&type=A", lower);

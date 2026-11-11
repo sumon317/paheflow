@@ -321,4 +321,77 @@ impl HttpClient {
             }
         })
     }
+
+    pub async fn fetch_bytes(
+        &self,
+        url: &str,
+        referer: Option<&str>,
+        cfg: &AppConfig,
+    ) -> Result<(Vec<u8>, String), String> {
+        let is_animepahe = url.contains("animepahe.");
+        let mut last_error = String::from("Failed to download image.");
+
+        for attempt in 1..=3 {
+            self.throttle().await;
+
+            let mut req = self.http.get(url);
+
+            let ua = if !cfg.ua.trim().is_empty() {
+                cfg.ua.trim()
+            } else {
+                "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
+            };
+            req = req.header(reqwest::header::USER_AGENT, ua);
+            req = req.header(
+                reqwest::header::ACCEPT,
+                "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            );
+            req = req.header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
+
+            if is_animepahe && !cfg.cf.trim().is_empty() {
+                req = req.header(
+                    reqwest::header::COOKIE,
+                    format!("cf_clearance={}", cfg.cf.trim()),
+                );
+            }
+
+            let effective_ref = referer.or(if is_animepahe {
+                Some("https://animepahe.pw/")
+            } else {
+                None
+            });
+            if let Some(ref_url) = effective_ref {
+                req = req.header(reqwest::header::REFERER, ref_url);
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let content_type = resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("image/jpeg")
+                            .to_string();
+                        match resp.bytes().await {
+                            Ok(bytes) => return Ok((bytes.to_vec(), content_type)),
+                            Err(e) => {
+                                last_error = format!("Failed to read image bytes: {}", e);
+                            }
+                        }
+                    } else {
+                        last_error = format!("HTTP request failed with status code {}", status);
+                    }
+                }
+                Err(err) => {
+                    last_error = format!("HTTP client request failed: {}", err);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(400 * attempt)).await;
+        }
+
+        Err(last_error)
+    }
 }

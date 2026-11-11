@@ -314,7 +314,7 @@
       window.AndroidBridge.downloadAndInstallUpdate(apkUrl);
     } else {
       // Desktop / Browser
-      const targetUrl = latestUpdateInfo.html_url || "https://github.com/sumon317/paheflow/releases/latest";
+      const targetUrl = latestUpdateInfo.html_url || "https://github.com/paheflow/paheflow/releases/latest";
       window.open(targetUrl, "_blank");
       closeUpdateModal();
       toast("Opened GitHub release in browser", "info");
@@ -506,12 +506,13 @@
       const timeStr = timeAgo(item.created_at || item.createdAt);
       const isSelected = session === state.selectedSlug;
       const snapshot = item.snapshot || "";
+      const thumbUrl = snapshot ? `/api/thumb?url=${encodeURIComponent(snapshot)}&token=${encodeURIComponent(token())}` : "";
       const duration = item.duration || "";
 
       return `
         <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(session)}" data-title="${escapeHtml(title)}" data-ep="${escapeHtml(epNum)}">
           <div class="recent-thumb-wrap">
-            ${snapshot ? `<img class="recent-thumb" src="${escapeHtml(snapshot)}" alt="${escapeHtml(title)}" loading="lazy" onerror="this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex';" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
+            ${snapshot ? `<img class="recent-thumb" src="${escapeHtml(thumbUrl)}" data-fallback-src="${escapeHtml(snapshot)}" alt="${escapeHtml(title)}" loading="lazy" referrerpolicy="no-referrer" onerror="if(this.dataset.fallbackSrc && this.src !== this.dataset.fallbackSrc){ this.src = this.dataset.fallbackSrc; this.removeAttribute('data-fallback-src'); } else { this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'; }" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
           </div>
           <div class="result-main">
             <div class="result-title">${escapeHtml(title)}</div>

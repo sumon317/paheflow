@@ -54,6 +54,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/catalog", get(get_catalog))
         .route("/api/search", get(get_search))
         .route("/api/latest", get(get_latest_releases))
+        .route("/api/thumb", get(get_thumbnail))
         .route("/api/episodes", get(get_episodes))
         .route("/api/episode-options", get(get_episode_options))
         .route("/api/status", get(get_status))
@@ -478,7 +479,8 @@ async fn get_check_update(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    let url = "https://api.github.com/repos/sumon317/paheflow/releases/latest";
+    let repo = std::env::var("PAHEFLOW_REPO").unwrap_or_else(|_| "paheflow/paheflow".to_string());
+    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -636,6 +638,170 @@ async fn get_latest_releases(
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": e })),
         )),
+    }
+}
+
+async fn get_thumbnail(
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Response<Body> {
+    if !check_token_any(&headers, &query, &state) {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid token"}"#,
+        )
+            .into_response();
+    }
+
+    let raw_url = match query.get("url") {
+        Some(u) if !u.trim().is_empty() => u.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"Missing url parameter"}"#,
+            )
+                .into_response();
+        }
+    };
+
+    let parsed = match url::Url::parse(raw_url) {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"Invalid URL"}"#,
+            )
+                .into_response();
+        }
+    };
+
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let allowed = host.ends_with(".animepahe.com")
+        || host == "animepahe.com"
+        || host.ends_with(".animepahe.pw")
+        || host == "animepahe.pw"
+        || host.ends_with(".animepahe.org")
+        || host == "animepahe.org"
+        || host.ends_with(".animepahe.ru")
+        || host == "animepahe.ru"
+        || host.ends_with(".animepahe.si")
+        || host == "animepahe.si"
+        || host.ends_with(".owocdn.com")
+        || host.ends_with(".owocdn.top")
+        || host.ends_with(".kwik.cx")
+        || host.ends_with(".kwik.si");
+
+    if !allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Host not allowed"}"#,
+        )
+            .into_response();
+    }
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    raw_url.hash(&mut hasher);
+    let hash_val = hasher.finish();
+
+    let ext = parsed
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .and_then(|seg| seg.rsplit('.').next())
+        .filter(|e| *e == "jpg" || *e == "jpeg" || *e == "png" || *e == "webp")
+        .unwrap_or("jpg");
+
+    let mime_type = match ext {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+
+    let thumb_dir = resource_dir().join("cache").join("thumbs");
+    let _ = fs::create_dir_all(&thumb_dir);
+    let cache_file = thumb_dir.join(format!("{:016x}.{}", hash_val, ext));
+
+    if let Ok(bytes) = fs::read(&cache_file) {
+        if !bytes.is_empty() {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime_type)
+                .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Build response failed").into_response()
+                });
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let mut initial_url = raw_url.to_string();
+    if host == "i.animepahe.ru" || host == "i.animepahe.si" {
+        initial_url = initial_url
+            .replace("i.animepahe.ru", "i.animepahe.com")
+            .replace("i.animepahe.si", "i.animepahe.com");
+    }
+    candidates.push(initial_url);
+
+    if !raw_url.contains("i.animepahe.com") {
+        candidates.push(
+            raw_url
+                .replace("i.animepahe.ru", "i.animepahe.com")
+                .replace("i.animepahe.si", "i.animepahe.com")
+                .replace("i.animepahe.pw", "i.animepahe.com"),
+        );
+    }
+    if !raw_url.contains("i.animepahe.pw") {
+        candidates.push(
+            raw_url
+                .replace("i.animepahe.ru", "i.animepahe.pw")
+                .replace("i.animepahe.si", "i.animepahe.pw")
+                .replace("i.animepahe.com", "i.animepahe.pw"),
+        );
+    }
+    candidates.push(raw_url.to_string());
+    candidates.dedup();
+
+    let cfg = read_config();
+    let mut fetched_data: Option<(Vec<u8>, String)> = None;
+
+    for cand in candidates {
+        if let Ok((bytes, content_type)) = state
+            .client
+            .fetch_bytes(&cand, Some("https://animepahe.pw/"), &cfg)
+            .await
+        {
+            if !bytes.is_empty() {
+                fetched_data = Some((bytes, content_type));
+                break;
+            }
+        }
+    }
+
+    if let Some((bytes, content_type)) = fetched_data {
+        let _ = fs::write(&cache_file, &bytes);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Build response failed").into_response()
+            })
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Thumbnail not found"}"#,
+        )
+            .into_response()
     }
 }
 
@@ -1432,5 +1598,60 @@ mod tests {
         assert!(!is_version_newer("1.0.0", "1.0.0"));
         assert!(!is_version_newer("0.9.9", "1.0.0"));
         assert!(!is_version_newer("1.0.0", "1.0.1"));
+    }
+
+    #[test]
+    fn thumbnail_host_validation_allows_valid_domains() {
+        let allowed_urls = [
+            "https://i.animepahe.com/uploads/snapshots/123.jpg",
+            "https://i.animepahe.pw/snapshots/abc.jpg",
+            "https://animepahe.org/snapshots/def.jpg",
+            "https://i.animepahe.ru/snapshots/xyz.jpg",
+            "https://i.animepahe.si/snapshots/xyz.jpg",
+        ];
+        for u in allowed_urls {
+            let parsed = url::Url::parse(u).unwrap();
+            let host = parsed.host_str().unwrap().to_ascii_lowercase();
+            let ok = host.ends_with(".animepahe.com")
+                || host == "animepahe.com"
+                || host.ends_with(".animepahe.pw")
+                || host == "animepahe.pw"
+                || host.ends_with(".animepahe.org")
+                || host == "animepahe.org"
+                || host.ends_with(".animepahe.ru")
+                || host == "animepahe.ru"
+                || host.ends_with(".animepahe.si")
+                || host == "animepahe.si"
+                || host.ends_with(".owocdn.com")
+                || host.ends_with(".owocdn.top")
+                || host.ends_with(".kwik.cx")
+                || host.ends_with(".kwik.si");
+            assert!(ok, "Expected host {} to be allowed", host);
+        }
+
+        let disallowed_urls = [
+            "https://malicious.site/exploit.jpg",
+            "https://google.com/test.jpg",
+            "https://animepahe.com.attacker.com/evil.jpg",
+        ];
+        for u in disallowed_urls {
+            let parsed = url::Url::parse(u).unwrap();
+            let host = parsed.host_str().unwrap().to_ascii_lowercase();
+            let ok = host.ends_with(".animepahe.com")
+                || host == "animepahe.com"
+                || host.ends_with(".animepahe.pw")
+                || host == "animepahe.pw"
+                || host.ends_with(".animepahe.org")
+                || host == "animepahe.org"
+                || host.ends_with(".animepahe.ru")
+                || host == "animepahe.ru"
+                || host.ends_with(".animepahe.si")
+                || host == "animepahe.si"
+                || host.ends_with(".owocdn.com")
+                || host.ends_with(".owocdn.top")
+                || host.ends_with(".kwik.cx")
+                || host.ends_with(".kwik.si");
+            assert!(!ok, "Expected host {} to be rejected", host);
+        }
     }
 }

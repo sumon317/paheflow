@@ -11,10 +11,12 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.Settings
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -77,6 +79,7 @@ class MainActivity : AppCompatActivity() {
         AnimePaheService.start(this)
 
         setupWebView()
+        checkFirstRunPermissionOnboarding()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -133,6 +136,12 @@ class MainActivity : AppCompatActivity() {
         settings.textZoom = 100
         settings.allowFileAccess = false
         settings.allowContentAccess = false
+        settings.loadsImagesAutomatically = true
+        settings.blockNetworkImage = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        }
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
         webView.overScrollMode = WebView.OVER_SCROLL_NEVER
 
@@ -341,10 +350,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun hasStoragePermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager() || canWriteToAppStorage()
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED || canWriteToAppStorage()
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED || canWriteToAppStorage()
         } else {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+            true
         }
     }
 
@@ -358,36 +369,66 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun promptStoragePermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!Environment.isExternalStorageManager()) {
-                try {
-                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
-                    Toast.makeText(this, "Please allow 'All files access' for PaheFlow to save downloads to storage", Toast.LENGTH_LONG).show()
-                } catch (_: Exception) {
-                    try {
-                        val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                        startActivity(intent)
-                    } catch (e: Exception) {
-                        Toast.makeText(this, "Please enable storage access in Settings: ${e.message}", Toast.LENGTH_LONG).show()
-                    }
-                }
-            } else {
-                Toast.makeText(this, "Storage permission is already granted", Toast.LENGTH_SHORT).show()
+        val permissions = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
             }
-        } else {
-            val permissions = mutableListOf<String>()
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.Q &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             }
-            if (permissions.isNotEmpty()) {
-                ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 102)
+        }
+
+        if (permissions.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 102)
+        } else {
+            Toast.makeText(this, "Storage permission is already granted", Toast.LENGTH_SHORT).show()
+            checkAndNotifyStoragePermission()
+        }
+    }
+
+    private fun checkFirstRunPermissionOnboarding() {
+        val prefs = getSharedPreferences("paheflow_prefs", MODE_PRIVATE)
+        val prompted = prefs.getBoolean("first_run_storage_prompt_shown", false)
+        if (!prompted) {
+            prefs.edit().putBoolean("first_run_storage_prompt_shown", true).apply()
+            if (!hasStoragePermission()) {
+                showFirstRunPermissionDialog()
             }
+        }
+    }
+
+    private fun showFirstRunPermissionDialog() {
+        if (isFinishing || isDestroyed) return
+        AlertDialog.Builder(this)
+            .setTitle("Storage Permission")
+            .setMessage("PaheFlow needs storage permission to save downloaded anime episodes to your device's Download folder. Would you like to grant permission now?")
+            .setPositiveButton("Grant Permission") { _, _ ->
+                promptStoragePermission()
+            }
+            .setNegativeButton("Later", null)
+            .show()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 102) {
+            checkAndNotifyStoragePermission()
         }
     }
 
@@ -579,12 +620,6 @@ class MainActivity : AppCompatActivity() {
         try {
             File(dirPath).mkdirs()
         } catch (_: Exception) {}
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            if (!hasStoragePermission()) {
-                promptStoragePermission()
-            }
-        }
     }
 
     private fun resolveTreeUriToPath(uri: Uri): String? {
