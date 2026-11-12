@@ -670,6 +670,8 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
   height: 100%;
   object-fit: cover;
   display: block;
+  image-rendering: -webkit-optimize-contrast;
+  content-visibility: auto;
 }
 .recent-thumb-placeholder {
   font-size: 20px;

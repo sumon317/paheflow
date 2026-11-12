@@ -62,8 +62,9 @@
    *  state
    * ───────────────────────────────────────────────────────────────── */
 
-  const CATALOG_PAGE_SIZE = 40;
-  const RECENT_CHUNK_SIZE = 30;
+  const CATALOG_PAGE_SIZE = 10;
+  const CATALOG_CHUNK_SIZE = 10;
+  const RECENT_CHUNK_SIZE = 10;
   // Download logs arrive much faster than a user can read them. Keep the DOM
   // bounded so a long batch cannot turn every SSE event into a layout pass.
   const MAX_LOG_LINES = 1000;
@@ -451,8 +452,6 @@
       a.title.toLowerCase().includes(term) || a.slug.toLowerCase().includes(term));
   }
 
-  const CATALOG_CHUNK_SIZE = 40;
-  const RECENT_CHUNK_SIZE = 30;
 
   function renderCatalog(resetLimit = true) {
     if (state.searchMode === "recent") {
@@ -509,7 +508,7 @@
       <div class="result ${isSelected ? "is-selected" : ""}" data-slug="${escapeHtml(a.slug)}">
         ${poster ? `
           <div class="recent-thumb-wrap">
-            <img class="recent-thumb" src="${escapeHtml(thumbUrl)}" alt="${escapeHtml(a.title)}" loading="lazy" decoding="async" onerror="this.parentElement.style.display='none'" />
+            <img class="recent-thumb" src="${escapeHtml(thumbUrl)}" alt="${escapeHtml(a.title)}" width="88" height="52" loading="lazy" decoding="async" onerror="this.parentElement.style.display='none'" />
           </div>
         ` : ""}
         <div class="result-main">
@@ -537,7 +536,7 @@
       if (entries[0] && entries[0].isIntersecting) {
         appendMoreCatalog(list, isLocal);
       }
-    }, { rootMargin: "600px" });
+    }, { rootMargin: "300px" });
     state.catalogObserver.observe(sentinel);
   }
 
@@ -714,7 +713,7 @@
       <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(session)}" data-title="${escapeHtml(title)}" data-ep="${escapeHtml(epNum)}">
         ${snapshot ? `
           <div class="recent-thumb-wrap">
-            <img class="recent-thumb" src="${escapeHtml(thumbUrl)}" alt="${escapeHtml(title)}" loading="lazy" decoding="async" onerror="this.parentElement.style.display='none'" />
+            <img class="recent-thumb" src="${escapeHtml(thumbUrl)}" alt="${escapeHtml(title)}" width="88" height="52" loading="lazy" decoding="async" onerror="this.parentElement.style.display='none'" />
           </div>
         ` : ""}
         <div class="result-main">
@@ -745,7 +744,7 @@
       if (entries[0] && entries[0].isIntersecting) {
         appendMoreRecent(items);
       }
-    }, { rootMargin: "600px" });
+    }, { rootMargin: "300px" });
     state.catalogObserver.observe(sentinel);
   }
 

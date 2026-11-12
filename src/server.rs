@@ -737,7 +737,7 @@ async fn get_thumbnail(
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+                .header(header::CACHE_CONTROL, "public, max-age=2592000, immutable")
                 .body(Body::from(bytes))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "Build response failed").into_response()
@@ -794,7 +794,7 @@ async fn get_thumbnail(
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, content_type)
-            .header(header::CACHE_CONTROL, "public, max-age=604800, immutable")
+            .header(header::CACHE_CONTROL, "public, max-age=2592000, immutable")
             .body(Body::from(bytes))
             .unwrap_or_else(|_| {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Build response failed").into_response()
