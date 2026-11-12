@@ -1128,7 +1128,7 @@ pub async fn refresh_catalog(
 ) -> Result<Vec<CatalogEntry>, String> {
     let url = format!("{}/anime", HOST);
     let html = client.fetch(&url, None, cfg).await?;
-    
+
     // More flexible regex to match various HTML structures:
     // 1. <a href="/anime/SLUG" title="TITLE">...<img src="POSTER"...>...</a>
     // 2. <a href="/anime/SLUG" title="TITLE"><img src="POSTER"...></a>
@@ -1159,7 +1159,10 @@ pub async fn refresh_catalog(
         if let Some(src) = caps.get(1) {
             let src_str = src.as_str().trim();
             if !src_str.is_empty() && !src_str.starts_with("data:") {
-                img_positions.push((src_str.to_string(), caps.get(0).map(|m| m.start()).unwrap_or(0)));
+                img_positions.push((
+                    src_str.to_string(),
+                    caps.get(0).map(|m| m.start()).unwrap_or(0),
+                ));
             }
         }
     }
@@ -1168,14 +1171,15 @@ pub async fn refresh_catalog(
     for (slug, title, anchor_pos) in anchor_positions {
         let mut best_poster = None;
         let mut best_distance = usize::MAX;
-        
+
         for (img_src, img_pos) in &img_positions {
             let distance = if *img_pos < anchor_pos {
                 anchor_pos - *img_pos
             } else {
                 *img_pos - anchor_pos
             };
-            if distance < best_distance && distance < 5000 { // Within 5KB of HTML
+            if distance < best_distance && distance < 5000 {
+                // Within 5KB of HTML
                 best_distance = distance;
                 best_poster = Some(img_src.clone());
             }
