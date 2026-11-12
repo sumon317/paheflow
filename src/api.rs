@@ -903,7 +903,10 @@ pub fn catalog() -> Vec<CatalogEntry> {
             if let Some(caps) = line_re.captures(line.trim()) {
                 let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                 let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                let poster = caps.get(3).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+                let poster = caps
+                    .get(3)
+                    .map(|m| m.as_str().trim().to_string())
+                    .filter(|s| !s.is_empty());
                 if !slug.is_empty() && seen.insert(slug.to_string()) {
                     entries.push(CatalogEntry {
                         slug: slug.to_string(),
@@ -995,7 +998,10 @@ pub async fn refresh_catalog(
     for caps in anchor_re.captures_iter(&html) {
         let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        let poster = caps.get(3).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+        let poster = caps
+            .get(3)
+            .map(|m| m.as_str().trim().to_string())
+            .filter(|s| !s.is_empty());
         if !slug.is_empty() && seen.insert(slug.to_string()) {
             entries.push(CatalogEntry {
                 slug: slug.to_string(),
@@ -1007,8 +1013,9 @@ pub async fn refresh_catalog(
 
     // Fallback: if no posters found, try to find img tags near the anchors in the broader HTML
     if entries.iter().all(|e| e.poster.is_none()) {
-        let img_re = Regex::new(r#"<img\s+[^>]*src="([^"]*animepahe[^"]*|\.[^"]*(?:jpg|png|webp))"[^>]*>"#)
-            .map_err(|e| e.to_string())?;
+        let img_re =
+            Regex::new(r#"<img\s+[^>]*src="([^"]*animepahe[^"]*|\.[^"]*(?:jpg|png|webp))"[^>]*>"#)
+                .map_err(|e| e.to_string())?;
         let mut img_iter = img_re.captures_iter(&html);
         for entry in entries.iter_mut() {
             if let Some(img_caps) = img_iter.next() {
