@@ -12,3 +12,9 @@ id = "android-signing-credential"
 description = "Android signing password material hardcoded or defaulted in build scripts"
 regex = '''(?i)(?:storePassword|keyPassword)\s*=\s*(?:"[^"*]{4,}"|[^,\r\n]*\?:\s*"[^"*]{6,}")'''
 keywords = ["storePassword", "keyPassword"]
+
+[allowlist]
+description = "Allowlist false positives"
+stopwords = [
+    "Type to search animepahe.pw",
+]
