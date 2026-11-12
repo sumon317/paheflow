@@ -1128,43 +1128,64 @@ pub async fn refresh_catalog(
 ) -> Result<Vec<CatalogEntry>, String> {
     let url = format!("{}/anime", HOST);
     let html = client.fetch(&url, None, cfg).await?;
-    // Match anchor with optional img inside or before it: <a href="/anime/SLUG" title="TITLE"><img src="POSTER" ...></a>
-    // or <img src="POSTER" ...><a href="/anime/SLUG" title="TITLE">...</a>
-    let anchor_re = Regex::new(r#"<a\s+href="/anime/([0-9a-fA-F-]+)"[^>]*title="([^"]*)"[^>]*>(?:[^<]*<img\s+[^>]*src="([^"]*)"[^>]*>)?"#)
+    
+    // More flexible regex to match various HTML structures:
+    // 1. <a href="/anime/SLUG" title="TITLE">...<img src="POSTER"...>...</a>
+    // 2. <a href="/anime/SLUG" title="TITLE"><img src="POSTER"...></a>
+    // 3. <img src="POSTER"...>...<a href="/anime/SLUG" title="TITLE">...</a>
+    // 4. <a href="/anime/SLUG" ... title="TITLE" ...> (no img inside, check nearby)
+    let anchor_re = Regex::new(r#"<a\s+href="/anime/([0-9a-fA-F-]+)"[^>]*title="([^"]*)"[^>]*>"#)
         .map_err(|e| e.to_string())?;
 
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
+    // First pass: collect all anchors with their positions
+    let mut anchor_positions = Vec::new();
     for caps in anchor_re.captures_iter(&html) {
         let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-        let poster = caps
-            .get(3)
-            .map(|m| m.as_str().trim().to_string())
-            .filter(|s| !s.is_empty());
+        let anchor_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
         if !slug.is_empty() && seen.insert(slug.to_string()) {
-            entries.push(CatalogEntry {
-                slug: slug.to_string(),
-                title: title.to_string(),
-                poster,
-            });
+            anchor_positions.push((slug.to_string(), title.to_string(), anchor_end));
         }
     }
 
-    // Fallback: if no posters found, try to find img tags near the anchors in the broader HTML
-    if entries.iter().all(|e| e.poster.is_none()) {
-        let img_re =
-            Regex::new(r#"<img\s+[^>]*src="([^"]*animepahe[^"]*|\.[^"]*(?:jpg|png|webp))"[^>]*>"#)
-                .map_err(|e| e.to_string())?;
-        let mut img_iter = img_re.captures_iter(&html);
-        for entry in entries.iter_mut() {
-            if let Some(img_caps) = img_iter.next() {
-                if let Some(src) = img_caps.get(1) {
-                    entry.poster = Some(src.as_str().trim().to_string());
-                }
+    // Second pass: find all img tags with their positions
+    let img_re = Regex::new(r#"<img\s+[^>]*src="([^"]*(?:animepahe|anime|cover|poster|thumb)[^"]*|\.[^"]*(?:jpg|png|webp))"[^>]*>"#)
+        .map_err(|e| e.to_string())?;
+    let mut img_positions = Vec::new();
+    for caps in img_re.captures_iter(&html) {
+        if let Some(src) = caps.get(1) {
+            let src_str = src.as_str().trim();
+            if !src_str.is_empty() && !src_str.starts_with("data:") {
+                img_positions.push((src_str.to_string(), caps.get(0).map(|m| m.start()).unwrap_or(0)));
             }
         }
+    }
+
+    // Match each anchor to the nearest preceding or following image
+    for (slug, title, anchor_pos) in anchor_positions {
+        let mut best_poster = None;
+        let mut best_distance = usize::MAX;
+        
+        for (img_src, img_pos) in &img_positions {
+            let distance = if *img_pos < anchor_pos {
+                anchor_pos - *img_pos
+            } else {
+                *img_pos - anchor_pos
+            };
+            if distance < best_distance && distance < 5000 { // Within 5KB of HTML
+                best_distance = distance;
+                best_poster = Some(img_src.clone());
+            }
+        }
+
+        entries.push(CatalogEntry {
+            slug,
+            title,
+            poster: best_poster,
+        });
     }
 
     if entries.is_empty() {
