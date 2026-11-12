@@ -557,7 +557,7 @@
       const hasQuery = Boolean($("searchInput").value.trim());
       $("catalogMeta").textContent = total
         ? `${total} result(s) from animepahe.pw`
-        : (hasQuery ? "No results from animepahe.pw" : "Search animepahe");
+        : "No results from animepahe.pw";
     } else {
       $("catalogMeta").textContent = total
         ? `${total} cached slug(s) shown`

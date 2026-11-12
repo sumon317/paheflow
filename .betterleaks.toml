@@ -16,5 +16,6 @@ keywords = ["storePassword", "keyPassword"]
 [allowlist]
 description = "Allowlist false positives"
 stopwords = [
+    "Search animepahe",
     "Type to search animepahe.pw",
 ]
