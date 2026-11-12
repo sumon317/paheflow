@@ -18,4 +18,5 @@ description = "Allowlist false positives"
 stopwords = [
     "Search animepahe",
     "Type to search animepahe.pw",
+    "keyPassword=%s",
 ]
