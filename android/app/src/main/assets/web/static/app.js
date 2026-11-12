@@ -62,7 +62,7 @@
    *  state
    * ───────────────────────────────────────────────────────────────── */
 
-  const CATALOG_PAGE_SIZE = 200;
+  const CATALOG_PAGE_SIZE = 10000; // Effectively unlimited - show all items at once
   // Download logs arrive much faster than a user can read them. Keep the DOM
   // bounded so a long batch cannot turn every SSE event into a layout pass.
   const MAX_LOG_LINES = 1000;
@@ -384,15 +384,15 @@
       return;
     }
     const list = filteredCatalog();
-    const shownList = list.slice(0, state.catalogLimit);
+    // With unlimited CATALOG_PAGE_SIZE, show all items
+    const shownList = list;
     const box = $("resultsList");
     if (!list.length) {
       const remote = state.searchMode === "remote";
       box.innerHTML = `<div class="empty"><p class="empty-title">${remote ? "No results" : "No matches in local catalog"}</p><p class="empty-text">${remote ? "Try a different search term." : "The local list holds cached slugs; hit Refresh catalog to update it."}</p></div>`;
-      updateCatalogMeta(0, 0);
+      updateCatalogMeta(list.length, list.length);
       return;
     }
-    const hidden = list.length - shownList.length;
     box.innerHTML = shownList.map(a => {
       // Determine thumbnail: remote catalog items have poster/cover, local ones don't
       const poster = a.poster || a.cover || "";
@@ -415,31 +415,27 @@
           </div>
         </div>
       `;
-    }).join("") + (hidden > 0
-      ? `<button class="btn btn-ghost load-more" id="loadMoreCatalog">Show ${Math.min(CATALOG_PAGE_SIZE, hidden)} more (${hidden} hidden)</button>`
-      : "");
+    }).join("");
     $$$(".select-btn", box).forEach(btn => {
       btn.onclick = (e) => { e.stopPropagation(); const slug = e.currentTarget.closest(".result").dataset.slug; selectAnime(slug); };
     });
     $$$(".result", box).forEach(el => {
       el.onclick = (e) => { if (!e.target.closest(".select-btn")) selectAnime(el.dataset.slug); };
     });
-    const more = $("loadMoreCatalog");
-    if (more) more.onclick = () => { state.catalogLimit += CATALOG_PAGE_SIZE; renderCatalog(); };
-    updateCatalogMeta(shownList.length, list.length);
+    updateCatalogMeta(list.length, list.length);
   }
 
   function updateCatalogMeta(shown, total) {
     if (state.searchMode === "recent") {
       const totalStr = state.recentTotal ? ` of ${state.recentTotal.toLocaleString()}` : "";
-      $("catalogMeta").textContent = `Page ${state.recentPage}${totalStr} latest releases from AnimePahe`;
+      $("catalogMeta").textContent = `${shown} recent release${shown !== 1 ? "s" : ""}${totalStr ? ` (${totalStr.trim()} total)` : ""} from AnimePahe`;
     } else if (state.searchMode === "remote") {
       $("catalogMeta").textContent = total
-        ? `${shown} of ${total} result(s) from animepahe.pw`
+        ? `${total} result(s) from animepahe.pw`
         : "No results from animepahe.pw";
     } else {
       $("catalogMeta").textContent = total
-        ? `${shown} of ${total} cached slug(s) shown`
+        ? `${total} cached slug(s) shown`
         : "No cached slugs match";
     }
   }
@@ -451,11 +447,11 @@
     $$("#resultModes .seg").forEach(b => b.classList.toggle("is-active", b.dataset.mode === mode));
     const pager = $("recentPager");
     if (pager) {
-      pager.classList.toggle("hidden", mode !== "recent");
+      pager.classList.add("hidden"); // Always hide pager - unlimited scrolling
     }
     if (mode === "recent") {
       if (!state.recentItems.length || !isModeChange || forceReload) {
-        loadRecentReleases(state.recentPage || 1);
+        loadRecentReleases(1, true); // Fetch all pages
       } else {
         renderRecentReleases();
       }
@@ -479,7 +475,7 @@
     }
   }
 
-  async function loadRecentReleases(page = 1) {
+  async function loadRecentReleases(page = 1, all = false) {
     state.recentLoading = true;
     state.recentPage = page;
     const box = $("resultsList");
@@ -487,11 +483,11 @@
     $("catalogMeta").textContent = "Fetching latest releases...";
     updateRecentPager();
     try {
-      const res = await api.get(`/api/latest?page=${page}`);
+      const res = await api.get(`/api/latest?page=${page}&all=${all ? "1" : "0"}`);
       const list = res.items || res.data || [];
       state.recentItems = list;
-      state.recentPage = res.page || res.current_page || res.currentPage || page;
-      state.recentLastPage = res.lastPage || res.last_page || 1;
+      state.recentPage = 1;
+      state.recentLastPage = 1;
       state.recentTotal = res.total ?? list.length;
       state.recentLoading = false;
       if (state.searchMode === "recent") {
@@ -577,15 +573,7 @@
   function updateRecentPager() {
     const pager = $("recentPager");
     if (!pager) return;
-    if (state.searchMode !== "recent") {
-      pager.classList.add("hidden");
-      return;
-    }
-    const pages = Math.max(1, state.recentLastPage || 1);
-    pager.classList.toggle("hidden", pages <= 1 && !state.recentItems.length);
-    $("recentPageInfo").textContent = `Page ${state.recentPage} of ${pages}`;
-    $("recentPrev").disabled = state.recentLoading || state.recentPage <= 1;
-    $("recentNext").disabled = state.recentLoading || state.recentPage >= pages;
+    pager.classList.add("hidden"); // Always hide - unlimited scrolling
   }
 
   function selectRecentEpisode(slug, title, episodeNum) {
@@ -685,7 +673,7 @@
     try {
       const titleParam = state.selectedTitle ? `&title=${encodeURIComponent(state.selectedTitle)}` : "";
       const audioParam = state.audioFilter ? `&audio=${encodeURIComponent(state.audioFilter)}` : "";
-      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&page=${page}${titleParam}${audioParam}`);
+      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&all=1${titleParam}${audioParam}`);
       if (res.slug && res.slug !== slug) {
         state.selectedSlug = res.slug;
         slug = res.slug;
@@ -780,11 +768,7 @@
   function updatePagination() {
     const pager = $("epPager");
     if (!pager) return;
-    const pages = Math.max(1, state.epLastPage || 1);
-    pager.classList.toggle("hidden", pages <= 1);
-    $("epPageInfo").textContent = `Page ${state.epPage} of ${pages}`;
-    $("epPrev").disabled = state.epPage <= 1;
-    $("epNext").disabled = state.epPage >= pages;
+    pager.classList.add("hidden"); // Always hide - we load all episodes at once
   }
 
   function getDisplayEpisodes() {
@@ -2209,21 +2193,9 @@
     $("clearSearch").onclick = () => { $("searchInput").value = ""; setCatalogMode("local"); };
     $$("#resultModes .seg").forEach(btn => btn.onclick = () => setCatalogMode(btn.dataset.mode));
     $("refreshCatalog").onclick = refreshCatalog;
-    $("recentPrev").onclick = () => {
-      if (state.recentPage > 1 && !state.recentLoading) {
-        loadRecentReleases(state.recentPage - 1);
-      }
-    };
-    $("recentNext").onclick = () => {
-      if (state.recentPage < state.recentLastPage && !state.recentLoading) {
-        loadRecentReleases(state.recentPage + 1);
-      }
-    };
 
     // episodes
     $("reloadEpisodes").onclick = () => loadEpisodes(state.selectedSlug, 1, state.audioFilter);
-    $("epPrev").onclick = () => { if (state.epPage > 1) loadEpisodes(state.selectedSlug, state.epPage - 1, state.audioFilter); };
-    $("epNext").onclick = () => { if (state.epPage < state.epLastPage) loadEpisodes(state.selectedSlug, state.epPage + 1, state.audioFilter); };
     $("epFilter").addEventListener("input", debounce(() => { state.epFilter = $("epFilter").value; renderEpGrid(); }));
     $$("#epAudioSegmented .seg").forEach(btn => {
       btn.onclick = () => {

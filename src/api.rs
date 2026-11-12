@@ -262,111 +262,236 @@ pub async fn latest_releases(
     client: &HttpClient,
     page: u32,
     cfg: &AppConfig,
+    all: bool,
 ) -> Result<LatestReleasesPage, String> {
-    let url = format!("{}?m=airing&page={}", API_URL, page.max(1));
-    let json = match client.fetch_json(&url, None, cfg).await {
-        Ok(j) => j,
-        Err(_) => {
-            let alt_url = format!("{}/?m=airing&page={}", API_URL, page.max(1));
-            client.fetch_json(&alt_url, None, cfg).await?
-        }
-    };
+    if all {
+        // Fetch all pages
+        let mut all_items = Vec::new();
+        let mut total = 0;
+        let mut last_page = 1;
+        let mut current_page = 1;
+        let mut pg = 1;
 
-    let page_val = json
-        .get("current_page")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or(page);
+        loop {
+            let url = format!("{}?m=airing&page={}", API_URL, pg);
+            let json = match client.fetch_json(&url, None, cfg).await {
+                Ok(j) => j,
+                Err(_) => {
+                    let alt_url = format!("{}/?m=airing&page={}", API_URL, pg);
+                    client.fetch_json(&alt_url, None, cfg).await?
+                }
+            };
 
-    let last_page = json
-        .get("last_page")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or(1);
+            let page_val = json
+                .get("current_page")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(pg);
 
-    let total = json
-        .get("total")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(0);
+            let lp = json
+                .get("last_page")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(1);
 
-    let mut items = Vec::new();
-    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-        for it in data {
-            let anime_title = it
-                .get("anime_title")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let anime_session = it
-                .get("anime_session")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
+            total = json
+                .get("total")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(total);
 
-            if anime_title.is_empty() || anime_session.is_empty() {
-                continue;
+            last_page = lp;
+            current_page = page_val;
+
+            if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                for it in data {
+                    let anime_title = it
+                        .get("anime_title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let anime_session = it
+                        .get("anime_session")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    if anime_title.is_empty() || anime_session.is_empty() {
+                        continue;
+                    }
+
+                    all_items.push(LatestReleaseItem {
+                        id: it.get("id").and_then(|v| v.as_u64()),
+                        anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
+                        anime_title,
+                        anime_session,
+                        episode: it
+                            .get("episode")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                        snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
+                            let s = s.trim();
+                            let mut url = if s.starts_with("//") {
+                                format!("https:{}", s)
+                            } else if s.starts_with('/') {
+                                format!("https://animepahe.pw{}", s)
+                            } else if !s.starts_with("http://")
+                                && !s.starts_with("https://")
+                                && !s.is_empty()
+                            {
+                                format!("https://{}", s)
+                            } else {
+                                s.to_string()
+                            };
+                            if url.contains("i.animepahe.ru") {
+                                url = url.replace("i.animepahe.ru", "i.animepahe.com");
+                            } else if url.contains("i.animepahe.si") {
+                                url = url.replace("i.animepahe.si", "i.animepahe.com");
+                            }
+                            url
+                        }),
+                        duration: it
+                            .get("duration")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        session: it
+                            .get("session")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        created_at: it
+                            .get("created_at")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        audio: it
+                            .get("audio")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    });
+                }
             }
 
-            items.push(LatestReleaseItem {
-                id: it.get("id").and_then(|v| v.as_u64()),
-                anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
-                anime_title,
-                anime_session,
-                episode: it
-                    .get("episode")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-                snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
-                    let s = s.trim();
-                    let mut url = if s.starts_with("//") {
-                        format!("https:{}", s)
-                    } else if s.starts_with('/') {
-                        format!("https://animepahe.pw{}", s)
-                    } else if !s.starts_with("http://")
-                        && !s.starts_with("https://")
-                        && !s.is_empty()
-                    {
-                        format!("https://{}", s)
-                    } else {
-                        s.to_string()
-                    };
-                    if url.contains("i.animepahe.ru") {
-                        url = url.replace("i.animepahe.ru", "i.animepahe.com");
-                    } else if url.contains("i.animepahe.si") {
-                        url = url.replace("i.animepahe.si", "i.animepahe.com");
-                    }
-                    url
-                }),
-                duration: it
-                    .get("duration")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                session: it
-                    .get("session")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                created_at: it
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                audio: it
-                    .get("audio")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-            });
+            if pg >= lp {
+                break;
+            }
+            pg += 1;
         }
-    }
 
-    Ok(LatestReleasesPage {
-        page: page_val,
-        current_page: page_val,
-        last_page,
-        last_page_camel: last_page,
-        total: if total > 0 { total } else { items.len() },
-        items: items.clone(),
-        data: items,
-    })
+        Ok(LatestReleasesPage {
+            page: 1,
+            current_page: 1,
+            last_page: 1,
+            last_page_camel: 1,
+            total: all_items.len(),
+            items: all_items.clone(),
+            data: all_items,
+        })
+    } else {
+        // Single page fetch (original behavior)
+        let url = format!("{}?m=airing&page={}", API_URL, page.max(1));
+        let json = match client.fetch_json(&url, None, cfg).await {
+            Ok(j) => j,
+            Err(_) => {
+                let alt_url = format!("{}/?m=airing&page={}", API_URL, page.max(1));
+                client.fetch_json(&alt_url, None, cfg).await?
+            }
+        };
+
+        let page_val = json
+            .get("current_page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(page);
+
+        let last_page = json
+            .get("last_page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(1);
+
+        let total = json
+            .get("total")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
+        let mut items = Vec::new();
+        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+            for it in data {
+                let anime_title = it
+                    .get("anime_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let anime_session = it
+                    .get("anime_session")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+
+                if anime_title.is_empty() || anime_session.is_empty() {
+                    continue;
+                }
+
+                items.push(LatestReleaseItem {
+                    id: it.get("id").and_then(|v| v.as_u64()),
+                    anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
+                    anime_title,
+                    anime_session,
+                    episode: it
+                        .get("episode")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
+                        let s = s.trim();
+                        let mut url = if s.starts_with("//") {
+                            format!("https:{}", s)
+                        } else if s.starts_with('/') {
+                            format!("https://animepahe.pw{}", s)
+                        } else if !s.starts_with("http://")
+                            && !s.starts_with("https://")
+                            && !s.is_empty()
+                        {
+                            format!("https://{}", s)
+                        } else {
+                            s.to_string()
+                        };
+                        if url.contains("i.animepahe.ru") {
+                            url = url.replace("i.animepahe.ru", "i.animepahe.com");
+                        } else if url.contains("i.animepahe.si") {
+                            url = url.replace("i.animepahe.si", "i.animepahe.com");
+                        }
+                        url
+                    }),
+                    duration: it
+                        .get("duration")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    session: it
+                        .get("session")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    created_at: it
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    audio: it
+                        .get("audio")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                });
+            }
+        }
+
+        Ok(LatestReleasesPage {
+            page: page_val,
+            current_page: page_val,
+            last_page,
+            last_page_camel: last_page,
+            total: if total > 0 { total } else { items.len() },
+            items: items.clone(),
+            data: items,
+        })
+    }
 }
 
 pub async fn release_page(

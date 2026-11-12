@@ -630,9 +630,10 @@ async fn get_latest_releases(
         .get("page")
         .and_then(|p| p.parse::<u32>().ok())
         .unwrap_or(1);
+    let all = query.get("all").map(|v| v == "1" || v == "true").unwrap_or(false);
     let cfg = read_config();
 
-    match api::latest_releases(&state.client, page, &cfg).await {
+    match api::latest_releases(&state.client, page, &cfg, all).await {
         Ok(res) => Ok(Json(serde_json::to_value(&res).unwrap_or_default())),
         Err(e) => Err((
             StatusCode::BAD_GATEWAY,
@@ -819,6 +820,7 @@ async fn get_episodes(
     let mut slug = query.get("slug").cloned().unwrap_or_default();
     let title_param = query.get("title").cloned();
     let page = query.get("page").and_then(|p| p.parse::<u32>().ok());
+    let all_param = query.get("all").map(|v| v == "1" || v == "true").unwrap_or(false);
     let audio_param = query.get("audio").cloned().unwrap_or_default();
     let cfg = read_config();
 
@@ -836,7 +838,10 @@ async fn get_episodes(
         let last_page = total.div_ceil(per_page).max(1) as u32;
         let pg = page.unwrap_or(1).min(last_page).max(1);
 
-        let paged_items = if page.is_some() {
+        // If all=true, return all episodes without pagination
+        let paged_items = if all_param {
+            filtered
+        } else if page.is_some() {
             let start_idx = ((pg - 1) as usize) * per_page;
             if start_idx < filtered.len() {
                 filtered[start_idx..(start_idx + per_page).min(filtered.len())].to_vec()
@@ -849,8 +854,8 @@ async fn get_episodes(
 
         return Ok(Json(serde_json::json!({
             "items": paged_items,
-            "lastPage": last_page,
-            "page": pg,
+            "lastPage": if all_param { 1 } else { last_page },
+            "page": if all_param { 1 } else { pg },
             "slug": slug,
             "total": total,
             "totalAll": total_all,
