@@ -90,9 +90,13 @@ Whether running as an APK on your phone or as a lightweight desktop service on L
 3. Grant storage permissions when prompted so downloads can be saved directly to `Download/PaheFlow`.
 4. If prompted with a Cloudflare notice, tap **"Solve Cloudflare"**, solve the challenge in the sheet, and resume downloading immediately.
 
+**In-app updates:** the update checker downloads the latest APK to `Downloads/PaheFlow` and hands it to your file
+manager or package installer with an **Open with…** dialog — the app never installs anything itself, so it holds no
+install-packages permission. You confirm the install in the installer that pops up.
+
 > **Play Protect warning on install:** Google may show *"Harmful app blocked — this app may be harmful"* for sideloaded
-> APKs with no verdict history. This is a heuristic false positive for new apps with self-update capability — tap
-> **Install anyway** if you trust the source, and verify the APK's SHA-256 and signing certificate against the values in
+> APKs with no verdict history. This is a heuristic false positive for new apps — tap **Install anyway** if you trust the
+> source, and verify the APK's SHA-256 and signing certificate against the values in
 > [docs/play-protect.md](docs/play-protect.md). That document also contains the developer appeal procedure.
 
 ### Linux Desktop

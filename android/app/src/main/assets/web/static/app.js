@@ -300,7 +300,7 @@
     const progressPercent = $("updateProgressPercent");
     const progressLabel = $("updateProgressLabel");
 
-    if (window.AndroidBridge && typeof window.AndroidBridge.downloadAndInstallUpdate === "function") {
+    if (window.AndroidBridge && typeof window.AndroidBridge.downloadLatestUpdate === "function") {
       if (actionBtn) {
         actionBtn.disabled = true;
         actionBtn.textContent = "Downloading…";
@@ -311,7 +311,7 @@
       if (progressLabel) progressLabel.textContent = "Starting download…";
 
       const apkUrl = latestUpdateInfo.apk_url || latestUpdateInfo.html_url;
-      window.AndroidBridge.downloadAndInstallUpdate(apkUrl);
+      window.AndroidBridge.downloadLatestUpdate(apkUrl);
     } else {
       // Desktop / Browser
       const targetUrl = latestUpdateInfo.html_url || "https://github.com/sumon317/paheflow/releases/latest";
@@ -339,6 +339,16 @@
       actionBtn.textContent = "Retry Download";
     }
     toast("Update download failed: " + errMsg, "error");
+  };
+
+  window.onUpdateDownloadComplete = function() {
+    const actionBtn = $("confirmUpdateBtn");
+    if (actionBtn) {
+      actionBtn.disabled = true;
+      actionBtn.textContent = "Downloaded — open the popup or check Downloads/PaheFlow";
+    }
+    const progressLabel = $("updateProgressLabel");
+    if (progressLabel) progressLabel.textContent = "Saved to Downloads/PaheFlow";
   };
 
   /* ─────────────────────────────────────────────────────────────────

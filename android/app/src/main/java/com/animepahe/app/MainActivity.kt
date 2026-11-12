@@ -5,12 +5,13 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.content.ContentValues
 import android.net.Uri
+import android.provider.MediaStore
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.DocumentsContract
-import android.provider.Settings
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -203,9 +204,9 @@ class MainActivity : AppCompatActivity() {
             }
 
             @JavascriptInterface
-            fun downloadAndInstallUpdate(apkUrl: String) {
+            fun downloadLatestUpdate(apkUrl: String) {
                 runOnUiThread {
-                    this@MainActivity.downloadAndInstallUpdate(apkUrl)
+                    this@MainActivity.downloadLatestUpdate(apkUrl)
                 }
             }
 
@@ -437,23 +438,12 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript("if (typeof window.onStoragePermissionChanged === 'function') window.onStoragePermissionChanged($hasPerm);", null)
     }
 
-    private var pendingInstallApk: File? = null
-
     override fun onResume() {
         super.onResume()
         checkAndNotifyStoragePermission()
-        if (pendingInstallApk != null) {
-            val apk = pendingInstallApk
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
-                pendingInstallApk = null
-                if (apk != null && apk.exists()) {
-                    installDownloadedApk(apk)
-                }
-            }
-        }
     }
 
-    fun downloadAndInstallUpdate(apkUrl: String) {
+    fun downloadLatestUpdate(apkUrl: String) {
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 runOnUiThread {
@@ -549,12 +539,18 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
+                val sharedUri = publishApkToSharedDownloads(destFile)
+                val signatureMatches = isApkSignedWithSameKey(destFile)
                 runOnUiThread {
                     webView.evaluateJavascript(
-                        "if (typeof window.onUpdateDownloadProgress === 'function') window.onUpdateDownloadProgress(100, 'Ready to install');",
+                        "if (typeof window.onUpdateDownloadProgress === 'function') window.onUpdateDownloadProgress(100, 'Saved to Downloads/PaheFlow');",
                         null
                     )
-                    installDownloadedApk(destFile)
+                    webView.evaluateJavascript(
+                        "if (typeof window.onUpdateDownloadComplete === 'function') window.onUpdateDownloadComplete();",
+                        null
+                    )
+                    showUpdateReadyDialog(sharedUri, signatureMatches)
                 }
             } catch (e: Exception) {
                 runOnUiThread {
@@ -569,65 +565,80 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    fun installDownloadedApk(apkFile: File) {
-        if (!apkFile.exists() || apkFile.length() == 0L) {
-            Toast.makeText(this, "Downloaded update is empty or missing", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        if (!isApkSignedWithSameKey(apkFile)) {
-            AlertDialog.Builder(this)
-                .setTitle("Update Signature Mismatch")
-                .setMessage(
-                    "The downloaded update was not signed with the same key as the installed PaheFlow app, " +
-                        "so it will not be installed.\n\n" +
-                        "If you are upgrading from v1.1.0 or older, the app is now signed with a new key: " +
-                        "uninstall the old version first, then install the new APK."
-                )
-                .setPositiveButton("OK", null)
-                .show()
-            return
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (!packageManager.canRequestPackageInstalls()) {
-                pendingInstallApk = apkFile
-                AlertDialog.Builder(this)
-                    .setTitle("Allow App Installation")
-                    .setMessage("To install the PaheFlow update, please allow installing unknown apps from PaheFlow in system Settings.")
-                    .setPositiveButton("Open Settings") { _, _ ->
-                        try {
-                            val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                                data = Uri.parse("package:$packageName")
-                            }
-                            startActivity(intent)
-                        } catch (e: Exception) {
-                            Toast.makeText(this, "Could not open settings: ${e.message}", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                    .setNegativeButton("Cancel") { _, _ ->
-                        pendingInstallApk = null
-                    }
-                    .show()
-                return
-            }
-        }
-
-        try {
-            val apkUri = androidx.core.content.FileProvider.getUriForFile(
-                this,
-                "${packageName}.fileprovider",
-                apkFile
-            )
-            val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(apkUri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            startActivity(installIntent)
+    private fun updateDisplayName(): String {
+        val version = try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "update"
         } catch (e: Exception) {
-            Toast.makeText(this, "Could not launch package installer: ${e.message}", Toast.LENGTH_LONG).show()
+            "update"
         }
+        return "paheflow-update-v$version.apk"
+    }
+
+    private fun publishApkToSharedDownloads(tempFile: File): Uri? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, updateDisplayName())
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.android.package-archive")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/PaheFlow")
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: return null
+                val out = contentResolver.openOutputStream(uri) ?: return null
+                out.use { output ->
+                    tempFile.inputStream().use { input -> input.copyTo(output) }
+                }
+                uri
+            } else {
+                @Suppress("DEPRECATION")
+                val targetDir = File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "PaheFlow"
+                )
+                if (!targetDir.exists()) targetDir.mkdirs()
+                val target = File(targetDir, updateDisplayName())
+                tempFile.copyTo(target, overwrite = true)
+                androidx.core.content.FileProvider.getUriForFile(
+                    this,
+                    "${packageName}.fileprovider",
+                    target
+                )
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun showUpdateReadyDialog(apkUri: Uri?, signatureMatches: Boolean) {
+        val note = if (signatureMatches) {
+            "Open it with your file manager or package installer to install the update."
+        } else {
+            "Note: this file was signed with a different key than the installed app. If you are upgrading " +
+                "from v1.1.0 or older, uninstall the old version first, then install this file with your " +
+                "file manager or package installer."
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Update downloaded")
+            .setMessage("The update APK was saved to your Downloads/PaheFlow folder.\n\n$note")
+            .setPositiveButton("Open with…") { _, _ ->
+                if (apkUri == null) {
+                    Toast.makeText(this, "Could not share the file - open Downloads/PaheFlow manually", Toast.LENGTH_LONG).show()
+                    return@setPositiveButton
+                }
+                try {
+                    val view = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(apkUri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        clipData = android.content.ClipData.newRawUri("update_apk", apkUri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(Intent.createChooser(view, "Open update with…"))
+                } catch (e: Exception) {
+                    Toast.makeText(this, "No app can open the APK: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("Later", null)
+            .show()
     }
 
     private fun isApkSignedWithSameKey(apkFile: File): Boolean {
