@@ -173,7 +173,8 @@
       $("cookieBannerText").textContent = message;
       banner.classList.remove("hidden");
     }
-    openCfSolverModal();
+    // Don't auto-open modal - just highlight the button
+    highlightSolveCfButton(true);
   }
 
   /* ─────────────────────────────────────────────────────────────────
@@ -1359,7 +1360,7 @@
     renderSetup();
     const autoSolveCb = $("cfgAutoSolveOnLaunch");
     if (autoSolveCb) {
-      autoSolveCb.checked = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "true") !== "false";
+      autoSolveCb.checked = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "false") !== "false";
       autoSolveCb.onchange = () => {
         localStorage.setItem("paheflow_auto_solve_cf_on_launch", autoSolveCb.checked ? "true" : "false");
       };
@@ -2138,7 +2139,8 @@
       // Test connection on startup
       await checkConnectionAndUpdateUI();
 
-      const autoSolveOnLaunch = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "true") !== "false";
+      // Default to false - only auto-solve if user explicitly enabled it
+      const autoSolveOnLaunch = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "false") !== "false";
       if (!state.config.cfConfigured) {
         // Don't auto-open - just highlight the button
         highlightSolveCfButton(true);
