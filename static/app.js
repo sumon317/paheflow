@@ -1616,7 +1616,14 @@
   }
 
   async function startCfSolver() {
+    // Clear any existing polling timer
+    if (cfSolverPollTimer) {
+      clearInterval(cfSolverPollTimer);
+      cfSolverPollTimer = null;
+    }
+
     if (window.AndroidBridge) {
+      // On Android: close modal, open native solver
       closeCfSolverModal();
       if (typeof window.AndroidBridge.openInFirefox === "function") {
         window.AndroidBridge.openInFirefox();
@@ -2535,7 +2542,12 @@
    *  go
    * ───────────────────────────────────────────────────────────────── */
 
+  // Track if cookie-synced handler is already running to prevent duplicate execution
+  let cookieSyncedHandling = false;
+
   window.addEventListener("animepahe-cookie-synced", async () => {
+    if (cookieSyncedHandling) return;
+    cookieSyncedHandling = true;
     try {
       const init = await api.get("/api/state");
       state.config = normalizeConfig(init.config);
@@ -2544,10 +2556,15 @@
     const banner = $("cookieBanner");
     if (banner) banner.classList.add("hidden");
     closeCfSolverModal();
+    // Show green "solved" state on buttons
+    highlightSolveCfButton("solved");
+    // Fade to normal after a moment
+    setTimeout(() => highlightSolveCfButton(false), 4000);
     toast("Cloudflare credentials updated!", "ok");
     if (state.selectedSlug) {
       loadEpisodes(state.selectedSlug, state.epPage, state.audioFilter);
     }
+    cookieSyncedHandling = false;
   });
 
   bind();
