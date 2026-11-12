@@ -315,27 +315,27 @@ pub async fn latest_releases(
                     .get("episode")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
-                snapshot: it
-                    .get("snapshot")
-                    .and_then(|v| v.as_str())
-                    .map(|s| {
-                        let s = s.trim();
-                        let mut url = if s.starts_with("//") {
-                            format!("https:{}", s)
-                        } else if s.starts_with('/') {
-                            format!("https://animepahe.pw{}", s)
-                        } else if !s.starts_with("http://") && !s.starts_with("https://") && !s.is_empty() {
-                            format!("https://{}", s)
-                        } else {
-                            s.to_string()
-                        };
-                        if url.contains("i.animepahe.ru") {
-                            url = url.replace("i.animepahe.ru", "i.animepahe.com");
-                        } else if url.contains("i.animepahe.si") {
-                            url = url.replace("i.animepahe.si", "i.animepahe.com");
-                        }
-                        url
-                    }),
+                snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
+                    let s = s.trim();
+                    let mut url = if s.starts_with("//") {
+                        format!("https:{}", s)
+                    } else if s.starts_with('/') {
+                        format!("https://animepahe.pw{}", s)
+                    } else if !s.starts_with("http://")
+                        && !s.starts_with("https://")
+                        && !s.is_empty()
+                    {
+                        format!("https://{}", s)
+                    } else {
+                        s.to_string()
+                    };
+                    if url.contains("i.animepahe.ru") {
+                        url = url.replace("i.animepahe.ru", "i.animepahe.com");
+                    } else if url.contains("i.animepahe.si") {
+                        url = url.replace("i.animepahe.si", "i.animepahe.com");
+                    }
+                    url
+                }),
                 duration: it
                     .get("duration")
                     .and_then(|v| v.as_str())

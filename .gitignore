@@ -32,3 +32,4 @@ android/build/
 android/**/build/
 android/app/src/main/jniLibs/
 *.apk
+*.apk.sha256
