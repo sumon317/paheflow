@@ -105,6 +105,9 @@
     lastDoneJob: "",
     epStatusKey: "",
     playlistKey: "",
+    // Navigation history for back button handling
+    tabHistory: ["home"],
+    activeTab: "home",
   };
 
   let logQueue = [];
@@ -2064,7 +2067,13 @@
   }
 
   function showTab(name) {
-    state.activeTab = name;
+    // Track tab history for back button navigation
+    if (state.activeTab !== name) {
+      state.tabHistory.push(state.activeTab);
+      // Limit history size
+      if (state.tabHistory.length > 20) state.tabHistory.shift();
+      state.activeTab = name;
+    }
     $$(".panel").forEach(p => p.classList.toggle("is-active", p.id === "panel-" + name));
     $$(".tab").forEach(t => t.classList.toggle("is-active", t.dataset.tab === name));
     updateActionBarVisibility();
@@ -2148,6 +2157,40 @@
     }
   }
   window.toggleActivityPanel = toggleActivityPanel;
+
+  // Handle back button/gesture - returns action taken:
+  // "handled" - back was handled (closed panel, went back in tab history, or web history)
+  // "exit" - no more history, app should show exit confirmation
+  function handleBackPress() {
+    // 1. Close mobile activity panel if open
+    const isMobile = window.innerWidth <= 900;
+    if (isMobile && document.body.classList.contains("show-mobile-activity")) {
+      toggleActivityPanel(false);
+      return "handled";
+    }
+
+    // 2. Close any open modals first
+    const modals = document.querySelectorAll(".modal-overlay:not(.hidden), .dialog-overlay:not(.hidden)");
+    if (modals.length > 0) {
+      modals.forEach(m => m.classList.add("hidden"));
+      return "handled";
+    }
+
+    // 3. Go back in tab history if available
+    if (state.tabHistory.length > 1) {
+      const previousTab = state.tabHistory[state.tabHistory.length - 2];
+      state.tabHistory.pop();
+      state.activeTab = previousTab;
+      showTab(previousTab);
+      return "handled";
+    }
+
+    // 4. Check if WebView can go back (handled by Android side via webView.canGoBack())
+    // We'll return "webview" to let Android handle web navigation
+    return "webview";
+  }
+
+  window.handleBackPress = handleBackPress;
 
   /* ─────────────────────────────────────────────────────────────────
    *  bindings

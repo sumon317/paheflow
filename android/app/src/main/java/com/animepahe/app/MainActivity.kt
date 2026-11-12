@@ -84,24 +84,23 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                webView.evaluateJavascript("""
-                    (function() {
-                        if (document.body.classList.contains("show-mobile-activity")) {
-                            if (typeof window.toggleActivityPanel === "function") {
-                                window.toggleActivityPanel(false);
-                            } else {
-                                document.body.classList.remove("show-mobile-activity");
-                            }
-                            return true;
+                webView.evaluateJavascript("window.handleBackPress();") { result ->
+                    val cleaned = result?.replace("\"", "") ?: ""
+                    when (cleaned) {
+                        "handled" -> {
+                            // JS handled it (closed panel, went back in tab history, closed modal)
                         }
-                        return false;
-                    })();
-                """.trimIndent()) { result ->
-                    if (result != "true") {
-                        if (webView.canGoBack()) {
-                            webView.goBack()
-                        } else {
-                            finish()
+                        "webview" -> {
+                            // Let WebView handle its own history
+                            if (webView.canGoBack()) {
+                                webView.goBack()
+                            } else {
+                                showExitConfirmationDialog()
+                            }
+                        }
+                        else -> {
+                            // Default: show exit confirmation
+                            showExitConfirmationDialog()
                         }
                     }
                 }
@@ -347,6 +346,17 @@ class MainActivity : AppCompatActivity() {
             .setOnCancelListener {
                 notifyFolderPicked(null)
             }
+            .show()
+    }
+
+    private fun showExitConfirmationDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Exit PaheFlow?")
+            .setMessage("Are you sure you want to close the app?")
+            .setPositiveButton("Exit") { _, _ ->
+                finish()
+            }
+            .setNegativeButton("Stay", null)
             .show()
     }
 
