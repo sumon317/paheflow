@@ -265,7 +265,9 @@ pub async fn latest_releases(
     all: bool,
 ) -> Result<LatestReleasesPage, String> {
     if all {
-        // Fetch all pages
+        // Fetch recent pages (limited to avoid slow performance)
+        // Max 5 pages = ~150 items, which is reasonable for "recent"
+        const MAX_PAGES: u32 = 5;
         let mut all_items = Vec::new();
         let mut total = 0;
         let mut last_page = 1;
@@ -276,9 +278,18 @@ pub async fn latest_releases(
             let url = format!("{}?m=airing&page={}", API_URL, pg);
             let json = match client.fetch_json(&url, None, cfg).await {
                 Ok(j) => j,
-                Err(_) => {
-                    let alt_url = format!("{}/?m=airing&page={}", API_URL, pg);
-                    client.fetch_json(&alt_url, None, cfg).await?
+                Err(e) => {
+                    // If first page fails, try alt URL
+                    if pg == 1 {
+                        let alt_url = format!("{}/?m=airing&page={}", API_URL, pg);
+                        match client.fetch_json(&alt_url, None, cfg).await {
+                            Ok(j) => j,
+                            Err(_) => return Err(format!("Failed to fetch recent releases: {}", e)),
+                        }
+                    } else {
+                        // For subsequent pages, stop gracefully on error (likely reached end or rate limited)
+                        break;
+                    }
                 }
             };
 
@@ -370,10 +381,13 @@ pub async fn latest_releases(
                 }
             }
 
-            if pg >= lp {
+            if pg >= lp || pg >= MAX_PAGES {
                 break;
             }
             pg += 1;
+            
+            // Small delay to avoid rate limiting
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
         Ok(LatestReleasesPage {
