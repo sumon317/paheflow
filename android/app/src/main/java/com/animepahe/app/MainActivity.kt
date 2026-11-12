@@ -20,8 +20,11 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.Toast
+import android.view.LayoutInflater
+import android.view.View
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -42,6 +45,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private var serverPort: Int = 8765
+    private var lastBackPressTime: Long = 0L
 
     private val openDocumentTreeLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -89,18 +93,17 @@ class MainActivity : AppCompatActivity() {
                     when (cleaned) {
                         "handled" -> {
                             // JS handled it (closed panel, went back in tab history, closed modal)
+                            // Reset double-tap timer since user navigated
+                            lastBackPressTime = 0L
                         }
                         "webview" -> {
-                            // Let WebView handle its own history
-                            if (webView.canGoBack()) {
-                                webView.goBack()
-                            } else {
-                                showExitConfirmationDialog()
-                            }
+                            // WebView history - but don't use it for main app navigation to avoid blank screens
+                            // Instead, treat as "no JS history" and trigger double-tap exit logic
+                            handleDoubleTapExit()
                         }
                         else -> {
-                            // Default: show exit confirmation
-                            showExitConfirmationDialog()
+                            // Default: trigger double-tap exit logic
+                            handleDoubleTapExit()
                         }
                     }
                 }
@@ -108,6 +111,20 @@ class MainActivity : AppCompatActivity() {
         })
 
         waitForServerAndLoad()
+    }
+
+    private fun handleDoubleTapExit() {
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastBackPressTime < 2000) {
+            // Double tap detected - show themed exit confirmation
+            showThemedExitConfirmationDialog()
+        } else {
+            // First tap - show toast
+            lastBackPressTime = currentTime
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Press back again to exit", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -349,15 +366,34 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun showThemedExitConfirmationDialog() {
+        val dialogView = layoutInflater.inflate(R.layout.dialog_exit_confirmation, null)
+        val dialog = AlertDialog.Builder(this)
+            .setView(dialogView)
+            .create()
+
+        dialogView.findViewById<android.widget.TextView>(R.id.dialogTitle).text = "Exit PaheFlow?"
+        dialogView.findViewById<android.widget.TextView>(R.id.dialogMessage).text = "Are you sure you want to close the app?"
+        
+        dialogView.findViewById<android.widget.Button>(R.id.btnStay).setOnClickListener { dialog.dismiss() }
+        dialogView.findViewById<android.widget.Button>(R.id.btnExit).setOnClickListener {
+            dialog.dismiss()
+            finish()
+        }
+
+        dialog.setOnShowListener { d ->
+            val alertDialog = d as AlertDialog
+            alertDialog.getButton(AlertDialog.BUTTON_POSITIVE)?.setTextColor(resources.getColor(R.color.accent, null))
+            alertDialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.setTextColor(resources.getColor(R.color.text_primary, null))
+        }
+
+        dialog.show()
+    }
+
+    // Kept for compatibility but now uses themed version
+    @Suppress("UNUSED_PARAMETER")
     private fun showExitConfirmationDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("Exit PaheFlow?")
-            .setMessage("Are you sure you want to close the app?")
-            .setPositiveButton("Exit") { _, _ ->
-                finish()
-            }
-            .setNegativeButton("Stay", null)
-            .show()
+        showThemedExitConfirmationDialog()
     }
 
     fun hasStoragePermission(): Boolean {
