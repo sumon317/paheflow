@@ -1,0 +1,114 @@
+name: Build & Publish Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2.0.1)'
+        required: false
+        default: 'v2.0.1'
+
+jobs:
+  build-release-apk:
+    name: Build & Release Android APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Locate Android NDK
+        run: |
+          if [ -d "$ANDROID_SDK_ROOT/ndk" ]; then
+            NDK_PATH=$(find "$ANDROID_SDK_ROOT/ndk" -maxdepth 1 -mindepth 1 | sort -V | tail -n 1)
+          fi
+          if [ -z "$NDK_PATH" ]; then
+            echo "y" | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --install "ndk;26.3.11579264"
+            NDK_PATH="$ANDROID_SDK_ROOT/ndk/26.3.11579264"
+          fi
+          echo "Using Android NDK at: $NDK_PATH"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+          echo "NDK_HOME=$NDK_PATH" >> $GITHUB_ENV
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+
+      - name: Cache Cargo & NDK Build Tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-ndk-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ndk-
+
+      - name: Install cargo-ndk
+        run: |
+          which cargo-ndk || cargo install cargo-ndk
+
+      - name: Build Rust Android JNI Libraries
+        run: |
+          RUSTFLAGS="--remap-path-prefix=${{ github.workspace }}=/workspace" cargo ndk \
+            -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            -o android/app/src/main/jniLibs \
+            build --release
+
+      - name: Setup Keystore & Signing Properties
+        env:
+          STORE_PASS: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > android/app/paheflow-release.keystore
+          printf "storeFile=paheflow-release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n" \
+            "$STORE_PASS" "$ALIAS" "$KEY_PASS" > android/app/keystore.properties
+
+      - name: Assemble Release APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Package Release Assets
+        id: package_assets
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.ref_name }}"
+          fi
+          APK_NAME="paheflow-${TAG}.apk"
+          cp android/app/build/outputs/apk/release/app-release.apk "${APK_NAME}"
+          sha256sum "${APK_NAME}" > "${APK_NAME}.sha256"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload APK Assets to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.package_assets.outputs.tag }}"
+          APK_NAME="${{ steps.package_assets.outputs.apk_name }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${APK_NAME}" "${APK_NAME}.sha256" --clobber
+          else
+            gh release create "${TAG}" "${APK_NAME}" "${APK_NAME}.sha256" --title "${TAG}" --generate-notes
+          fi
