@@ -108,6 +108,11 @@
     // Navigation history for back button handling
     tabHistory: ["home"],
     activeTab: "home",
+    // Chunked rendering state
+    catalogRenderTask: null,
+    catalogRenderIndex: 0,
+    catalogRenderList: null,
+    catalogRenderBox: null,
   };
 
   let logQueue = [];
@@ -454,8 +459,6 @@
       return;
     }
     const list = filteredCatalog();
-    // With unlimited CATALOG_PAGE_SIZE, show all items
-    const shownList = list;
     const box = $("resultsList");
     if (!list.length) {
       const remote = state.searchMode === "remote";
@@ -463,36 +466,75 @@
       updateCatalogMeta(list.length, list.length);
       return;
     }
-    box.innerHTML = shownList.map(a => {
-      // Determine thumbnail: remote catalog items have poster/cover, local ones don't
+    updateCatalogMeta(list.length, list.length);
+    
+    // Use chunked rendering to avoid blocking the main thread
+    if (state.catalogRenderTask) {
+      cancelAnimationFrame(state.catalogRenderTask);
+    }
+    state.catalogRenderIndex = 0;
+    state.catalogRenderList = list;
+    state.catalogRenderBox = box;
+    box.innerHTML = "";
+    renderCatalogChunk();
+  }
+
+  function renderCatalogChunk() {
+    const { catalogRenderList, catalogRenderBox, catalogRenderIndex } = state;
+    if (!catalogRenderList || !catalogRenderBox) return;
+    
+    const CHUNK_SIZE = 50; // Render 50 items per frame
+    const end = Math.min(catalogRenderIndex + CHUNK_SIZE, catalogRenderList.length);
+    
+    const fragment = document.createDocumentFragment();
+    for (let i = catalogRenderIndex; i < end; i++) {
+      const a = catalogRenderList[i];
       const poster = a.poster || a.cover || "";
       const thumbUrl = poster ? `/api/thumb?url=${encodeURIComponent(poster)}&token=${encodeURIComponent(token())}` : "";
       const hasThumb = !!poster;
 
-      return `
-        <div class="result ${a.slug === state.selectedSlug ? "is-selected" : ""}" data-slug="${escapeHtml(a.slug)}">
-          <div class="recent-thumb-wrap">
-            ${hasThumb ? `<img class="recent-thumb" src="${escapeHtml(thumbUrl)}" data-fallback-src="${escapeHtml(poster)}" alt="${escapeHtml(a.title)}" loading="lazy" referrerpolicy="no-referrer" onerror="if(this.dataset.fallbackSrc && this.src !== this.dataset.fallbackSrc){ this.src = this.dataset.fallbackSrc; this.removeAttribute('data-fallback-src'); } else { this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'; }" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
-          </div>
-          <div class="result-main">
-            <div class="result-title">${escapeHtml(a.title)}</div>
-            <div class="result-meta">
-              <span class="slug">${escapeHtml(a.slug)}</span>
-            </div>
-          </div>
-          <div class="result-actions">
-            <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
+      const div = document.createElement("div");
+      div.className = `result ${a.slug === state.selectedSlug ? "is-selected" : ""}`;
+      div.dataset.slug = a.slug;
+      div.innerHTML = `
+        <div class="recent-thumb-wrap">
+          ${hasThumb ? `<img class="recent-thumb" src="${escapeHtml(thumbUrl)}" data-fallback-src="${escapeHtml(poster)}" alt="${escapeHtml(a.title)}" loading="lazy" referrerpolicy="no-referrer" onerror="if(this.dataset.fallbackSrc && this.src !== this.dataset.fallbackSrc){ this.src = this.dataset.fallbackSrc; this.removeAttribute('data-fallback-src'); } else { this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'; }" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
+        </div>
+        <div class="result-main">
+          <div class="result-title">${escapeHtml(a.title)}</div>
+          <div class="result-meta">
+            <span class="slug">${escapeHtml(a.slug)}</span>
           </div>
         </div>
+        <div class="result-actions">
+          <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
+        </div>
       `;
-    }).join("");
-    $$$(".select-btn", box).forEach(btn => {
-      btn.onclick = (e) => { e.stopPropagation(); const slug = e.currentTarget.closest(".result").dataset.slug; selectAnime(slug); };
+      fragment.appendChild(div);
+    }
+    
+    catalogRenderBox.appendChild(fragment);
+    
+    // Attach event listeners for the newly added elements
+    const newSelectBtns = catalogRenderBox.querySelectorAll(".select-btn");
+    newSelectBtns.forEach(btn => {
+      if (!btn.dataset.listenerAttached) {
+        btn.dataset.listenerAttached = "true";
+        btn.onclick = (e) => { e.stopPropagation(); const slug = e.currentTarget.closest(".result").dataset.slug; selectAnime(slug); };
+      }
     });
-    $$$(".result", box).forEach(el => {
-      el.onclick = (e) => { if (!e.target.closest(".select-btn")) selectAnime(el.dataset.slug); };
+    const newResults = catalogRenderBox.querySelectorAll(".result:not([data-listener-attached])");
+    newResults.forEach(el => {
+      if (!el.dataset.listenerAttached) {
+        el.dataset.listenerAttached = "true";
+        el.onclick = (e) => { if (!e.target.closest(".select-btn")) selectAnime(el.dataset.slug); };
+      }
     });
-    updateCatalogMeta(list.length, list.length);
+    
+    state.catalogRenderIndex = end;
+    if (end < catalogRenderList.length) {
+      state.catalogRenderTask = requestAnimationFrame(renderCatalogChunk);
+    }
   }
 
   function updateCatalogMeta(shown, total) {
