@@ -630,7 +630,10 @@ async fn get_latest_releases(
         .get("page")
         .and_then(|p| p.parse::<u32>().ok())
         .unwrap_or(1);
-    let all = query.get("all").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let all = query
+        .get("all")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     let cfg = read_config();
 
     match api::latest_releases(&state.client, page, &cfg, all).await {
@@ -820,7 +823,10 @@ async fn get_episodes(
     let mut slug = query.get("slug").cloned().unwrap_or_default();
     let title_param = query.get("title").cloned();
     let page = query.get("page").and_then(|p| p.parse::<u32>().ok());
-    let all_param = query.get("all").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let all_param = query
+        .get("all")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     let audio_param = query.get("audio").cloned().unwrap_or_default();
     let cfg = read_config();
 
