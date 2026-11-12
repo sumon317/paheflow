@@ -203,7 +203,7 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         val doLoad = {
             if (!urlLoaded && !isSolved && webView != null) {
                 urlLoaded = true
-                wv.loadUrl("https://animepahe.pw/api?m=search&q=animepahe")
+                wv.loadUrl("https://animepahe.pw/")
                 handler.postDelayed(cookieChecker, 1000)
             }
         }
@@ -222,7 +222,7 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         for (part in cookieStr.split(";")) {
             val trimmed = part.trim()
             if (trimmed.startsWith("cf_clearance=")) {
-                return trimmed.removePrefix("cf_clearance=").trim()
+                return trimmed.removePrefix("cf_clearance=").trim().trim('"')
             }
         }
         return ""
@@ -231,12 +231,19 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
     private fun checkCookies(autoDismiss: Boolean = true, forceSave: Boolean = false) {
         if (isSolved && !forceSave) return
         val cookieManager = CookieManager.getInstance()
+        val cookiesPwSlash = cookieManager.getCookie("https://animepahe.pw/") ?: ""
         val cookiesPw = cookieManager.getCookie("https://animepahe.pw") ?: ""
+        val cookiesRuSlash = cookieManager.getCookie("https://animepahe.ru/") ?: ""
         val cookiesRu = cookieManager.getCookie("https://animepahe.ru") ?: ""
+        val cookiesOrg = cookieManager.getCookie("https://animepahe.org/") ?: ""
 
-        val clearancePw = extractClearance(cookiesPw)
-        val clearanceRu = extractClearance(cookiesRu)
-        val clearance = if (clearancePw.isNotEmpty()) clearancePw else clearanceRu
+        val clearance = listOf(
+            extractClearance(cookiesPwSlash),
+            extractClearance(cookiesPw),
+            extractClearance(cookiesRuSlash),
+            extractClearance(cookiesRu),
+            extractClearance(cookiesOrg)
+        ).firstOrNull { it.isNotEmpty() } ?: ""
 
         val wvTitle = webView?.title?.lowercase() ?: ""
         val isChallengeTitle = wvTitle.contains("just a moment") ||
@@ -245,7 +252,9 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
                 wvTitle.contains("cloudflare")
 
         val currentUrl = webView?.url?.lowercase() ?: ""
-        val onSite = currentUrl.contains("animepahe.pw") || currentUrl.contains("animepahe.ru")
+        val onSite = currentUrl.contains("animepahe.pw") ||
+                currentUrl.contains("animepahe.ru") ||
+                currentUrl.contains("animepahe.org")
 
         val challengePassed = !isChallengeTitle && onSite
 

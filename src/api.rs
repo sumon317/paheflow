@@ -270,8 +270,6 @@ pub async fn latest_releases(
         const MAX_PAGES: u32 = 5;
         let mut all_items = Vec::new();
         let mut total = 0;
-        let mut last_page = 1;
-        let mut current_page = 1;
         let mut pg = 1;
 
         loop {
@@ -295,12 +293,6 @@ pub async fn latest_releases(
                 }
             };
 
-            let page_val = json
-                .get("current_page")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .unwrap_or(pg);
-
             let lp = json
                 .get("last_page")
                 .and_then(|v| v.as_u64())
@@ -312,9 +304,6 @@ pub async fn latest_releases(
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
                 .unwrap_or(total);
-
-            last_page = lp;
-            current_page = page_val;
 
             if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
                 for it in data {

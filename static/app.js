@@ -73,7 +73,7 @@
     localCatalog: [],
     remoteCatalog: [],
     catalogLimit: CATALOG_PAGE_SIZE,
-    searchMode: "remote",
+    searchMode: "local",
     selectedSlug: "",
     selectedTitle: "",
     episodes: [],
@@ -171,15 +171,15 @@
       text.includes("cloudflare") ||
       text.includes("just a moment") ||
       text.includes("expired") ||
-      text.includes("403 challenge");
+      text.includes("403 challenge") ||
+      text.includes("403");
     if (!broken) return;
     const banner = $("cookieBanner");
     if (banner) {
       $("cookieBannerText").textContent = message;
       banner.classList.remove("hidden");
     }
-    // Don't auto-open modal - just highlight the button
-    highlightSolveCfButton(true);
+    highlightSolveCfButton("needed");
   }
 
   /* ─────────────────────────────────────────────────────────────────
@@ -258,7 +258,7 @@
   }
 
   // Highlight or un-highlight the Solve Cloudflare buttons
-// State: "needed" = red pulsing, "solved" = green pulsing, false/undefined = normal
+  // State: "needed" / true = red pulsing, "solved" = green pulsing, false/undefined = normal
   function highlightSolveCfButton(state) {
     const solveBtn = $("topbarSolveCf");
     const bannerBtn = $("bannerSolveCookie");
@@ -271,7 +271,7 @@
       bannerBtn.classList.remove("cf-needed", "cf-solved");
     }
     
-    if (state === "needed") {
+    if (state === "needed" || state === true) {
       if (solveBtn) solveBtn.classList.add("cf-needed");
       if (bannerBtn) bannerBtn.classList.add("cf-needed");
     } else if (state === "solved") {
@@ -454,6 +454,12 @@
   }
 
   function renderCatalog() {
+    if (state.catalogRenderTask) {
+      cancelAnimationFrame(state.catalogRenderTask);
+      state.catalogRenderTask = null;
+    }
+    state.catalogRenderList = null;
+
     if (state.searchMode === "recent") {
       renderRecentReleases();
       return;
@@ -462,16 +468,22 @@
     const box = $("resultsList");
     if (!list.length) {
       const remote = state.searchMode === "remote";
-      box.innerHTML = `<div class="empty"><p class="empty-title">${remote ? "No results" : "No matches in local catalog"}</p><p class="empty-text">${remote ? "Try a different search term." : "The local list holds cached slugs; hit Refresh catalog to update it."}</p></div>`;
+      const hasQuery = Boolean($("searchInput").value.trim());
+      box.innerHTML = `<div class="empty"><p class="empty-title">${
+        remote
+          ? (hasQuery ? "No results" : "Search animepahe.pw")
+          : "No matches in local catalog"
+      }</p><p class="empty-text">${
+        remote
+          ? (hasQuery ? "Try a different search term." : "Type an anime title in the search box above and press Search.")
+          : "The local list holds 6,600+ cached slugs; try another search or check recent releases."
+      }</p></div>`;
       updateCatalogMeta(list.length, list.length);
       return;
     }
     updateCatalogMeta(list.length, list.length);
     
     // Use chunked rendering to avoid blocking the main thread
-    if (state.catalogRenderTask) {
-      cancelAnimationFrame(state.catalogRenderTask);
-    }
     state.catalogRenderIndex = 0;
     state.catalogRenderList = list;
     state.catalogRenderBox = box;
@@ -542,9 +554,10 @@
       const totalStr = state.recentTotal ? ` of ${state.recentTotal.toLocaleString()}` : "";
       $("catalogMeta").textContent = `${shown} recent release${shown !== 1 ? "s" : ""}${totalStr ? ` (${totalStr.trim()} total)` : ""} from AnimePahe`;
     } else if (state.searchMode === "remote") {
+      const hasQuery = Boolean($("searchInput").value.trim());
       $("catalogMeta").textContent = total
         ? `${total} result(s) from animepahe.pw`
-        : "No results from animepahe.pw";
+        : (hasQuery ? "No results from animepahe.pw" : "Type to search animepahe.pw");
     } else {
       $("catalogMeta").textContent = total
         ? `${total} cached slug(s) shown`
@@ -553,6 +566,11 @@
   }
 
   function setCatalogMode(mode, forceReload = false) {
+    if (state.catalogRenderTask) {
+      cancelAnimationFrame(state.catalogRenderTask);
+      state.catalogRenderTask = null;
+    }
+    state.catalogRenderList = null;
     const isModeChange = state.searchMode !== mode;
     state.searchMode = mode;
     state.catalogLimit = CATALOG_PAGE_SIZE;
@@ -719,12 +737,22 @@
     if (state.searchMode === "recent") {
       setBusy($("refreshCatalog"), true);
       try {
-        await loadRecentReleases(state.recentPage || 1);
+        await loadRecentReleases(state.recentPage || 1, true);
         toast("Recent releases refreshed", "ok");
       } catch (e) {
         toast("Refresh failed: " + e.message, "error");
+        noteApiError(e.message);
       } finally {
         setBusy($("refreshCatalog"), false);
+      }
+      return;
+    }
+    if (state.searchMode === "remote") {
+      const q = $("searchInput").value.trim();
+      if (q) {
+        await doSearch();
+      } else {
+        setCatalogMode("local");
       }
       return;
     }
@@ -734,7 +762,10 @@
       state.localCatalog = items;
       setCatalogMode("local");
       toast("Catalog refreshed (" + items.length + " entries)", "ok");
-    } catch (e) { toast("Refresh failed: " + e.message, "error"); }
+    } catch (e) {
+      toast("Refresh failed: " + e.message, "error");
+      noteApiError(e.message);
+    }
     finally { setBusy($("refreshCatalog"), false); }
   }
 
@@ -2173,6 +2204,11 @@
   }
 
   function showTab(name) {
+    if (name !== "browse" && state.catalogRenderTask) {
+      cancelAnimationFrame(state.catalogRenderTask);
+      state.catalogRenderTask = null;
+      state.catalogRenderList = null;
+    }
     // Track tab history for back button navigation
     if (state.activeTab !== name) {
       state.tabHistory.push(state.activeTab);
@@ -2605,6 +2641,10 @@
     toast("Cloudflare credentials updated!", "ok");
     if (state.selectedSlug) {
       loadEpisodes(state.selectedSlug, state.epPage, state.audioFilter);
+    } else if (state.searchMode === "recent") {
+      loadRecentReleases(state.recentPage || 1, true);
+    } else if (state.searchMode === "remote" && $("searchInput").value.trim()) {
+      doSearch();
     }
     cookieSyncedHandling = false;
   });

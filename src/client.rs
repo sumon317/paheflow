@@ -163,14 +163,14 @@ impl HttpClient {
                             || lower.contains("cf-browser-verification")
                         {
                             return Err(String::from(
-                                "Cloudflare is challenging this request (HTTP 403 challenge). Please update cf_clearance in Settings."
+                                "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings.",
                             ));
                         }
                         if lower.contains("sorry, you have been blocked")
                             || lower.contains("cf-error-details")
                         {
                             return Err(String::from(
-                                "Cloudflare refused this request. Your IP or cookie is blocked — copy a fresh cf_clearance into Settings."
+                                "Cloudflare refused this request (IP or cookie blocked). Tap 'Solve Cloudflare' or copy a fresh cf_clearance into Settings.",
                             ));
                         }
 
@@ -276,14 +276,14 @@ impl HttpClient {
                         || lower.contains("cf-browser-verification")
                     {
                         return Err(String::from(
-                            "Cloudflare is challenging this request (HTTP 403 challenge). Please update cf_clearance in Settings.",
+                            "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings.",
                         ));
                     }
                     if lower.contains("sorry, you have been blocked")
                         || lower.contains("cf-error-details")
                     {
                         return Err(String::from(
-                            "Cloudflare refused this request. Your IP or cookie is blocked — copy a fresh cf_clearance into Settings.",
+                            "Cloudflare refused this request (IP or cookie blocked). Tap 'Solve Cloudflare' or copy a fresh cf_clearance into Settings.",
                         ));
                     }
 
