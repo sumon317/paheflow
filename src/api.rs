@@ -62,6 +62,8 @@ pub struct AvailableOptions {
 pub struct CatalogEntry {
     pub slug: String,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -895,15 +897,18 @@ pub fn catalog() -> Vec<CatalogEntry> {
     let mut seen = HashSet::new();
 
     if let Ok(raw) = fs::read_to_string(&path) {
-        let line_re = Regex::new(r#"^\[([^\]]+)\]\s*(.*?)\s*$"#).unwrap();
+        // Format: [slug] title | poster_url
+        let line_re = Regex::new(r#"^\[([^\]]+)\]\s*(.*?)(?:\s*\|\s*(.*?))?\s*$"#).unwrap();
         for line in raw.lines() {
             if let Some(caps) = line_re.captures(line.trim()) {
                 let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                 let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+                let poster = caps.get(3).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
                 if !slug.is_empty() && seen.insert(slug.to_string()) {
                     entries.push(CatalogEntry {
                         slug: slug.to_string(),
                         title: title.to_string(),
+                        poster,
                     });
                 }
             }
@@ -921,9 +926,10 @@ pub fn title_for_slug(slug: &str) -> String {
     String::new()
 }
 
-fn catalog_line(slug: &str, title: &str) -> String {
+fn catalog_line(slug: &str, title: &str, poster: Option<&str>) -> String {
     let title = title.replace(['\r', '\n'], " ");
-    format!("[{}] {}   \n", slug, title.trim())
+    let poster_part = poster.map(|p| format!(" | {}", p)).unwrap_or_default();
+    format!("[{}] {}{}   \n", slug, title.trim(), poster_part)
 }
 
 fn write_catalog_atomic(content: &str) -> Result<(), String> {
@@ -945,7 +951,7 @@ pub fn ensure_entry(slug: &str, title: &str) {
     }
     use std::io::Write;
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = file.write_all(catalog_line(slug, title).as_bytes());
+        let _ = file.write_all(catalog_line(slug, title, None).as_bytes());
     }
 }
 
@@ -961,12 +967,13 @@ pub fn update_slug_in_catalog(old_slug: &str, new_slug: &str, title: &str) {
         current.push(CatalogEntry {
             slug: new_slug.to_string(),
             title: title.to_string(),
+            poster: None,
         });
     }
 
     let mut content = String::with_capacity(current.len() * 80);
     for e in &current {
-        content.push_str(&catalog_line(&e.slug, &e.title));
+        content.push_str(&catalog_line(&e.slug, &e.title, e.poster.as_deref()));
     }
     let _ = write_catalog_atomic(&content);
 }
@@ -977,7 +984,9 @@ pub async fn refresh_catalog(
 ) -> Result<Vec<CatalogEntry>, String> {
     let url = format!("{}/anime", HOST);
     let html = client.fetch(&url, None, cfg).await?;
-    let anchor_re = Regex::new(r#"<a\s+href="/anime/([0-9a-fA-F-]+)"[^>]*title="([^"]*)""#)
+    // Match anchor with optional img inside or before it: <a href="/anime/SLUG" title="TITLE"><img src="POSTER" ...></a>
+    // or <img src="POSTER" ...><a href="/anime/SLUG" title="TITLE">...</a>
+    let anchor_re = Regex::new(r#"<a\s+href="/anime/([0-9a-fA-F-]+)"[^>]*title="([^"]*)"[^>]*>(?:[^<]*<img\s+[^>]*src="([^"]*)"[^>]*>)?"#)
         .map_err(|e| e.to_string())?;
 
     let mut entries = Vec::new();
@@ -986,11 +995,27 @@ pub async fn refresh_catalog(
     for caps in anchor_re.captures_iter(&html) {
         let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+        let poster = caps.get(3).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
         if !slug.is_empty() && seen.insert(slug.to_string()) {
             entries.push(CatalogEntry {
                 slug: slug.to_string(),
                 title: title.to_string(),
+                poster,
             });
+        }
+    }
+
+    // Fallback: if no posters found, try to find img tags near the anchors in the broader HTML
+    if entries.iter().all(|e| e.poster.is_none()) {
+        let img_re = Regex::new(r#"<img\s+[^>]*src="([^"]*animepahe[^"]*|\.[^"]*(?:jpg|png|webp))"[^>]*>"#)
+            .map_err(|e| e.to_string())?;
+        let mut img_iter = img_re.captures_iter(&html);
+        for entry in entries.iter_mut() {
+            if let Some(img_caps) = img_iter.next() {
+                if let Some(src) = img_caps.get(1) {
+                    entry.poster = Some(src.as_str().trim().to_string());
+                }
+            }
         }
     }
 
@@ -1000,9 +1025,9 @@ pub async fn refresh_catalog(
         );
     }
 
-    let mut content = String::with_capacity(entries.len() * 80);
+    let mut content = String::with_capacity(entries.len() * 120);
     for e in &entries {
-        content.push_str(&catalog_line(&e.slug, &e.title));
+        content.push_str(&catalog_line(&e.slug, &e.title, e.poster.as_deref()));
     }
     write_catalog_atomic(&content)?;
 
@@ -1152,7 +1177,7 @@ mod tests {
 
     #[test]
     fn catalog_lines_stay_single_line() {
-        let line = catalog_line("slug-1", "Title\nwith\rbreaks");
+        let line = catalog_line("slug-1", "Title\nwith\rbreaks", None);
         assert_eq!(line.matches('\n').count(), 1);
         assert!(line.starts_with("[slug-1] Title with breaks"));
     }
