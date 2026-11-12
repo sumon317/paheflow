@@ -205,6 +205,64 @@
     }
   };
 
+  // Test connection to animepahe.pw
+  async function testConnection() {
+    try {
+      const res = await api.post("/api/test-connection", {});
+      return res.ok === true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Check connection and update UI accordingly
+  async function checkConnectionAndUpdateUI() {
+    const connected = await testConnection();
+    const solveBtn = $("topbarSolveCf");
+    const bannerBtn = $("bannerSolveCookie");
+    const statusPill = $("statusPill");
+    const statusText = $("statusText");
+
+    if (connected) {
+      // Connection OK - show subtle indicator
+      if (statusPill && statusText) {
+        statusPill.dataset.state = "connected";
+        statusText.textContent = "Connected";
+        // Reset after 3 seconds to idle
+        setTimeout(() => {
+          if (statusPill.dataset.state === "connected") {
+            statusPill.dataset.state = "idle";
+            statusText.textContent = "Idle";
+          }
+        }, 3000);
+      }
+      // Remove highlight from buttons
+      if (solveBtn) solveBtn.classList.remove("cf-needed");
+      if (bannerBtn) bannerBtn.classList.remove("cf-needed");
+    } else {
+      // Connection failed - highlight the Solve Cloudflare button
+      highlightSolveCfButton(true);
+      if (statusPill && statusText) {
+        statusPill.dataset.state = "disconnected";
+        statusText.textContent = "Cloudflare blocked";
+      }
+    }
+    return connected;
+  }
+
+  // Highlight or un-highlight the Solve Cloudflare buttons
+  function highlightSolveCfButton(needed) {
+    const solveBtn = $("topbarSolveCf");
+    const bannerBtn = $("bannerSolveCookie");
+    if (needed) {
+      if (solveBtn) solveBtn.classList.add("cf-needed");
+      if (bannerBtn) bannerBtn.classList.add("cf-needed");
+    } else {
+      if (solveBtn) solveBtn.classList.remove("cf-needed");
+      if (bannerBtn) bannerBtn.classList.remove("cf-needed");
+    }
+  }
+
   /* ─────────────────────────────────────────────────────────────────
    *  In-App Auto Update
    * ───────────────────────────────────────────────────────────────── */
@@ -2076,13 +2134,22 @@
       state.catalogLimit = CATALOG_PAGE_SIZE;
       renderSettings();
       renderCatalog();
+
+      // Test connection on startup
+      await checkConnectionAndUpdateUI();
+
       const autoSolveOnLaunch = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "true") !== "false";
       if (!state.config.cfConfigured) {
-        showTab("settings");
-        openCfSolverModal();
+        // Don't auto-open - just highlight the button
+        highlightSolveCfButton(true);
       } else if (autoSolveOnLaunch) {
-        setTimeout(() => {
-          openCfSolverModal();
+        // Only auto-open if explicitly enabled AND connection failed
+        setTimeout(async () => {
+          // Check connection again before auto-opening
+          const connected = await testConnection();
+          if (!connected) {
+            openCfSolverModal();
+          }
         }, 350);
       }
       applyJob(init.job);
