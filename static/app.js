@@ -237,12 +237,13 @@
           }
         }, 3000);
       }
-      // Remove highlight from buttons
-      if (solveBtn) solveBtn.classList.remove("cf-needed");
-      if (bannerBtn) bannerBtn.classList.remove("cf-needed");
+      // Show green "solved" state on buttons
+      highlightSolveCfButton("solved");
+      // Fade to normal after a moment
+      setTimeout(() => highlightSolveCfButton(false), 4000);
     } else {
-      // Connection failed - highlight the Solve Cloudflare button
-      highlightSolveCfButton(true);
+      // Connection failed - highlight the Solve Cloudflare button (red)
+      highlightSolveCfButton("needed");
       if (statusPill && statusText) {
         statusPill.dataset.state = "disconnected";
         statusText.textContent = "Cloudflare blocked";
@@ -252,15 +253,25 @@
   }
 
   // Highlight or un-highlight the Solve Cloudflare buttons
-  function highlightSolveCfButton(needed) {
+// State: "needed" = red pulsing, "solved" = green pulsing, false/undefined = normal
+  function highlightSolveCfButton(state) {
     const solveBtn = $("topbarSolveCf");
     const bannerBtn = $("bannerSolveCookie");
-    if (needed) {
+    
+    // Remove both classes first
+    if (solveBtn) {
+      solveBtn.classList.remove("cf-needed", "cf-solved");
+    }
+    if (bannerBtn) {
+      bannerBtn.classList.remove("cf-needed", "cf-solved");
+    }
+    
+    if (state === "needed") {
       if (solveBtn) solveBtn.classList.add("cf-needed");
       if (bannerBtn) bannerBtn.classList.add("cf-needed");
-    } else {
-      if (solveBtn) solveBtn.classList.remove("cf-needed");
-      if (bannerBtn) bannerBtn.classList.remove("cf-needed");
+    } else if (state === "solved") {
+      if (solveBtn) solveBtn.classList.add("cf-solved");
+      if (bannerBtn) bannerBtn.classList.add("cf-solved");
     }
   }
 
@@ -1654,6 +1665,9 @@
             spinner.classList.add("hidden");
             statusText.textContent = "✅ Cloudflare verified! Connected!";
             toast("Cloudflare verified and auto-configured from Firefox!", "ok");
+            
+            // Show green "solved" state on buttons
+            highlightSolveCfButton("solved");
 
             if (cfSolverWindow && !cfSolverWindow.closed) {
               cfSolverWindow.close();
