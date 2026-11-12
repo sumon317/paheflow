@@ -284,7 +284,9 @@ pub async fn latest_releases(
                         let alt_url = format!("{}/?m=airing&page={}", API_URL, pg);
                         match client.fetch_json(&alt_url, None, cfg).await {
                             Ok(j) => j,
-                            Err(_) => return Err(format!("Failed to fetch recent releases: {}", e)),
+                            Err(_) => {
+                                return Err(format!("Failed to fetch recent releases: {}", e))
+                            }
                         }
                     } else {
                         // For subsequent pages, stop gracefully on error (likely reached end or rate limited)
@@ -385,7 +387,7 @@ pub async fn latest_releases(
                 break;
             }
             pg += 1;
-            
+
             // Small delay to avoid rate limiting
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
