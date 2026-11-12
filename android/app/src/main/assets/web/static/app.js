@@ -62,7 +62,8 @@
    *  state
    * ───────────────────────────────────────────────────────────────── */
 
-  const CATALOG_PAGE_SIZE = 10000; // Effectively unlimited - show all items at once
+  const CATALOG_PAGE_SIZE = 40;
+  const RECENT_CHUNK_SIZE = 30;
   // Download logs arrive much faster than a user can read them. Keep the DOM
   // bounded so a long batch cannot turn every SSE event into a layout pass.
   const MAX_LOG_LINES = 1000;
@@ -73,6 +74,8 @@
     localCatalog: [],
     remoteCatalog: [],
     catalogLimit: CATALOG_PAGE_SIZE,
+    recentLimit: RECENT_CHUNK_SIZE,
+    catalogObserver: null,
     searchMode: "local",
     selectedSlug: "",
     selectedTitle: "",
@@ -108,11 +111,6 @@
     // Navigation history for back button handling
     tabHistory: ["home"],
     activeTab: "home",
-    // Chunked rendering state
-    catalogRenderTask: null,
-    catalogRenderIndex: 0,
-    catalogRenderList: null,
-    catalogRenderBox: null,
   };
 
   let logQueue = [];
@@ -453,20 +451,21 @@
       a.title.toLowerCase().includes(term) || a.slug.toLowerCase().includes(term));
   }
 
-  function renderCatalog() {
-    if (state.catalogRenderTask) {
-      cancelAnimationFrame(state.catalogRenderTask);
-      state.catalogRenderTask = null;
-    }
-    state.catalogRenderList = null;
+  const CATALOG_CHUNK_SIZE = 40;
+  const RECENT_CHUNK_SIZE = 30;
 
+  function renderCatalog(resetLimit = true) {
     if (state.searchMode === "recent") {
-      renderRecentReleases();
+      renderRecentReleases(resetLimit);
       return;
     }
     const list = filteredCatalog();
     const box = $("resultsList");
     if (!list.length) {
+      if (state.catalogObserver) {
+        state.catalogObserver.disconnect();
+        state.catalogObserver = null;
+      }
       const remote = state.searchMode === "remote";
       const hasQuery = Boolean($("searchInput").value.trim());
       box.innerHTML = `<div class="empty"><p class="empty-title">${
@@ -478,40 +477,41 @@
           ? (hasQuery ? "Try a different search term." : "Type an anime title in the search box above and press Search.")
           : "The local list holds 6,600+ cached slugs; try another search or check recent releases."
       }</p></div>`;
-      updateCatalogMeta(list.length, list.length);
+      updateCatalogMeta(0, 0);
       return;
     }
-    updateCatalogMeta(list.length, list.length);
-    
-    // Use chunked rendering to avoid blocking the main thread
-    state.catalogRenderIndex = 0;
-    state.catalogRenderList = list;
-    state.catalogRenderBox = box;
-    box.innerHTML = "";
-    renderCatalogChunk();
+
+    if (resetLimit) {
+      state.catalogLimit = CATALOG_CHUNK_SIZE;
+    }
+
+    const total = list.length;
+    const shownCount = Math.min(state.catalogLimit, total);
+    updateCatalogMeta(shownCount, total);
+
+    const shown = list.slice(0, shownCount);
+    const isLocal = state.searchMode === "local";
+
+    const cardsHtml = shown.map(a => renderCatalogCardHtml(a, isLocal)).join("");
+    const hasMore = shownCount < total;
+    const sentinelHtml = hasMore ? `<div id="catalogSentinel" class="catalog-sentinel" style="padding: 16px; text-align: center; color: var(--text-faint); font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;"><span class="spinner" style="width: 14px; height: 14px;"></span> Loading more (${shownCount} of ${total})...</div>` : "";
+
+    box.innerHTML = cardsHtml + sentinelHtml;
+    setupCatalogObserver(list, isLocal);
   }
 
-  function renderCatalogChunk() {
-    const { catalogRenderList, catalogRenderBox, catalogRenderIndex } = state;
-    if (!catalogRenderList || !catalogRenderBox) return;
-    
-    const CHUNK_SIZE = 50; // Render 50 items per frame
-    const end = Math.min(catalogRenderIndex + CHUNK_SIZE, catalogRenderList.length);
-    
-    const fragment = document.createDocumentFragment();
-    for (let i = catalogRenderIndex; i < end; i++) {
-      const a = catalogRenderList[i];
-      const poster = a.poster || a.cover || "";
-      const thumbUrl = poster ? `/api/thumb?url=${encodeURIComponent(poster)}&token=${encodeURIComponent(token())}` : "";
-      const hasThumb = !!poster;
+  function renderCatalogCardHtml(a, isLocal) {
+    const poster = isLocal ? "" : (a.poster || a.cover || "");
+    const thumbUrl = poster ? `/api/thumb?url=${encodeURIComponent(poster)}&token=${encodeURIComponent(token())}` : "";
+    const isSelected = a.slug === state.selectedSlug;
 
-      const div = document.createElement("div");
-      div.className = `result ${a.slug === state.selectedSlug ? "is-selected" : ""}`;
-      div.dataset.slug = a.slug;
-      div.innerHTML = `
-        <div class="recent-thumb-wrap">
-          ${hasThumb ? `<img class="recent-thumb" src="${escapeHtml(thumbUrl)}" data-fallback-src="${escapeHtml(poster)}" alt="${escapeHtml(a.title)}" loading="lazy" referrerpolicy="no-referrer" onerror="if(this.dataset.fallbackSrc && this.src !== this.dataset.fallbackSrc){ this.src = this.dataset.fallbackSrc; this.removeAttribute('data-fallback-src'); } else { this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'; }" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
-        </div>
+    return `
+      <div class="result ${isSelected ? "is-selected" : ""}" data-slug="${escapeHtml(a.slug)}">
+        ${poster ? `
+          <div class="recent-thumb-wrap">
+            <img class="recent-thumb" src="${escapeHtml(thumbUrl)}" alt="${escapeHtml(a.title)}" loading="lazy" decoding="async" onerror="this.parentElement.style.display='none'" />
+          </div>
+        ` : ""}
         <div class="result-main">
           <div class="result-title">${escapeHtml(a.title)}</div>
           <div class="result-meta">
@@ -521,31 +521,58 @@
         <div class="result-actions">
           <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
         </div>
-      `;
-      fragment.appendChild(div);
+      </div>
+    `;
+  }
+
+  function setupCatalogObserver(list, isLocal) {
+    if (state.catalogObserver) {
+      state.catalogObserver.disconnect();
+      state.catalogObserver = null;
     }
-    
-    catalogRenderBox.appendChild(fragment);
-    
-    // Attach event listeners for the newly added elements
-    const newSelectBtns = catalogRenderBox.querySelectorAll(".select-btn");
-    newSelectBtns.forEach(btn => {
-      if (!btn.dataset.listenerAttached) {
-        btn.dataset.listenerAttached = "true";
-        btn.onclick = (e) => { e.stopPropagation(); const slug = e.currentTarget.closest(".result").dataset.slug; selectAnime(slug); };
+    const sentinel = $("catalogSentinel");
+    if (!sentinel) return;
+
+    state.catalogObserver = new IntersectionObserver((entries) => {
+      if (entries[0] && entries[0].isIntersecting) {
+        appendMoreCatalog(list, isLocal);
       }
-    });
-    const newResults = catalogRenderBox.querySelectorAll(".result:not([data-listener-attached])");
-    newResults.forEach(el => {
-      if (!el.dataset.listenerAttached) {
-        el.dataset.listenerAttached = "true";
-        el.onclick = (e) => { if (!e.target.closest(".select-btn")) selectAnime(el.dataset.slug); };
+    }, { rootMargin: "600px" });
+    state.catalogObserver.observe(sentinel);
+  }
+
+  function appendMoreCatalog(list, isLocal) {
+    const total = list.length;
+    if (state.catalogLimit >= total) return;
+
+    const start = state.catalogLimit;
+    state.catalogLimit = Math.min(state.catalogLimit + CATALOG_CHUNK_SIZE, total);
+    updateCatalogMeta(state.catalogLimit, total);
+
+    const nextBatch = list.slice(start, state.catalogLimit);
+    const box = $("resultsList");
+    const sentinel = $("catalogSentinel");
+
+    const fragment = document.createDocumentFragment();
+    const temp = document.createElement("div");
+    temp.innerHTML = nextBatch.map(a => renderCatalogCardHtml(a, isLocal)).join("");
+    while (temp.firstChild) {
+      fragment.appendChild(temp.firstChild);
+    }
+
+    if (sentinel) {
+      box.insertBefore(fragment, sentinel);
+      if (state.catalogLimit >= total) {
+        sentinel.remove();
+        if (state.catalogObserver) {
+          state.catalogObserver.disconnect();
+          state.catalogObserver = null;
+        }
+      } else {
+        sentinel.innerHTML = `<span class="spinner" style="width: 14px; height: 14px;"></span> Loading more (${state.catalogLimit} of ${total})...`;
       }
-    });
-    
-    state.catalogRenderIndex = end;
-    if (end < catalogRenderList.length) {
-      state.catalogRenderTask = requestAnimationFrame(renderCatalogChunk);
+    } else {
+      box.appendChild(fragment);
     }
   }
 
@@ -566,27 +593,27 @@
   }
 
   function setCatalogMode(mode, forceReload = false) {
-    if (state.catalogRenderTask) {
-      cancelAnimationFrame(state.catalogRenderTask);
-      state.catalogRenderTask = null;
+    if (state.catalogObserver) {
+      state.catalogObserver.disconnect();
+      state.catalogObserver = null;
     }
-    state.catalogRenderList = null;
     const isModeChange = state.searchMode !== mode;
     state.searchMode = mode;
-    state.catalogLimit = CATALOG_PAGE_SIZE;
+    state.catalogLimit = CATALOG_CHUNK_SIZE;
+    state.recentLimit = RECENT_CHUNK_SIZE;
     $$("#resultModes .seg").forEach(b => b.classList.toggle("is-active", b.dataset.mode === mode));
     const pager = $("recentPager");
     if (pager) {
-      pager.classList.add("hidden"); // Always hide pager - unlimited scrolling
+      pager.classList.add("hidden");
     }
     if (mode === "recent") {
       if (!state.recentItems.length || !isModeChange || forceReload) {
-        loadRecentReleases(1, true); // Fetch all pages
+        loadRecentReleases(1, true);
       } else {
-        renderRecentReleases();
+        renderRecentReleases(true);
       }
     } else {
-      renderCatalog();
+      renderCatalog(true);
     }
   }
 
@@ -621,7 +648,7 @@
       state.recentTotal = res.total ?? list.length;
       state.recentLoading = false;
       if (state.searchMode === "recent") {
-        renderRecentReleases();
+        renderRecentReleases(true);
       }
     } catch (e) {
       state.recentLoading = false;
@@ -635,75 +662,134 @@
     }
   }
 
-  function renderRecentReleases() {
+  function renderRecentReleases(resetLimit = true) {
     const box = $("resultsList");
     const items = state.recentItems || [];
     if (!items.length) {
+      if (state.catalogObserver) {
+        state.catalogObserver.disconnect();
+        state.catalogObserver = null;
+      }
       box.innerHTML = `<div class="empty"><p class="empty-title">No recent releases found</p><p class="empty-text">Check your internet connection or Cloudflare clearance.</p></div>`;
       $("catalogMeta").textContent = "No recent releases";
       updateRecentPager();
       return;
     }
 
-    box.innerHTML = items.map(item => {
-      const title = item.anime_title || item.animeTitle || "";
-      const session = item.anime_session || item.animeSession || "";
-      const epNum = (item.episode !== undefined && item.episode !== null) ? String(item.episode) : "";
-      const isDub = (item.audio || "").toLowerCase() === "dub" || (item.audio || "").toLowerCase() === "eng";
-      const audioClass = isDub ? "recent-badge-dub" : "recent-badge-sub";
-      const audioLabel = isDub ? "DUB" : "SUB";
-      const timeStr = timeAgo(item.created_at || item.createdAt);
-      const isSelected = session === state.selectedSlug;
-      const snapshot = item.snapshot || "";
-      const thumbUrl = snapshot ? `/api/thumb?url=${encodeURIComponent(snapshot)}&token=${encodeURIComponent(token())}` : "";
-      const duration = item.duration || "";
+    if (resetLimit) {
+      state.recentLimit = RECENT_CHUNK_SIZE;
+    }
 
-      return `
-        <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(session)}" data-title="${escapeHtml(title)}" data-ep="${escapeHtml(epNum)}">
-          <div class="recent-thumb-wrap">
-            ${snapshot ? `<img class="recent-thumb" src="${escapeHtml(thumbUrl)}" data-fallback-src="${escapeHtml(snapshot)}" alt="${escapeHtml(title)}" loading="lazy" referrerpolicy="no-referrer" onerror="if(this.dataset.fallbackSrc && this.src !== this.dataset.fallbackSrc){ this.src = this.dataset.fallbackSrc; this.removeAttribute('data-fallback-src'); } else { this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display='flex'; }" /><div class="recent-thumb-placeholder" style="display:none;">🎬</div>` : `<div class="recent-thumb-placeholder">🎬</div>`}
-          </div>
-          <div class="result-main">
-            <div class="result-title">${escapeHtml(title)}</div>
-            <div class="result-meta">
-              <span class="badge recent-badge-ep">EP ${escapeHtml(epNum)}</span>
-              <span class="badge ${audioClass}">${audioLabel}</span>
-              ${duration ? `<span>${escapeHtml(duration)}</span>` : ""}
-              ${timeStr ? `<span class="recent-time">🕒 ${escapeHtml(timeStr)}</span>` : ""}
-            </div>
-          </div>
-          <div class="result-actions">
-            <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(epNum)}">Open</button>
-          </div>
-        </div>
-      `;
-    }).join("");
+    const total = items.length;
+    const shownCount = Math.min(state.recentLimit || RECENT_CHUNK_SIZE, total);
+    const shown = items.slice(0, shownCount);
 
-    $$$(".select-btn", box).forEach(btn => {
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        const card = e.currentTarget.closest(".result");
-        selectRecentEpisode(card.dataset.session, card.dataset.title, card.dataset.ep);
-      };
-    });
+    const cardsHtml = shown.map(item => renderRecentCardHtml(item)).join("");
+    const hasMore = shownCount < total;
+    const sentinelHtml = hasMore ? `<div id="recentSentinel" class="recent-sentinel" style="padding: 16px; text-align: center; color: var(--text-faint); font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;"><span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${shownCount} of ${total})...</div>` : "";
 
-    $$$(".result.recent", box).forEach(el => {
-      el.onclick = (e) => {
-        if (!e.target.closest(".select-btn")) {
-          selectRecentEpisode(el.dataset.session, el.dataset.title, el.dataset.ep);
-        }
-      };
-    });
+    box.innerHTML = cardsHtml + sentinelHtml;
 
     const totalStr = state.recentTotal ? ` of ${state.recentTotal.toLocaleString()}` : "";
-    $("catalogMeta").textContent = `Page ${state.recentPage}${totalStr} latest releases from AnimePahe`;
+    $("catalogMeta").textContent = `${shownCount}${totalStr} latest releases from AnimePahe`;
     updateRecentPager();
+
+    setupRecentObserver(items);
+  }
+
+  function renderRecentCardHtml(item) {
+    const title = item.anime_title || item.animeTitle || "";
+    const session = item.anime_session || item.animeSession || "";
+    const epNum = (item.episode !== undefined && item.episode !== null) ? String(item.episode) : "";
+    const isDub = (item.audio || "").toLowerCase() === "dub" || (item.audio || "").toLowerCase() === "eng";
+    const audioClass = isDub ? "recent-badge-dub" : "recent-badge-sub";
+    const audioLabel = isDub ? "DUB" : "SUB";
+    const timeStr = timeAgo(item.created_at || item.createdAt);
+    const isSelected = session === state.selectedSlug;
+    const snapshot = item.snapshot || "";
+    const thumbUrl = snapshot ? `/api/thumb?url=${encodeURIComponent(snapshot)}&token=${encodeURIComponent(token())}` : "";
+    const duration = item.duration || "";
+
+    return `
+      <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(session)}" data-title="${escapeHtml(title)}" data-ep="${escapeHtml(epNum)}">
+        ${snapshot ? `
+          <div class="recent-thumb-wrap">
+            <img class="recent-thumb" src="${escapeHtml(thumbUrl)}" alt="${escapeHtml(title)}" loading="lazy" decoding="async" onerror="this.parentElement.style.display='none'" />
+          </div>
+        ` : ""}
+        <div class="result-main">
+          <div class="result-title">${escapeHtml(title)}</div>
+          <div class="result-meta">
+            <span class="badge recent-badge-ep">EP ${escapeHtml(epNum)}</span>
+            <span class="badge ${audioClass}">${audioLabel}</span>
+            ${duration ? `<span>${escapeHtml(duration)}</span>` : ""}
+            ${timeStr ? `<span class="recent-time">🕒 ${escapeHtml(timeStr)}</span>` : ""}
+          </div>
+        </div>
+        <div class="result-actions">
+          <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(epNum)}">Open</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function setupRecentObserver(items) {
+    if (state.catalogObserver) {
+      state.catalogObserver.disconnect();
+      state.catalogObserver = null;
+    }
+    const sentinel = $("recentSentinel");
+    if (!sentinel) return;
+
+    state.catalogObserver = new IntersectionObserver((entries) => {
+      if (entries[0] && entries[0].isIntersecting) {
+        appendMoreRecent(items);
+      }
+    }, { rootMargin: "600px" });
+    state.catalogObserver.observe(sentinel);
+  }
+
+  function appendMoreRecent(items) {
+    const total = items.length;
+    if (state.recentLimit >= total) return;
+
+    const start = state.recentLimit;
+    state.recentLimit = Math.min(state.recentLimit + RECENT_CHUNK_SIZE, total);
+
+    const totalStr = state.recentTotal ? ` of ${state.recentTotal.toLocaleString()}` : "";
+    $("catalogMeta").textContent = `${state.recentLimit}${totalStr} latest releases from AnimePahe`;
+
+    const nextBatch = items.slice(start, state.recentLimit);
+    const box = $("resultsList");
+    const sentinel = $("recentSentinel");
+
+    const fragment = document.createDocumentFragment();
+    const temp = document.createElement("div");
+    temp.innerHTML = nextBatch.map(item => renderRecentCardHtml(item)).join("");
+    while (temp.firstChild) {
+      fragment.appendChild(temp.firstChild);
+    }
+
+    if (sentinel) {
+      box.insertBefore(fragment, sentinel);
+      if (state.recentLimit >= total) {
+        sentinel.remove();
+        if (state.catalogObserver) {
+          state.catalogObserver.disconnect();
+          state.catalogObserver = null;
+        }
+      } else {
+        sentinel.innerHTML = `<span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${state.recentLimit} of ${total})...`;
+      }
+    } else {
+      box.appendChild(fragment);
+    }
   }
 
   function updateRecentPager() {
     const pager = $("recentPager");
     if (!pager) return;
-    pager.classList.add("hidden"); // Always hide - unlimited scrolling
+    pager.classList.add("hidden");
   }
 
   function selectRecentEpisode(slug, title, episodeNum) {
@@ -978,7 +1064,7 @@
       const isDubTag = audioTag.includes("DUB");
       return `
       <div class="ep ${checked ? "is-checked" : ""}" data-ep="${escapeHtml(id)}" title="Episode ${escapeHtml(id)}${dur ? ` · ${dur}` : ""}${sizeTag ? ` · ${sizeTag}` : ""}">
-        <input type="checkbox" ${checked ? "checked" : ""} />
+        <input type="checkbox" ${checked ? "checked" : ""} style="pointer-events: none;" />
         <span class="ep-num">E${escapeHtml(id)}</span>
         <div class="ep-info">
           <div class="ep-tags">
@@ -989,11 +1075,6 @@
         </div>
       </div>`;
     }).join("");
-    $$(".ep", box).forEach(el => {
-      const ep = el.dataset.ep;
-      el.onclick = () => toggleEpisode(ep);
-      el.querySelector("input").onclick = (e) => { e.stopPropagation(); toggleEpisode(ep); };
-    });
     updateEpSelectionUI();
   }
 
@@ -2204,10 +2285,15 @@
   }
 
   function showTab(name) {
-    if (name !== "browse" && state.catalogRenderTask) {
-      cancelAnimationFrame(state.catalogRenderTask);
-      state.catalogRenderTask = null;
-      state.catalogRenderList = null;
+    if (name !== "browse" && state.catalogObserver) {
+      state.catalogObserver.disconnect();
+      state.catalogObserver = null;
+    } else if (name === "browse" && !state.catalogObserver) {
+      if (state.searchMode === "recent" && $("recentSentinel")) {
+        setupRecentObserver(state.recentItems || []);
+      } else if ($("catalogSentinel")) {
+        setupCatalogObserver(filteredCatalog(), state.searchMode === "local");
+      }
     }
     // Track tab history for back button navigation
     if (state.activeTab !== name) {
@@ -2351,6 +2437,31 @@
   function bind() {
     // tabs
     $$(".tab").forEach(btn => btn.onclick = () => showTab(btn.dataset.tab));
+
+    // delegated clicks for results list
+    const resultsList = $("resultsList");
+    if (resultsList) {
+      resultsList.addEventListener("click", (e) => {
+        const card = e.target.closest(".result");
+        if (!card) return;
+        if (card.classList.contains("recent")) {
+          selectRecentEpisode(card.dataset.session, card.dataset.title, card.dataset.ep);
+        } else if (card.dataset.slug) {
+          selectAnime(card.dataset.slug);
+        }
+      });
+    }
+
+    // delegated clicks for episode grid
+    const epGrid = $("epGrid");
+    if (epGrid) {
+      epGrid.addEventListener("click", (e) => {
+        const el = e.target.closest(".ep");
+        if (!el) return;
+        const ep = el.dataset.ep;
+        if (ep) toggleEpisode(ep);
+      });
+    }
 
     // search
     $("searchBtn").onclick = doSearch;
