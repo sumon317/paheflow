@@ -479,7 +479,7 @@ async fn get_check_update(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    let repo = std::env::var("PAHEFLOW_REPO").unwrap_or_else(|_| "paheflow/paheflow".to_string());
+    let repo = std::env::var("PAHEFLOW_REPO").unwrap_or_else(|_| "sumon317/paheflow".to_string());
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let resp = match client.get(url).send().await {
         Ok(r) => r,

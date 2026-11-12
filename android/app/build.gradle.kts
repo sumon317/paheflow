@@ -14,8 +14,8 @@ android {
         applicationId = "com.animepahe.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.1.2"
+        versionCode = 10
+        versionName = "1.1.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -36,15 +36,22 @@ android {
         FileInputStream(keystorePropertiesFile).use { stream ->
             keystoreProperties.load(stream)
         }
+    } else {
+        logger.warn("android/app/keystore.properties not found. Signing credentials must be provided in that file; see README.")
     }
 
     signingConfigs {
         create("release") {
-            val keyPath = keystoreProperties.getProperty("storeFile") ?: "paheflow-release.keystore"
-            storeFile = file(keyPath)
-            storePassword = keystoreProperties.getProperty("storePassword") ?: System.getenv("SIGNING_PASSWORD")
-            keyAlias = keystoreProperties.getProperty("keyAlias") ?: "paheflow"
-            keyPassword = keystoreProperties.getProperty("keyPassword") ?: System.getenv("SIGNING_PASSWORD")
+            fun signingProp(name: String): String =
+                checkNotNull(keystoreProperties.getProperty(name)) {
+                    "android/app/keystore.properties is missing '$name'. Signing credentials must come " +
+                        "from keystore.properties — hardcoded fallback passwords are not allowed."
+                }
+
+            storeFile = file(signingProp("storeFile"))
+            storePassword = signingProp("storePassword")
+            keyAlias = signingProp("keyAlias")
+            keyPassword = signingProp("keyPassword")
             enableV1Signing = true
             enableV2Signing = true
         }

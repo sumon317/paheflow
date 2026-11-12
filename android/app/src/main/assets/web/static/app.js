@@ -314,7 +314,7 @@
       window.AndroidBridge.downloadAndInstallUpdate(apkUrl);
     } else {
       // Desktop / Browser
-      const targetUrl = latestUpdateInfo.html_url || "https://github.com/paheflow/paheflow/releases/latest";
+      const targetUrl = latestUpdateInfo.html_url || "https://github.com/sumon317/paheflow/releases/latest";
       window.open(targetUrl, "_blank");
       closeUpdateModal();
       toast("Opened GitHub release in browser", "info");

@@ -1,0 +1,14 @@
+# Betterleaks config: default rules + PaheFlow-specific rules.
+# CI passes this explicitly: betterleaks git . -c .betterleaks.toml
+#
+# NOTE on the regex below: value character classes deliberately exclude "*"
+# (re2 has no lookahead) so git-filter-repo's "***REMOVED***" history
+# placeholders are never flagged by this rule.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "android-signing-credential"
+description = "Android signing password material hardcoded or defaulted in build scripts"
+regex = '''(?i)(?:storePassword|keyPassword)\s*=\s*(?:"[^"*]{4,}"|[^,\r\n]*\?:\s*"[^"*]{6,}")'''
+keywords = ["storePassword", "keyPassword"]

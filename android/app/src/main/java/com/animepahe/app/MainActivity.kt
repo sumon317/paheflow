@@ -575,6 +575,20 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        if (!isApkSignedWithSameKey(apkFile)) {
+            AlertDialog.Builder(this)
+                .setTitle("Update Signature Mismatch")
+                .setMessage(
+                    "The downloaded update was not signed with the same key as the installed PaheFlow app, " +
+                        "so it will not be installed.\n\n" +
+                        "If you are upgrading from v1.1.0 or older, the app is now signed with a new key: " +
+                        "uninstall the old version first, then install the new APK."
+                )
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (!packageManager.canRequestPackageInstalls()) {
                 pendingInstallApk = apkFile
@@ -615,6 +629,34 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Could not launch package installer: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
+
+    private fun isApkSignedWithSameKey(apkFile: File): Boolean {
+        return try {
+            val archiveInfo = packageManager.getPackageArchiveInfo(
+                apkFile.absolutePath,
+                PackageManager.GET_SIGNATURES
+            ) ?: return false
+            val installedInfo = packageManager.getPackageInfo(
+                packageName,
+                PackageManager.GET_SIGNATURES
+            )
+            val archiveCerts = archiveInfo.signatures
+                ?.map { it.toByteArray().sha256Hex() }
+                ?.toSet()
+                ?: return false
+            val installedCerts = installedInfo.signatures
+                ?.map { it.toByteArray().sha256Hex() }
+                ?.toSet()
+                ?: return false
+            archiveCerts == installedCerts
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun ByteArray.sha256Hex(): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(this)
+            .joinToString("") { "%02x".format(it) }
 
     private fun ensureDirAndCheckPermission(dirPath: String) {
         try {

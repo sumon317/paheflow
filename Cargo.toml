@@ -1,6 +1,6 @@
 [package]
 name = "paheflow"
-version = "1.1.2"
+version = "1.1.3"
 edition = "2021"
 description = "Fast, lightweight native AnimePahe stream extractor and concurrent downloader for Android & Linux"
 license = "GPL-3.0-or-later"

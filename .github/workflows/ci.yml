@@ -55,3 +55,23 @@ jobs:
 
       - name: Run Offline Regression Tests
         run: python3 -m unittest discover -s tests -v
+
+  secret-scan:
+    name: Betterleaks Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Betterleaks
+        run: |
+          curl -sSLo /tmp/betterleaks.tar.gz https://github.com/betterleaks/betterleaks/releases/download/v1.10.0/betterleaks_1.10.0_linux_x64.tar.gz
+          echo "9d9ad503cd5d80d18a939352266c3fcca52f10da9b83cd5cfe646989b13940fe  /tmp/betterleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/betterleaks.tar.gz -C /tmp betterleaks
+
+      - name: Scan Git History and Working Tree
+        run: |
+          /tmp/betterleaks git . -c .betterleaks.toml --no-banner --redact
+          /tmp/betterleaks dir . -c .betterleaks.toml --no-banner --redact --max-target-megabytes 20
