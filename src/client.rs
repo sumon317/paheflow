@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{resource_dir, AppConfig};
 
-pub const MIN_INTERVAL_MS: u64 = 400;
+pub const MIN_INTERVAL_MS: u64 = 50;
 pub const TIMEOUT_SECS: u64 = 30;
 pub const RATE_LIMIT_MARKER: &str = "error code: 1015";
 
@@ -221,17 +221,26 @@ impl HttpClient {
                 "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
             };
             req = req.header(reqwest::header::USER_AGENT, ua);
+            req = req.header("sec-ch-ua", r#""Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133""#);
+            req = req.header("sec-ch-ua-mobile", "?1");
+            req = req.header("sec-ch-ua-platform", r#""Android""#);
             if url.contains("/api") {
                 req = req.header(
                     reqwest::header::ACCEPT,
                     "application/json, text/javascript, */*; q=0.01",
                 );
                 req = req.header("X-Requested-With", "XMLHttpRequest");
+                req = req.header("sec-fetch-dest", "empty");
+                req = req.header("sec-fetch-mode", "cors");
+                req = req.header("sec-fetch-site", "same-origin");
             } else {
                 req = req.header(
                     reqwest::header::ACCEPT,
                     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 );
+                req = req.header("sec-fetch-dest", "document");
+                req = req.header("sec-fetch-mode", "navigate");
+                req = req.header("sec-fetch-site", "same-origin");
             }
             req = req.header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
 
@@ -332,8 +341,7 @@ impl HttpClient {
         let mut last_error = String::from("Failed to download image.");
 
         for attempt in 1..=3 {
-            self.throttle().await;
-
+            // Images / posters are hosted on high-bandwidth CDNs; do not throttle them.
             let mut req = self.http.get(url);
 
             let ua = if !cfg.ua.trim().is_empty() {

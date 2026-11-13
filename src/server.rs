@@ -986,6 +986,8 @@ async fn get_episodes(
                 let total = filtered.len();
                 Ok(Json(serde_json::json!({
                     "items": filtered,
+                    "lastPage": 1,
+                    "page": 1,
                     "slug": slug,
                     "total": total,
                     "totalAll": total_all,

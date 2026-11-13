@@ -96,6 +96,7 @@
     recentLastPage: 1,
     recentTotal: 0,
     recentLoading: false,
+    recentAudioFilter: "all",
     pendingSelectEpisode: null,
     allKnownEpisodes: {},
     config: { ua: "", concurrent_fragments: 8, cfConfigured: false, cfLength: 0 },
@@ -500,9 +501,25 @@
   }
 
   function renderCatalogCardHtml(a, isLocal) {
-    const poster = isLocal ? "" : (a.poster || a.cover || "");
-    const thumbUrl = poster ? `/api/thumb?url=${encodeURIComponent(poster)}&token=${encodeURIComponent(token())}` : "";
     const isSelected = a.slug === state.selectedSlug;
+    if (isLocal) {
+      return `
+        <div class="result local-result ${isSelected ? "is-selected" : ""}" data-slug="${escapeHtml(a.slug)}">
+          <div class="result-main">
+            <div class="result-title">${escapeHtml(a.title)}</div>
+            <div class="result-meta">
+              <span class="slug">${escapeHtml(a.slug)}</span>
+            </div>
+          </div>
+          <div class="result-actions">
+            <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
+          </div>
+        </div>
+      `;
+    }
+
+    const poster = a.poster || a.cover || "";
+    const thumbUrl = poster ? `/api/thumb?url=${encodeURIComponent(poster)}&token=${encodeURIComponent(token())}` : "";
 
     return `
       <div class="result ${isSelected ? "is-selected" : ""}" data-slug="${escapeHtml(a.slug)}">
@@ -605,9 +622,13 @@
     if (pager) {
       pager.classList.add("hidden");
     }
+    const recentSeg = $("recentAudioSeg");
+    if (recentSeg) {
+      recentSeg.classList.toggle("hidden", mode !== "recent");
+    }
     if (mode === "recent") {
       if (!state.recentItems.length || !isModeChange || forceReload) {
-        loadRecentReleases(1, true);
+        loadRecentReleases(1, false);
       } else {
         renderRecentReleases(true);
       }
@@ -631,30 +652,53 @@
     }
   }
 
-  async function loadRecentReleases(page = 1, all = false) {
+  function getFilteredRecentItems() {
+    const items = state.recentItems || [];
+    const filter = (state.recentAudioFilter || "all").toLowerCase();
+    if (filter === "all") return items;
+    return items.filter(it => {
+      const titleLower = (it.anime_title || it.animeTitle || "").toLowerCase();
+      const rawAudio = (it.audio || "").toLowerCase();
+      const isDub = rawAudio === "dub" || rawAudio === "eng" || titleLower.includes("(dub)") || titleLower.includes("[dub]") || titleLower.includes(" dub");
+      if (filter === "dub") return isDub;
+      if (filter === "sub") return !isDub;
+      return true;
+    });
+  }
+
+  async function loadRecentReleases(page = 1, append = false) {
+    if (state.recentLoading) return;
     state.recentLoading = true;
     state.recentPage = page;
     const box = $("resultsList");
-    box.innerHTML = `<div class="ep-loading"><span class="spinner"></span> Loading recent releases from AnimePahe...</div>`;
-    $("catalogMeta").textContent = "Fetching latest releases...";
+    if (!append) {
+      box.innerHTML = `<div class="ep-loading"><span class="spinner"></span> Loading recent releases from AnimePahe...</div>`;
+      $("catalogMeta").textContent = "Fetching latest releases...";
+    }
     updateRecentPager();
     try {
-      const res = await api.get(`/api/latest?page=${page}&all=${all ? "1" : "0"}`);
+      const res = await api.get(`/api/latest?page=${page}&all=0`);
       const list = res.items || res.data || [];
-      state.recentItems = list;
-      state.recentPage = 1;
-      state.recentLastPage = 1;
-      state.recentTotal = res.total ?? list.length;
+      if (append) {
+        state.recentItems = (state.recentItems || []).concat(list);
+      } else {
+        state.recentItems = list;
+      }
+      state.recentPage = page;
+      state.recentLastPage = res.lastPage || res.last_page || 1;
+      state.recentTotal = res.total ?? state.recentItems.length;
       state.recentLoading = false;
       if (state.searchMode === "recent") {
-        renderRecentReleases(true);
+        renderRecentReleases(!append);
       }
     } catch (e) {
       state.recentLoading = false;
       if (state.searchMode === "recent") {
-        box.innerHTML = `<div class="empty"><p class="empty-title">Failed to load recent releases</p><p class="empty-text">${escapeHtml(e.message || "Network or Cloudflare error")}</p></div>`;
-        $("catalogMeta").textContent = "Failed to load latest releases";
-        updateRecentPager();
+        if (!append) {
+          box.innerHTML = `<div class="empty"><p class="empty-title">Failed to load recent releases</p><p class="empty-text">${escapeHtml(e.message || "Network or Cloudflare error")}</p></div>`;
+          $("catalogMeta").textContent = "Failed to load latest releases";
+          updateRecentPager();
+        }
       }
       toast("Recent releases failed: " + e.message, "error");
       noteApiError(e.message);
@@ -663,14 +707,17 @@
 
   function renderRecentReleases(resetLimit = true) {
     const box = $("resultsList");
-    const items = state.recentItems || [];
+    const items = getFilteredRecentItems();
     if (!items.length) {
       if (state.catalogObserver) {
         state.catalogObserver.disconnect();
         state.catalogObserver = null;
       }
-      box.innerHTML = `<div class="empty"><p class="empty-title">No recent releases found</p><p class="empty-text">Check your internet connection or Cloudflare clearance.</p></div>`;
-      $("catalogMeta").textContent = "No recent releases";
+      const emptyMsg = (state.recentItems && state.recentItems.length)
+        ? `No ${state.recentAudioFilter === "dub" ? "Dub" : "Sub"} releases in current batch.`
+        : "No recent releases found.";
+      box.innerHTML = `<div class="empty"><p class="empty-title">${emptyMsg}</p><p class="empty-text">Check your internet connection or Cloudflare clearance.</p></div>`;
+      $("catalogMeta").textContent = emptyMsg;
       updateRecentPager();
       return;
     }
@@ -684,7 +731,7 @@
     const shown = items.slice(0, shownCount);
 
     const cardsHtml = shown.map(item => renderRecentCardHtml(item)).join("");
-    const hasMore = shownCount < total;
+    const hasMore = shownCount < total || (state.recentPage < state.recentLastPage);
     const sentinelHtml = hasMore ? `<div id="recentSentinel" class="recent-sentinel" style="padding: 16px; text-align: center; color: var(--text-faint); font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;"><span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${shownCount} of ${total})...</div>` : "";
 
     box.innerHTML = cardsHtml + sentinelHtml;
@@ -700,7 +747,9 @@
     const title = item.anime_title || item.animeTitle || "";
     const session = item.anime_session || item.animeSession || "";
     const epNum = (item.episode !== undefined && item.episode !== null) ? String(item.episode) : "";
-    const isDub = (item.audio || "").toLowerCase() === "dub" || (item.audio || "").toLowerCase() === "eng";
+    const titleLower = title.toLowerCase();
+    const rawAudio = (item.audio || "").toLowerCase();
+    const isDub = rawAudio === "dub" || rawAudio === "eng" || titleLower.includes("(dub)") || titleLower.includes("[dub]") || titleLower.includes(" dub");
     const audioClass = isDub ? "recent-badge-dub" : "recent-badge-sub";
     const audioLabel = isDub ? "DUB" : "SUB";
     const timeStr = timeAgo(item.created_at || item.createdAt);
@@ -750,7 +799,12 @@
 
   function appendMoreRecent(items) {
     const total = items.length;
-    if (state.recentLimit >= total) return;
+    if (state.recentLimit >= total) {
+      if (state.recentPage < state.recentLastPage && !state.recentLoading) {
+        loadRecentReleases(state.recentPage + 1, true);
+      }
+      return;
+    }
 
     const start = state.recentLimit;
     state.recentLimit = Math.min(state.recentLimit + RECENT_CHUNK_SIZE, total);
@@ -772,10 +826,14 @@
     if (sentinel) {
       box.insertBefore(fragment, sentinel);
       if (state.recentLimit >= total) {
-        sentinel.remove();
-        if (state.catalogObserver) {
-          state.catalogObserver.disconnect();
-          state.catalogObserver = null;
+        if (state.recentPage < state.recentLastPage && !state.recentLoading) {
+          loadRecentReleases(state.recentPage + 1, true);
+        } else {
+          sentinel.remove();
+          if (state.catalogObserver) {
+            state.catalogObserver.disconnect();
+            state.catalogObserver = null;
+          }
         }
       } else {
         sentinel.innerHTML = `<span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${state.recentLimit} of ${total})...`;
@@ -822,7 +880,7 @@
     if (state.searchMode === "recent") {
       setBusy($("refreshCatalog"), true);
       try {
-        await loadRecentReleases(state.recentPage || 1, true);
+        await loadRecentReleases(1, false);
         toast("Recent releases refreshed", "ok");
       } catch (e) {
         toast("Refresh failed: " + e.message, "error");
@@ -901,7 +959,7 @@
     try {
       const titleParam = state.selectedTitle ? `&title=${encodeURIComponent(state.selectedTitle)}` : "";
       const audioParam = state.audioFilter ? `&audio=${encodeURIComponent(state.audioFilter)}` : "";
-      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&all=1${titleParam}${audioParam}`);
+      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&all=1&page=${page}${titleParam}${audioParam}`);
       if (res.slug && res.slug !== slug) {
         state.selectedSlug = res.slug;
         slug = res.slug;
@@ -2470,6 +2528,14 @@
     }, 150));
     $("clearSearch").onclick = () => { $("searchInput").value = ""; setCatalogMode("local"); };
     $$("#resultModes .seg").forEach(btn => btn.onclick = () => setCatalogMode(btn.dataset.mode));
+    $$("#recentAudioSeg .seg").forEach(btn => {
+      btn.onclick = () => {
+        $$("#recentAudioSeg .seg").forEach(b => b.classList.remove("is-active"));
+        btn.classList.add("is-active");
+        state.recentAudioFilter = btn.dataset.recentAudio || "all";
+        renderRecentReleases(true);
+      };
+    });
     $("refreshCatalog").onclick = refreshCatalog;
 
     // episodes
@@ -2752,7 +2818,7 @@
     if (state.selectedSlug) {
       loadEpisodes(state.selectedSlug, state.epPage, state.audioFilter);
     } else if (state.searchMode === "recent") {
-      loadRecentReleases(state.recentPage || 1, true);
+      loadRecentReleases(1, false);
     } else if (state.searchMode === "remote" && $("searchInput").value.trim()) {
       doSearch();
     }

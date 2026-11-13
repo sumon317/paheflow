@@ -258,6 +258,86 @@ pub async fn search(
     Ok(results)
 }
 
+pub fn parse_latest_release_item(it: &serde_json::Value) -> Option<LatestReleaseItem> {
+    let anime_title = it
+        .get("anime_title")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let anime_session = it
+        .get("anime_session")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if anime_title.is_empty() || anime_session.is_empty() {
+        return None;
+    }
+
+    let raw_audio = it
+        .get("audio")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let title_lower = anime_title.to_lowercase();
+    let audio = if raw_audio == "dub"
+        || raw_audio == "eng"
+        || title_lower.contains("(dub)")
+        || title_lower.contains("[dub]")
+        || title_lower.contains(" dub")
+    {
+        Some("dub".to_string())
+    } else {
+        Some("sub".to_string())
+    };
+
+    Some(LatestReleaseItem {
+        id: it.get("id").and_then(|v| v.as_u64()),
+        anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
+        anime_title,
+        anime_session,
+        episode: it
+            .get("episode")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
+            let s = s.trim();
+            let mut url = if s.starts_with("//") {
+                format!("https:{}", s)
+            } else if s.starts_with('/') {
+                format!("https://animepahe.pw{}", s)
+            } else if !s.starts_with("http://")
+                && !s.starts_with("https://")
+                && !s.is_empty()
+            {
+                format!("https://{}", s)
+            } else {
+                s.to_string()
+            };
+            if url.contains("i.animepahe.ru") {
+                url = url.replace("i.animepahe.ru", "i.animepahe.com");
+            } else if url.contains("i.animepahe.si") {
+                url = url.replace("i.animepahe.si", "i.animepahe.com");
+            }
+            url
+        }),
+        duration: it
+            .get("duration")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        session: it
+            .get("session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        created_at: it
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        audio,
+    })
+}
+
 pub async fn latest_releases(
     client: &HttpClient,
     page: u32,
@@ -265,120 +345,62 @@ pub async fn latest_releases(
     all: bool,
 ) -> Result<LatestReleasesPage, String> {
     if all {
-        // Fetch recent pages (limited to avoid slow performance)
-        // Max 5 pages = ~150 items, which is reasonable for "recent"
         const MAX_PAGES: u32 = 5;
+        let url = format!("{}?m=airing&page=1", API_URL);
+        let json = match client.fetch_json(&url, None, cfg).await {
+            Ok(j) => j,
+            Err(e) => {
+                let alt_url = format!("{}/?m=airing&page=1", API_URL);
+                match client.fetch_json(&alt_url, None, cfg).await {
+                    Ok(j) => j,
+                    Err(_) => {
+                        return Err(format!("Failed to fetch recent releases: {}", e))
+                    }
+                }
+            }
+        };
+
+        let lp = json
+            .get("last_page")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(1);
+
+        let total = json
+            .get("total")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
         let mut all_items = Vec::new();
-        let mut total = 0;
-        let mut pg = 1;
+        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+            for it in data {
+                if let Some(item) = parse_latest_release_item(it) {
+                    all_items.push(item);
+                }
+            }
+        }
 
-        loop {
-            let url = format!("{}?m=airing&page={}", API_URL, pg);
-            let json = match client.fetch_json(&url, None, cfg).await {
-                Ok(j) => j,
-                Err(e) => {
-                    // If first page fails, try alt URL
-                    if pg == 1 {
-                        let alt_url = format!("{}/?m=airing&page={}", API_URL, pg);
-                        match client.fetch_json(&alt_url, None, cfg).await {
-                            Ok(j) => j,
-                            Err(_) => {
-                                return Err(format!("Failed to fetch recent releases: {}", e))
-                            }
+        if lp > 1 {
+            let target_pages: Vec<u32> = (2..=lp.min(MAX_PAGES)).collect();
+            let fetch_futures = target_pages.into_iter().map(|p| {
+                let client = client.clone();
+                let cfg = cfg.clone();
+                async move {
+                    let u = format!("{}?m=airing&page={}", API_URL, p);
+                    client.fetch_json(&u, None, &cfg).await.ok()
+                }
+            });
+            let extra_pages = futures_util::future::join_all(fetch_futures).await;
+            for page_json in extra_pages.into_iter().flatten() {
+                if let Some(data) = page_json.get("data").and_then(|d| d.as_array()) {
+                    for it in data {
+                        if let Some(item) = parse_latest_release_item(it) {
+                            all_items.push(item);
                         }
-                    } else {
-                        // For subsequent pages, stop gracefully on error (likely reached end or rate limited)
-                        break;
                     }
                 }
-            };
-
-            let lp = json
-                .get("last_page")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .unwrap_or(1);
-
-            total = json
-                .get("total")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .unwrap_or(total);
-
-            if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
-                for it in data {
-                    let anime_title = it
-                        .get("anime_title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let anime_session = it
-                        .get("anime_session")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-
-                    if anime_title.is_empty() || anime_session.is_empty() {
-                        continue;
-                    }
-
-                    all_items.push(LatestReleaseItem {
-                        id: it.get("id").and_then(|v| v.as_u64()),
-                        anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
-                        anime_title,
-                        anime_session,
-                        episode: it
-                            .get("episode")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
-                            let s = s.trim();
-                            let mut url = if s.starts_with("//") {
-                                format!("https:{}", s)
-                            } else if s.starts_with('/') {
-                                format!("https://animepahe.pw{}", s)
-                            } else if !s.starts_with("http://")
-                                && !s.starts_with("https://")
-                                && !s.is_empty()
-                            {
-                                format!("https://{}", s)
-                            } else {
-                                s.to_string()
-                            };
-                            if url.contains("i.animepahe.ru") {
-                                url = url.replace("i.animepahe.ru", "i.animepahe.com");
-                            } else if url.contains("i.animepahe.si") {
-                                url = url.replace("i.animepahe.si", "i.animepahe.com");
-                            }
-                            url
-                        }),
-                        duration: it
-                            .get("duration")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        session: it
-                            .get("session")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        created_at: it
-                            .get("created_at")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        audio: it
-                            .get("audio")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                    });
-                }
             }
-
-            if pg >= lp || pg >= MAX_PAGES {
-                break;
-            }
-            pg += 1;
-
-            // Small delay to avoid rate limiting
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
         Ok(LatestReleasesPage {
@@ -386,12 +408,12 @@ pub async fn latest_releases(
             current_page: 1,
             last_page: 1,
             last_page_camel: 1,
-            total: all_items.len(),
+            total: if total > 0 { total } else { all_items.len() },
             items: all_items.clone(),
             data: all_items,
         })
     } else {
-        // Single page fetch (original behavior)
+        // Single page fetch
         let url = format!("{}?m=airing&page={}", API_URL, page.max(1));
         let json = match client.fetch_json(&url, None, cfg).await {
             Ok(j) => j,
@@ -422,68 +444,9 @@ pub async fn latest_releases(
         let mut items = Vec::new();
         if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
             for it in data {
-                let anime_title = it
-                    .get("anime_title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let anime_session = it
-                    .get("anime_session")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-
-                if anime_title.is_empty() || anime_session.is_empty() {
-                    continue;
+                if let Some(item) = parse_latest_release_item(it) {
+                    items.push(item);
                 }
-
-                items.push(LatestReleaseItem {
-                    id: it.get("id").and_then(|v| v.as_u64()),
-                    anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
-                    anime_title,
-                    anime_session,
-                    episode: it
-                        .get("episode")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
-                        let s = s.trim();
-                        let mut url = if s.starts_with("//") {
-                            format!("https:{}", s)
-                        } else if s.starts_with('/') {
-                            format!("https://animepahe.pw{}", s)
-                        } else if !s.starts_with("http://")
-                            && !s.starts_with("https://")
-                            && !s.is_empty()
-                        {
-                            format!("https://{}", s)
-                        } else {
-                            s.to_string()
-                        };
-                        if url.contains("i.animepahe.ru") {
-                            url = url.replace("i.animepahe.ru", "i.animepahe.com");
-                        } else if url.contains("i.animepahe.si") {
-                            url = url.replace("i.animepahe.si", "i.animepahe.com");
-                        }
-                        url
-                    }),
-                    duration: it
-                        .get("duration")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    session: it
-                        .get("session")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    created_at: it
-                        .get("created_at")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    audio: it
-                        .get("audio")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                });
             }
         }
 
@@ -608,7 +571,7 @@ pub async fn release_with_status(
     }
 
     let mut page_errors = Vec::new();
-    const MAX_RELEASE_PAGES: u32 = 200;
+    const MAX_RELEASE_PAGES: u32 = 100;
     if last_page > MAX_RELEASE_PAGES {
         page_errors.push(format!(
             "only the first {} of {} pages were fetched",
@@ -616,16 +579,28 @@ pub async fn release_with_status(
         ));
     }
 
-    for page in 2..=last_page.min(MAX_RELEASE_PAGES) {
-        match release_page(client, slug, page, cfg).await {
-            Ok((page_items, _)) => {
-                for item in page_items {
-                    if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
-                        all_episodes.push(item);
+    if last_page > 1 {
+        let target_pages: Vec<u32> = (2..=last_page.min(MAX_RELEASE_PAGES)).collect();
+        for chunk in target_pages.chunks(6) {
+            let tasks = chunk.iter().map(|&page| {
+                let c = client.clone();
+                let s = slug.to_string();
+                let cf = cfg.clone();
+                async move { (page, release_page(&c, &s, page, &cf).await) }
+            });
+            let results = futures_util::future::join_all(tasks).await;
+            for (page, res) in results {
+                match res {
+                    Ok((page_items, _)) => {
+                        for item in page_items {
+                            if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
+                                all_episodes.push(item);
+                            }
+                        }
                     }
+                    Err(err) => page_errors.push(format!("page {}: {}", page, err)),
                 }
             }
-            Err(err) => page_errors.push(format!("page {}: {}", page, err)),
         }
     }
 
@@ -865,8 +840,19 @@ pub async fn play_sources(
                                     .unwrap_or("jpn");
                                 let size_str = sub_val
                                     .get("filesize")
-                                    .and_then(|v| v.as_u64())
-                                    .map(format_bytes);
+                                    .and_then(|v| {
+                                        if let Some(n) = v.as_u64() {
+                                            Some(format_bytes(n))
+                                        } else if let Some(s) = v.as_str() {
+                                            if let Ok(n) = s.parse::<u64>() {
+                                                Some(format_bytes(n))
+                                            } else {
+                                                Some(normalize_size_string(s))
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    });
                                 let kwik_url = sub_val
                                     .get("kwik")
                                     .or_else(|| sub_val.get("kwik_pahewin"))
@@ -914,28 +900,47 @@ pub async fn available_options(
     episode_num: &str,
     cfg: &AppConfig,
 ) -> Result<AvailableOptions, String> {
-    let episodes = match release(client, slug, cfg).await {
-        Ok(eps) => eps,
-        Err(e) => {
-            let (cached_eps, _) = load_release_cache_with_meta(slug);
-            if !cached_eps.is_empty() {
-                cached_eps
-            } else {
-                return Err(e);
-            }
-        }
-    };
-    let target = episodes
-        .iter()
-        .find(|e| {
+    // 1. Fast path: check disk cache first!
+    let (cached_eps, _) = load_release_cache_with_meta(slug);
+    let target = if let Some(target_ep) = cached_eps.iter().find(|e| {
+        let ep_str = match &e.episode {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            _ => String::new(),
+        };
+        ep_matches(&ep_str, episode_num)
+    }) {
+        target_ep.clone()
+    } else {
+        // 2. Not in disk cache: fetch page 1 first (most requested episodes are on page 1)
+        let (p1_items, last_page) = release_page(client, slug, 1, cfg).await?;
+        if let Some(target_ep) = p1_items.iter().find(|e| {
             let ep_str = match &e.episode {
                 serde_json::Value::Number(n) => n.to_string(),
                 serde_json::Value::String(s) => s.clone(),
                 _ => String::new(),
             };
             ep_matches(&ep_str, episode_num)
-        })
-        .ok_or_else(|| format!("Episode {} not found for this anime", episode_num))?;
+        }) {
+            if last_page <= 1 && !p1_items.is_empty() {
+                save_release_cache(slug, &p1_items);
+            }
+            target_ep.clone()
+        } else {
+            // 3. Fallback: fetch full release list
+            let list = release(client, slug, cfg).await?;
+            list.into_iter()
+                .find(|e| {
+                    let ep_str = match &e.episode {
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => String::new(),
+                    };
+                    ep_matches(&ep_str, episode_num)
+                })
+                .ok_or_else(|| format!("Episode {} not found for this anime", episode_num))?
+        }
+    };
 
     let sources = match play_sources(client, slug, &target.session, cfg).await {
         Ok(s) => s,
@@ -1491,6 +1496,42 @@ mod tests {
         let s1080 = sources.iter().find(|s| s.resolution == "1080").unwrap();
         assert_eq!(s1080.url, "https://kwik.cx/e/456");
         assert_eq!(s1080.filesize, Some("285 MB".to_string()));
+    }
+
+    #[test]
+    fn parses_latest_release_items_with_dub_sub_labeling() {
+        let dub_item = serde_json::json!({
+            "id": 100,
+            "anime_id": 200,
+            "anime_title": "Solo Leveling (Dub)",
+            "anime_session": "sess1",
+            "episode": 1,
+            "audio": null
+        });
+        let item1 = parse_latest_release_item(&dub_item).unwrap();
+        assert_eq!(item1.audio, Some("dub".to_string()));
+
+        let sub_item = serde_json::json!({
+            "id": 101,
+            "anime_id": 201,
+            "anime_title": "One Piece",
+            "anime_session": "sess2",
+            "episode": 1120,
+            "audio": "jpn"
+        });
+        let item2 = parse_latest_release_item(&sub_item).unwrap();
+        assert_eq!(item2.audio, Some("sub".to_string()));
+
+        let explicit_dub = serde_json::json!({
+            "id": 102,
+            "anime_id": 202,
+            "anime_title": "Bleach",
+            "anime_session": "sess3",
+            "episode": 15,
+            "audio": "eng"
+        });
+        let item3 = parse_latest_release_item(&explicit_dub).unwrap();
+        assert_eq!(item3.audio, Some("dub".to_string()));
     }
 
     #[test]

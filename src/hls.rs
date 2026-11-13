@@ -936,6 +936,89 @@ seg2.ts
     }
 
     #[tokio::test]
+    async fn test_download_encrypted_stream_local_server() {
+        use axum::{routing::get, Router};
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+
+        let key = [0x77u8; 16];
+        let iv1 = (1u128).to_be_bytes();
+        let iv2 = (2u128).to_be_bytes();
+
+        let pt1 = [0x47u8; 188]; // MPEG-TS packet
+        let pt2 = [0x47u8; 188];
+
+        let mut buf1 = [0u8; 256];
+        buf1[..pt1.len()].copy_from_slice(&pt1);
+        let enc1 = Aes128CbcEnc::new((&key).into(), (&iv1).into());
+        let ct1 = enc1
+            .encrypt_padded_mut::<Pkcs7>(&mut buf1, pt1.len())
+            .unwrap()
+            .to_vec();
+
+        let mut buf2 = [0u8; 256];
+        buf2[..pt2.len()].copy_from_slice(&pt2);
+        let enc2 = Aes128CbcEnc::new((&key).into(), (&iv2).into());
+        let ct2 = enc2
+            .encrypt_padded_mut::<Pkcs7>(&mut buf2, pt2.len())
+            .unwrap()
+            .to_vec();
+
+        let key_bytes = key.to_vec();
+        let app = Router::new()
+            .route(
+                "/playlist.m3u8",
+                get(|| async {
+                    r#"#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:1
+#EXT-X-KEY:METHOD=AES-128,URI="key.bin"
+#EXTINF:2.0,
+seg1.ts
+#EXTINF:2.0,
+seg2.ts
+#EXT-X-ENDLIST
+"#
+                }),
+            )
+            .route("/key.bin", get(move || async move { key_bytes }))
+            .route("/seg1.ts", get(move || async move { ct1 }))
+            .route("/seg2.ts", get(move || async move { ct2 }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let downloader = HlsDownloader::new(None);
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let pause_signal = Arc::new(AtomicBool::new(false));
+        let pause_notify = Arc::new(tokio::sync::Notify::new());
+
+        let dest = std::env::temp_dir().join(format!("paheflow_test_{}.mp4", fastrand::u64(..)));
+
+        let m3u8_url = format!("http://127.0.0.1:{}/playlist.m3u8", port);
+        let res = downloader
+            .download_stream(DownloadConfig {
+                m3u8_url,
+                referer: None,
+                dest_path: dest.clone(),
+                replace_existing: true,
+                concurrency: 4,
+                stop_signal,
+                pause_signal,
+                pause_notify,
+                progress_cb: |_| {},
+            })
+            .await;
+
+        assert!(res.is_ok(), "Download failed: {:?}", res);
+        assert!(dest.exists(), "Output file was not created");
+        assert!(dest.metadata().unwrap().len() > 0, "Output file is empty");
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
     #[ignore]
     async fn test_download_live_stream() {
         let downloader = HlsDownloader::new(None);
