@@ -230,7 +230,11 @@ impl HttpClient {
                 {
                     Ok(body) => return Ok(body),
                     Err(err) => {
-                        prefer_flag.store(false, Ordering::Relaxed);
+                        if err.contains("429") || err.to_ascii_lowercase().contains("rate-limit") {
+                            self.enforce_backoff(4000);
+                        } else if !is_cloudflare_error(&err) && !err.contains("403") {
+                            prefer_flag.store(false, Ordering::Relaxed);
+                        }
                         return Err(err);
                     }
                 }

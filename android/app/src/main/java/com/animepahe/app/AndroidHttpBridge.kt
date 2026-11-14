@@ -184,7 +184,8 @@ object AndroidHttpBridge {
             return navResult
         }
 
-        if (origin !in loadedOrigins) {
+        val wasLoaded = origin in loadedOrigins
+        if (!wasLoaded) {
             val originNav = navigateAndRead(wv, "$origin/", null)
             if (!originNav.ok) {
                 loadedOrigins.remove(origin)
@@ -196,12 +197,35 @@ object AndroidHttpBridge {
             loadedOrigins.add(origin)
         }
 
-        val apiResult = runJsFetch(wv, url, referer, origin)
+        var apiResult = runJsFetch(wv, url, referer, origin)
         if (apiResult.ok) {
             if (pendingChallengeOrigin == origin) {
                 pendingChallengeOrigin = null
             }
             return apiResult
+        }
+
+        // If the cached WebView page session went stale (e.g. Cloudflare rotated __cf_bm or a silent
+        // JS token), refresh the origin page once so Cloudflare passes silently before failing.
+        if (wasLoaded && (apiResult.status == 403 || apiResult.cfChallenge || apiResult.status == 0)) {
+            Log.d(TAG, "JS fetch got ${apiResult.status} on cached $origin; refreshing origin page")
+            val refreshNav = navigateAndRead(wv, "$origin/", null)
+            if (refreshNav.ok) {
+                loadedOrigins.add(origin)
+                apiResult = runJsFetch(wv, url, referer, origin)
+                if (apiResult.ok) {
+                    if (pendingChallengeOrigin == origin) {
+                        pendingChallengeOrigin = null
+                    }
+                    return apiResult
+                }
+            } else {
+                loadedOrigins.remove(origin)
+                if (refreshNav.cfChallenge || refreshNav.status == 403) {
+                    pendingChallengeOrigin = origin
+                }
+                return refreshNav
+            }
         }
 
         // Non-API pages (e.g., /play/{slug}/{session}) can require top-level

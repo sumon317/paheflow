@@ -172,8 +172,21 @@
     api.events.onerror = () => { /* reconnect handled by browser */ };
   }
 
+  function isRateLimitError(message) {
+    const text = String(message || "").toLowerCase();
+    return (
+      text.includes("too many requests") ||
+      text.includes("rate-limit") ||
+      text.includes("rate limit") ||
+      text.includes("error code: 1015") ||
+      text.includes("error 1015") ||
+      /\b429\b/.test(text)
+    );
+  }
+
   /* Detect Cloudflare / cookie problems so the UI can point at the fix. */
   function isCloudflareError(message) {
+    if (isRateLimitError(message)) return false;
     const text = String(message || "").toLowerCase();
     return (
       text.includes("cf_clearance") ||
@@ -186,7 +199,26 @@
     );
   }
 
+  const KEEPALIVE_INTERVAL_MS = 3 * 60 * 1000;
+  const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
+  let lastConnectionHealthyAt = 0;
+  let lastKeepaliveProbeAt = 0;
+  let rateLimitCooldownUntil = 0;
+  let keepaliveInFlight = false;
+  let keepaliveTimer = null;
+
+  function markConnectionHealthy() {
+    lastConnectionHealthyAt = Date.now();
+    const banner = $("cookieBanner");
+    if (banner) banner.classList.add("hidden");
+    highlightSolveCfButton(state.config.cfConfigured ? "solved" : "needed");
+  }
+
   function noteApiError(message) {
+    if (isRateLimitError(message)) {
+      rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      return;
+    }
     if (!isCloudflareError(message)) return;
     const banner = $("cookieBanner");
     if (banner) {
@@ -263,17 +295,20 @@
       return false;
     }
 
+    lastKeepaliveProbeAt = Date.now();
     const res = await probeConnection();
     const statusPill = $("statusPill");
     const statusText = $("statusText");
 
     if (res.ok) {
-      const banner = $("cookieBanner");
-      if (banner) banner.classList.add("hidden");
+      markConnectionHealthy();
       showConnectedStatusPill();
-      // Keep Solve Cloudflare green until a Cloudflare error arises
-      highlightSolveCfButton("solved");
       return true;
+    }
+
+    if (isRateLimitError(res.message)) {
+      rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      return false;
     }
 
     if (isCloudflareError(res.message)) {
@@ -284,6 +319,47 @@
       }
     }
     return false;
+  }
+
+  async function runKeepaliveProbeIfDue(forceIfBannerShown = false) {
+    if (!state.config.cfConfigured) return;
+    if (document.visibilityState !== "visible") return;
+    if (state.job?.running || keepaliveInFlight) return;
+    const now = Date.now();
+    if (now < rateLimitCooldownUntil) return;
+
+    const bannerVisible = !!($("cookieBanner") && !$("cookieBanner").classList.contains("hidden"));
+    const minInterval = (forceIfBannerShown && bannerVisible) ? 60 * 1000 : KEEPALIVE_INTERVAL_MS;
+    if (now - lastConnectionHealthyAt < minInterval) return;
+    if (now - lastKeepaliveProbeAt < minInterval) return;
+
+    keepaliveInFlight = true;
+    lastKeepaliveProbeAt = now;
+    try {
+      const res = await probeConnection();
+      if (res.ok) {
+        markConnectionHealthy();
+        showConnectedStatusPill();
+      } else if (isRateLimitError(res.message)) {
+        rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      } else if (isCloudflareError(res.message)) {
+        noteApiError(res.message);
+      }
+    } finally {
+      keepaliveInFlight = false;
+    }
+  }
+
+  function startConnectionKeepalive() {
+    if (keepaliveTimer) return;
+    keepaliveTimer = setInterval(() => {
+      void runKeepaliveProbeIfDue(true);
+    }, 60 * 1000);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        void runKeepaliveProbeIfDue(true);
+      }
+    });
   }
 
   // Highlight or un-highlight the Solve Cloudflare buttons
@@ -878,8 +954,7 @@
       state.recentLastPage = res.lastPage || res.last_page || 1;
       state.recentTotal = res.total ?? state.recentItems.length;
       state.recentLoading = false;
-      $("cookieBanner").classList.add("hidden");
-      if (state.config.cfConfigured) highlightSolveCfButton("solved");
+      markConnectionHealthy();
       if (state.searchMode === "recent") {
         if (!append) {
           renderRecentReleases(true);
@@ -1060,8 +1135,7 @@
       const { items } = await api.get(`/api/search?q=${encodeURIComponent(q)}`);
       state.remoteCatalog = items;
       renderCatalog();
-      $("cookieBanner").classList.add("hidden");
-      if (state.config.cfConfigured) highlightSolveCfButton("solved");
+      markConnectionHealthy();
     } catch (e) {
       toast("Search failed: " + e.message, "error");
       noteApiError(e.message);
@@ -1220,8 +1294,7 @@
         if (res.warning && !res.notFound) {
           toast(res.warning, "warn");
         }
-        $("cookieBanner").classList.add("hidden");
-        if (state.config.cfConfigured) highlightSolveCfButton("solved");
+        markConnectionHealthy();
       }
     } catch (e) {
       if (reqSeq !== state.epRequestSeq) return;
@@ -1923,15 +1996,11 @@
     setBusy(btn, true);
     try {
       const res = await probeConnection();
+      lastKeepaliveProbeAt = Date.now();
       toast(res.ok ? "Connection OK" : "Connection failed: " + res.message, res.ok ? "ok" : "error");
       if (res.ok) {
-        $("cookieBanner").classList.add("hidden");
+        markConnectionHealthy();
         showConnectedStatusPill();
-        if (state.config.cfConfigured) {
-          highlightSolveCfButton("solved");
-        } else {
-          highlightSolveCfButton("needed");
-        }
       } else {
         noteApiError(res.message);
       }
@@ -3324,6 +3393,7 @@
           }
         });
       }
+      startConnectionKeepalive();
       void checkAppUpdates(true);
     } catch (e) {
       toast("Failed to load initial state: " + e.message, "error");
@@ -3901,12 +3971,9 @@
       state.config = normalizeConfig(init.config);
       renderSettings();
     } catch (_) {}
-    const banner = $("cookieBanner");
-    if (banner) banner.classList.add("hidden");
+    markConnectionHealthy();
     closeCfSolverModal();
     showConnectedStatusPill();
-    // Keep Solve Cloudflare green until a Cloudflare error arises
-    highlightSolveCfButton(state.config.cfConfigured ? "solved" : "needed");
     toast("Cloudflare credentials updated!", "ok");
 
     // Auto-resume queue if paused due to Cloudflare verification
