@@ -221,7 +221,10 @@ impl HttpClient {
                 "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
             };
             req = req.header(reqwest::header::USER_AGENT, ua);
-            req = req.header("sec-ch-ua", r#""Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133""#);
+            req = req.header(
+                "sec-ch-ua",
+                r#""Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133""#,
+            );
             req = req.header("sec-ch-ua-mobile", "?1");
             req = req.header("sec-ch-ua-platform", r#""Android""#);
             if url.contains("/api") {

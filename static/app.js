@@ -102,6 +102,11 @@
     config: { ua: "", concurrent_fragments: 8, cfConfigured: false, cfLength: 0 },
     deps: [],
     job: null,
+    queue: [],
+    queueHold: false,
+    queueRenderKey: "",
+    dlGroups: [],
+    logsDrawerOpen: false,
     logSeq: 0,
     lastLogSeq: 0,
     logFilter: "all",
@@ -513,6 +518,7 @@
           </div>
           <div class="result-actions">
             <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
+            ${queueBtnHtml(a.slug, a.title)}
           </div>
         </div>
       `;
@@ -536,6 +542,7 @@
         </div>
         <div class="result-actions">
           <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
+          ${queueBtnHtml(a.slug, a.title)}
         </div>
       </div>
     `;
@@ -776,6 +783,7 @@
         </div>
         <div class="result-actions">
           <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(epNum)}">Open</button>
+          ${queueBtnHtml(session, title)}
         </div>
       </div>
     `;
@@ -1486,6 +1494,7 @@
     const sizeStr = totalSize ? ` (~${totalSize})` : "";
     $("epSubtitle").textContent = `${base} • ${count} selected${sizeStr}${count ? " — " + compressEpisodes(state.episodesSelected) : ""}`;
     $("startBtn").disabled = count === 0;
+    $("queueSelectionBtn").disabled = count === 0;
 
     const pill = $("epCapacityPill");
     if (pill) {
@@ -2048,54 +2057,466 @@
 
   function applyJob(job) {
     state.job = job;
+    if (job && typeof job === "object") {
+      if (Array.isArray(job.queue)) {
+        state.queue = job.queue;
+        state.dlGroups = job.queue.map(e => ({
+          queueId: e.id,
+          slug: e.slug,
+          title: e.title,
+          episodes: e.episodes,
+          status: e.status,
+          error: e.error,
+          epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
+        }));
+      }
+      if (typeof job.queueHold === "boolean") setQueueHold(job.queueHold);
+    }
+    renderQueuePanel();
+    updateQueueCardButtons();
+    renderDlGroups();
+    updateDlOverall();
     updateActionSummary();
     updateProgressUI();
     updateEpStatus();
     updatePlaylistBlock();
   }
 
+  /* ─────────────────────────────────────────────────────────────────
+   *  download queue
+   * ───────────────────────────────────────────────────────────────── */
+
+  const isQueued = (slug) => Boolean(slug) && state.queue.some(e => e.slug === slug);
+
+  function setQueueHold(value) {
+    const previous = state.queueHold;
+    state.queueHold = value;
+    if (value && !previous) toast("Download queue paused — resume it in the Queue tab.", "warn");
+  }
+
+  function audioLabelFor(audio) {
+    if (audio === "eng") return "Dub";
+    if (audio === "jpn") return "Sub";
+    return audio || "";
+  }
+
+  function queueStatusBadge(status, error) {
+    if (status === "downloading") return `<span class="badge ok queue-status">Downloading</span>`;
+    if (status === "failed") return `<span class="badge err queue-status" title="${escapeHtml(error || "Failed")}">${escapeHtml(error || "Failed")}</span>`;
+    return `<span class="badge queue-status">Queued</span>`;
+  }
+
+  function queueSpecMeta(entry) {
+    const parts = [];
+    parts.push(`<span class="badge recent-badge-ep">${entry.episodes === "*" ? "All episodes" : "EP " + escapeHtml(entry.episodes)}</span>`);
+    const bits = [];
+    bits.push(entry.resolution ? escapeHtml(entry.resolution) : "Auto");
+    const audio = audioLabelFor(entry.audio);
+    if (audio) bits.push(audio);
+    if (entry.replace) bits.push("replace");
+    if (entry.listOnly) bits.push("playlist only");
+    parts.push(`<span>${bits.join(" · ")}</span>`);
+    return parts.join(" ");
+  }
+
+  function renderQueuePanel() {
+    const hold = Boolean(state.queueHold);
+    const key = JSON.stringify(state.queue) + "|" + hold;
+    if (key === state.queueRenderKey) return;
+    state.queueRenderKey = key;
+
+    const banner = $("queueHoldBanner");
+    if (banner) banner.classList.toggle("hidden", !hold);
+    const holdBtn = $("queueHoldBtn");
+    if (holdBtn) holdBtn.textContent = hold ? "Resume queue" : "Pause queue";
+
+    const count = $("queueTabCount");
+    if (count) {
+      const pending = state.queue.length;
+      count.textContent = String(pending);
+      count.classList.toggle("hidden", pending === 0);
+    }
+
+    const list = $("queueList");
+    if (!list) return;
+    if (!state.queue.length) {
+      list.innerHTML = `
+        <div class="empty">
+          <p class="empty-title">The queue is empty</p>
+          <p class="empty-text">Use the Queue button on any anime in Browse, or queue your episode selection from the Episodes tab.</p>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = state.queue.map((entry, i) => {
+      const status = entry.status || "queued";
+      return `
+        <div class="queue-row ${status === "downloading" ? "is-downloading" : ""} ${status === "failed" ? "is-failed" : ""}" data-slug="${escapeHtml(entry.slug)}">
+          <div class="queue-pos">${i + 1}</div>
+          <div class="result-main">
+            <div class="result-title">${escapeHtml(entry.title || entry.slug)}</div>
+            <div class="result-meta">
+              ${queueSpecMeta(entry)}
+              ${queueStatusBadge(status, entry.status === "downloading" ? "" : entry.error)}
+            </div>
+          </div>
+          <div class="result-actions">
+            ${status === "downloading"
+              ? `<button class="btn btn-ghost btn-sm" disabled title="Stop the download first">Downloading</button>`
+              : `<button class="btn btn-ghost btn-sm" data-unqueue="${escapeHtml(entry.slug)}" title="Remove from queue">Unqueue</button>`}
+          </div>
+        </div>`;
+    }).join("");
+  }
+
+  function queueBtnHtml(slug, title) {
+    const queued = isQueued(slug);
+    return `<button class="btn btn-ghost btn-sm queue-btn${queued ? " is-queued" : ""}" data-queue-slug="${escapeHtml(slug)}" data-queue-title="${escapeHtml(title)}" title="${queued ? "Remove from download queue" : "Add to download queue (downloads automatically after the current job)"}">${queued ? "Unqueue" : "Queue"}</button>`;
+  }
+
+  function updateQueueCardButtons() {
+    $$(".queue-btn").forEach(btn => {
+      const slug = btn.dataset.queueSlug;
+      const queued = isQueued(slug);
+      const label = queued ? "Unqueue" : "Queue";
+      if (btn.textContent !== label) btn.textContent = label;
+      btn.classList.toggle("is-queued", queued);
+      btn.title = queued ? "Remove from download queue" : "Add to download queue (downloads automatically after the current job)";
+    });
+  }
+
+  function applyQueueResponse(res, fallbackOk, fallbackErr) {
+    if (res && Array.isArray(res.queue)) {
+      state.queue = res.queue;
+      state.dlGroups = res.queue.map(e => ({
+        queueId: e.id,
+        slug: e.slug,
+        title: e.title,
+        episodes: e.episodes,
+        status: e.status,
+        error: e.error,
+        epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
+      }));
+    }
+    if (res && typeof res.queueHold === "boolean") setQueueHold(res.queueHold);
+    renderQueuePanel();
+    updateQueueCardButtons();
+    renderDlGroups();
+    updateDlOverall();
+    if (res && res.message) toast(res.message, fallbackOk || "ok");
+    else if (fallbackErr) toast(fallbackErr, fallbackOk || "ok");
+  }
+
+  function queueAnime(slug, title) {
+    if (!slug) return;
+    api.post("/api/queue", { slug, title: title || slug }).then(res => {
+      applyQueueResponse(res);
+    }).catch(e => toast("Queue failed: " + e.message, "error"));
+  }
+
+  function unqueueAnime(slug) {
+    if (!slug) return;
+    api.post("/api/queue/remove", { slug }).then(res => {
+      applyQueueResponse(res);
+    }).catch(e => toast("Unqueue failed: " + e.message, "error"));
+  }
+
+  function handleQueueCardToggle(btn) {
+    const slug = btn.dataset.queueSlug;
+    const title = btn.dataset.queueTitle;
+    if (isQueued(slug)) unqueueAnime(slug);
+    else queueAnime(slug, title);
+  }
+
+  function queueCurrentSelection() {
+    if (!state.selectedSlug) { toast("Select an anime first", "warn"); return; }
+    const payload = {
+      slug: state.selectedSlug,
+      title: state.selectedTitle,
+      episodes: state.episodesSelected.length ? compressEpisodes(state.episodesSelected) : "*",
+      resolution: $("optResolution").value.trim(),
+      audio: $("optAudio").value.trim(),
+      replace: $("optReplace").checked,
+      listOnly: $("optListOnly").checked,
+    };
+    api.post("/api/queue", payload).then(res => {
+      applyQueueResponse(res);
+    }).catch(e => toast("Queue failed: " + e.message, "error"));
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
+   *  downloads activity & episode management
+   * ───────────────────────────────────────────────────────────────── */
+
+  function renderDlGroups() {
+    const container = $("dlGroups");
+    const empty = $("dlEmpty");
+    if (!container) return;
+
+    const groups = state.dlGroups || [];
+    if (!groups.length) {
+      container.innerHTML = "";
+      container.dataset.renderedStructure = "";
+      if (empty) empty.classList.remove("hidden");
+      return;
+    }
+    if (empty) empty.classList.add("hidden");
+
+    const structureKey = groups.map(g => `${g.queueId}:${(g.epItems || []).map(e => e.epId).join(",")}`).join("|");
+    if (container.dataset.renderedStructure === structureKey) {
+      groups.forEach(group => {
+        const groupEl = container.querySelector(`.dl-group[data-queue-id="${group.queueId}"]`);
+        if (!groupEl) return;
+        const isDownloading = group.status === "downloading";
+        const isFailed = group.status === "failed";
+        groupEl.classList.toggle("is-downloading", isDownloading);
+        groupEl.classList.toggle("is-failed", isFailed);
+
+        const epItems = group.epItems || [];
+        const total = epItems.length;
+        const done = epItems.filter(e => e.status === "done").length;
+        const pct = total > 0 ? Math.round((done / total) * 100) : (isDownloading ? 50 : 0);
+        const barFill = groupEl.querySelector(".dl-group-bar-fill");
+        if (barFill) barFill.style.width = `${pct}%`;
+
+        const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading"].includes(e.status)).every(e => e.status === "paused");
+        const toggleBtn = groupEl.querySelector("[data-group-toggle]");
+        if (toggleBtn) {
+          const expected = allPaused ? "▶ Resume all" : "⏸ Pause all";
+          if (toggleBtn.textContent.trim() !== expected) toggleBtn.textContent = expected;
+        }
+
+        epItems.forEach(ep => {
+          const epEl = groupEl.querySelector(`.dl-ep[data-ep-id="${ep.epId}"]`);
+          if (!epEl) return;
+          const isEpActive = ep.status === "downloading";
+          const isEpDone = ep.status === "done";
+          const isEpPaused = ep.status === "paused";
+          const isEpFailed = ep.status === "failed";
+          const epPct = Math.max(0, Math.min(100, Math.round(ep.percent || 0)));
+
+          epEl.classList.toggle("is-active", isEpActive);
+          epEl.classList.toggle("is-done", isEpDone);
+          epEl.classList.toggle("is-failed", isEpFailed);
+
+          const fill = epEl.querySelector(".progress-fill");
+          if (fill) {
+            fill.style.width = isEpDone ? "100%" : `${epPct}%`;
+            fill.classList.toggle("is-paused", isEpPaused);
+          }
+
+          const detailsEl = epEl.querySelector(".dl-ep-details");
+          if (detailsEl) {
+            let details = "";
+            if (isEpDone) {
+              if (ep.size) details = `<span>${escapeHtml(ep.size)}</span>`;
+            } else if (isEpActive) {
+              const spd = ep.speed ? `⚡ ${escapeHtml(ep.speed)}` : "";
+              const eta = ep.eta ? `⏱ ${escapeHtml(ep.eta)}` : "";
+              details = `<span>${epPct}%</span>` + [spd, eta].filter(Boolean).map(s => `<span>${s}</span>`).join("");
+            }
+            if (detailsEl.innerHTML !== details) detailsEl.innerHTML = details;
+          }
+
+          const metaEl = epEl.querySelector(".dl-ep-meta");
+          if (metaEl) {
+            let statusPill = "";
+            if (isEpDone) statusPill = `<span class="badge ok">✓ Done</span>`;
+            else if (isEpActive) statusPill = `<span class="badge ok" style="animation: queuePulse 1.8s infinite;">Downloading</span>`;
+            else if (isEpPaused) statusPill = `<span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);">Paused</span>`;
+            else if (isEpFailed) statusPill = `<span class="badge err" title="${escapeHtml(ep.error || "Failed")}">✗ Failed</span>`;
+            else statusPill = `<span class="badge">Queued</span>`;
+            if (metaEl.innerHTML !== statusPill) metaEl.innerHTML = statusPill;
+          }
+
+          const ctrlEl = epEl.querySelector(".dl-ep-ctrl");
+          if (ctrlEl) {
+            const key = ep.status + ":" + isEpActive;
+            if (ctrlEl.dataset.key !== key) {
+              ctrlEl.dataset.key = key;
+              let ctrlHtml = "";
+              if (isEpActive) {
+                ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-pause="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Pause episode">⏸</button>`;
+              } else if (isEpPaused) {
+                ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-resume="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Start / resume episode">▶</button>`;
+              } else if (ep.status === "queued") {
+                ctrlHtml = `
+                  <button class="btn btn-ghost btn-sm btn-icon" data-ep-pause="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Pause episode">⏸</button>
+                  <button class="btn btn-ghost btn-sm btn-icon" data-ep-move-up="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Move up in priority">↑</button>
+                `;
+              }
+              ctrlHtml += `<button class="btn btn-ghost btn-sm btn-icon" data-ep-remove="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Remove episode">✕</button>`;
+              ctrlEl.innerHTML = ctrlHtml;
+            }
+          }
+        });
+      });
+      return;
+    }
+
+    container.dataset.renderedStructure = structureKey;
+    container.innerHTML = groups.map(group => {
+      const isDownloading = group.status === "downloading";
+      const isFailed = group.status === "failed";
+      const epItems = group.epItems || [];
+      const total = epItems.length;
+      const done = epItems.filter(e => e.status === "done").length;
+      const pct = total > 0 ? Math.round((done / total) * 100) : (isDownloading ? 50 : 0);
+      const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading"].includes(e.status)).every(e => e.status === "paused");
+
+      const epsHtml = epItems.map(ep => {
+        const isEpActive = ep.status === "downloading";
+        const isEpDone = ep.status === "done";
+        const isEpPaused = ep.status === "paused";
+        const isEpFailed = ep.status === "failed";
+        const isEpQueued = ep.status === "queued";
+        const epPct = Math.max(0, Math.min(100, Math.round(ep.percent || 0)));
+
+        let statusPill = "";
+        let details = "";
+        if (isEpDone) {
+          statusPill = `<span class="badge ok">✓ Done</span>`;
+          if (ep.size) details = `<span>${escapeHtml(ep.size)}</span>`;
+        } else if (isEpActive) {
+          statusPill = `<span class="badge ok" style="animation: queuePulse 1.8s infinite;">Downloading</span>`;
+          const spd = ep.speed ? `⚡ ${escapeHtml(ep.speed)}` : "";
+          const eta = ep.eta ? `⏱ ${escapeHtml(ep.eta)}` : "";
+          details = [spd, eta].filter(Boolean).map(s => `<span>${s}</span>`).join("");
+        } else if (isEpPaused) {
+          statusPill = `<span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);">Paused</span>`;
+        } else if (isEpFailed) {
+          statusPill = `<span class="badge err" title="${escapeHtml(ep.error || "Failed")}">✗ Failed</span>`;
+        } else {
+          statusPill = `<span class="badge">Queued</span>`;
+        }
+
+        let ctrlHtml = "";
+        if (isEpActive) {
+          ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-pause="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Pause episode">⏸</button>`;
+        } else if (isEpPaused) {
+          ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-resume="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Start / resume episode">▶</button>`;
+        } else if (isEpQueued) {
+          ctrlHtml = `
+            <button class="btn btn-ghost btn-sm btn-icon" data-ep-pause="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Pause episode">⏸</button>
+            <button class="btn btn-ghost btn-sm btn-icon" data-ep-move-up="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Move up in priority">↑</button>
+          `;
+        }
+        ctrlHtml += `<button class="btn btn-ghost btn-sm btn-icon" data-ep-remove="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Remove episode">✕</button>`;
+
+        return `
+          <div class="dl-ep ${isEpActive ? "is-active" : ""} ${isEpDone ? "is-done" : ""} ${isEpFailed ? "is-failed" : ""}" data-ep-id="${escapeHtml(ep.epId)}">
+            <div class="dl-ep-label">${escapeHtml(ep.label || ("EP " + ep.epId))}</div>
+            <div class="dl-ep-bar">
+              <div class="progress-track">
+                <div class="progress-fill ${isEpPaused ? "is-paused" : ""}" style="width: ${isEpDone ? 100 : epPct}%;"></div>
+              </div>
+              <div class="dl-ep-details">
+                <span>${isEpActive ? epPct + "%" : (isEpDone ? "100%" : "")}</span>
+                ${details}
+              </div>
+            </div>
+            <div class="dl-ep-meta">
+              ${statusPill}
+            </div>
+            <div class="dl-ep-ctrl">
+              ${ctrlHtml}
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      return `
+        <div class="dl-group ${isDownloading ? "is-downloading" : ""} ${isFailed ? "is-failed" : ""}" data-queue-id="${group.queueId}">
+          <div class="dl-group-head">
+            <div class="dl-group-info">
+              <span class="dl-group-title" title="${escapeHtml(group.title || group.slug)}">${escapeHtml(group.title || group.slug)}</span>
+              ${queueStatusBadge(group.status, group.error)}
+            </div>
+            <div class="dl-group-actions">
+              <button class="btn btn-ghost btn-sm" data-group-toggle="${group.queueId}" title="${allPaused ? "Resume all episodes" : "Pause all episodes"}">
+                ${allPaused ? "▶ Resume all" : "⏸ Pause all"}
+              </button>
+              <button class="btn btn-ghost btn-sm" data-group-cancel="${group.queueId}" title="Cancel and remove anime from queue">
+                ✕ Cancel
+              </button>
+            </div>
+          </div>
+          <div class="dl-group-bar">
+            <div class="dl-group-bar-fill" style="width: ${pct}%;"></div>
+          </div>
+          <div class="dl-eps">
+            ${epsHtml || `<div style="padding: 10px; font-size: 11.5px; color: var(--text-faint); text-align: center;">Episodes will appear once catalog resolves...</div>`}
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  function updateDlOverall() {
+    const groups = state.dlGroups || [];
+    const allEps = groups.flatMap(g => g.epItems || []);
+    const total = allEps.length;
+    const done = allEps.filter(e => e.status === "done").length;
+    const active = allEps.find(e => e.status === "downloading");
+    const activeGroup = groups.find(g => g.status === "downloading");
+
+    const label = $("dlOverallLabel");
+    const pct = $("dlOverallPercent");
+    const fill = $("dlOverallFill");
+    const eps = $("dlOverallEps");
+    const spd = $("dlOverallSpeed");
+
+    if (!groups.length) {
+      if (label) label.textContent = "No active downloads";
+      if (pct) pct.textContent = "";
+      if (fill) fill.style.width = "0%";
+      if (eps) eps.textContent = "";
+      if (spd) spd.textContent = "";
+      return;
+    }
+
+    const overallPct = total > 0 ? Math.round((done / total) * 100) : 0;
+    if (fill) {
+      fill.style.width = `${overallPct}%`;
+      fill.classList.toggle("is-paused", Boolean(state.job?.paused));
+    }
+    if (pct) pct.textContent = `${overallPct}%`;
+
+    if (active) {
+      if (label) label.textContent = `Downloading ${escapeHtml(activeGroup?.title || "anime")} · ${escapeHtml(active.label || ("EP " + active.epId))}`;
+      const speedStr = active.speed ? `⚡ ${active.speed}` : (state.job?.progress?.speed ? `⚡ ${state.job.progress.speed}` : "");
+      const etaStr = active.eta ? `⏱ ETA ${active.eta}` : (state.job?.progress?.eta ? `⏱ ETA ${state.job.progress.eta}` : "");
+      if (spd) spd.textContent = [speedStr, etaStr].filter(Boolean).join(" · ");
+    } else if (state.job?.paused || state.queueHold) {
+      if (label) label.textContent = "Downloads paused";
+      if (spd) spd.textContent = "⏸ Paused";
+    } else if (done === total && total > 0) {
+      if (label) label.textContent = "All downloads completed";
+      if (spd) spd.textContent = "✓ Completed";
+    } else {
+      if (label) label.textContent = `${total - done} episode(s) queued`;
+      if (spd) spd.textContent = "Queued";
+    }
+
+    if (eps) eps.textContent = total > 0 ? `📦 ${done}/${total} episodes completed` : `${groups.length} anime in queue`;
+  }
+
   function updateProgressUI() {
     updateActionBarVisibility();
     if (!state.job || !state.job.running) {
-      $("progressLabel").textContent = "Idle";
-      $("progressPercent").textContent = "—";
-      $("progressFill").style.width = "0%";
-      $("progressFill").classList.remove("is-paused");
-      $("progressEpisode").textContent = "";
-      $("progressSpeed").textContent = "";
-      $("progressEta").textContent = "";
-      updatePill("idle");
+      updatePill(state.job?.exitCode === 0 ? "done" : (state.job?.exitCode !== null && state.job?.exitCode !== undefined ? "error" : "idle"));
       return;
     }
-    const p = state.job.progress || {};
-    if (state.job.paused) {
-      $("progressLabel").textContent = "Paused";
-      $("progressFill").classList.add("is-paused");
-      $("progressSpeed").textContent = "⏸ Paused";
-      updatePill("paused");
-    } else {
-      $("progressFill").classList.remove("is-paused");
-      if (p.percent !== null && p.percent !== undefined) {
-        $("progressFill").style.width = Math.max(0, Math.min(100, p.percent)) + "%";
-        $("progressPercent").textContent = p.percent.toFixed(1) + "%";
-        $("progressLabel").textContent = "Downloading…";
-      } else {
-        $("progressFill").style.width = "0%";
-        $("progressPercent").textContent = "—";
-        $("progressLabel").textContent = state.job.progress?.file ? "Starting…" : "Downloading…";
-      }
-      $("progressSpeed").textContent = state.job.progress?.speed ? "⚡ " + state.job.progress.speed : "";
-      updatePill("running");
-    }
-    $("progressEpisode").textContent = state.job.progress?.file ? "💾 " + state.job.progress.file.split("/").pop() : "";
-    $("progressEta").textContent = state.job.progress?.eta ? "⏱ " + state.job.progress.eta : "";
+    updatePill(state.job.paused ? "paused" : "running");
   }
 
   function updateEpStatus() {
+    const el = $("epStatus");
+    if (!el) return;
     if (!state.job) {
       if (state.epStatusKey !== "") {
         state.epStatusKey = "";
-        $("epStatus").innerHTML = "";
+        el.innerHTML = "";
       }
       return;
     }
@@ -2107,7 +2528,7 @@
     (ep.completed || []).forEach(e => chips.push(`<span class="ep-chip">E${escapeHtml(e)} ✓</span>`));
     (ep.failed || []).forEach(e => chips.push(`<span class="ep-chip failed">E${escapeHtml(e)} ✗</span>`));
     if (ep.current && !(ep.completed || []).includes(ep.current)) chips.push(`<span class="ep-chip">E${escapeHtml(ep.current)} ↻</span>`);
-    $("epStatus").innerHTML = chips.join("");
+    el.innerHTML = chips.join("");
   }
 
   function updatePlaylistBlock() {
@@ -2267,20 +2688,26 @@
       debug: $("optDebug").checked,
     };
     api.post("/api/run", payload).then(res => {
+      if (res.queued) {
+        toast(res.message || "Added to download queue", "ok");
+      }
       applyJob(res.job);
       state.lastDoneJob = "";
       // Remove the previous job's lines, but keep any new lines that the SSE
       // stream already delivered while this request was in flight.
-      const clearThrough = Number(res.job.logSeq || 0);
+      const clearThrough = Number(res.job?.logSeq || 0);
       logQueue = logQueue.filter(entry => Number(entry.seq || 0) > clearThrough);
       state.lastLogSeq = Math.max(state.lastLogSeq, clearThrough);
       $$(".log-line", $("logs")).forEach(line => {
         if (Number(line.dataset.seq || 0) <= clearThrough) line.remove();
       });
-      $("startBtn").textContent = "Pause";
-      $("startBtn").disabled = false;
-      $("stopBtn").disabled = false;
-      updatePill("running");
+      if (!res.queued) {
+        $("startBtn").textContent = "Pause";
+        $("startBtn").disabled = false;
+        $("stopBtn").disabled = false;
+        updatePill("running");
+      }
+      toggleActivityPanel(true);
     }).catch(e => toast("Start failed: " + e.message, "error"));
   }
 
@@ -2453,10 +2880,29 @@
   }
   window.toggleActivityPanel = toggleActivityPanel;
 
+  function toggleLogsDrawer(forceState = null) {
+    const drawer = $("logsDrawer");
+    if (!drawer) return;
+    if (forceState !== null) {
+      state.logsDrawerOpen = Boolean(forceState);
+    } else {
+      state.logsDrawerOpen = !state.logsDrawerOpen;
+    }
+    drawer.classList.toggle("is-open", state.logsDrawerOpen);
+    drawer.setAttribute("aria-hidden", String(!state.logsDrawerOpen));
+  }
+  window.toggleLogsDrawer = toggleLogsDrawer;
+
   // Handle back button/gesture - returns action taken:
   // "handled" - back was handled (closed panel, went back in tab history, or web history)
   // "exit" - no more history, app should show exit confirmation
   function handleBackPress() {
+    // 0. Close logs drawer if open
+    if (state.logsDrawerOpen) {
+      toggleLogsDrawer(false);
+      return "handled";
+    }
+
     // 1. Close mobile activity panel if open
     const isMobile = window.innerWidth <= 900;
     if (isMobile && document.body.classList.contains("show-mobile-activity")) {
@@ -2499,12 +2945,112 @@
     const resultsList = $("resultsList");
     if (resultsList) {
       resultsList.addEventListener("click", (e) => {
+        const queueBtn = e.target.closest(".queue-btn");
+        if (queueBtn) {
+          handleQueueCardToggle(queueBtn);
+          return;
+        }
         const card = e.target.closest(".result");
         if (!card) return;
         if (card.classList.contains("recent")) {
           selectRecentEpisode(card.dataset.session, card.dataset.title, card.dataset.ep);
         } else if (card.dataset.slug) {
           selectAnime(card.dataset.slug);
+        }
+      });
+    }
+
+    // delegated clicks for the queue list
+    const queueList = $("queueList");
+    if (queueList) {
+      queueList.addEventListener("click", (e) => {
+        const removeBtn = e.target.closest("[data-unqueue]");
+        if (removeBtn) unqueueAnime(removeBtn.dataset.unqueue);
+      });
+    }
+
+    // delegated clicks for dlGroups (Seal/YTDLnis-style downloads manager)
+    const dlGroups = $("dlGroups");
+    if (dlGroups) {
+      dlGroups.addEventListener("click", async (e) => {
+        const pauseBtn = e.target.closest("[data-ep-pause]");
+        if (pauseBtn) {
+          const queueId = Number(pauseBtn.dataset.queueId);
+          const epId = pauseBtn.dataset.epPause;
+          try {
+            const res = await api.post("/api/queue/ep/pause", { queueId, epId });
+            applyQueueResponse(res);
+          } catch (err) {
+            toast("Failed to pause episode: " + err.message, "error");
+          }
+          return;
+        }
+
+        const resumeBtn = e.target.closest("[data-ep-resume]");
+        if (resumeBtn) {
+          const queueId = Number(resumeBtn.dataset.queueId);
+          const epId = resumeBtn.dataset.epResume;
+          try {
+            const res = await api.post("/api/queue/ep/resume", { queueId, epId });
+            applyQueueResponse(res);
+          } catch (err) {
+            toast("Failed to resume episode: " + err.message, "error");
+          }
+          return;
+        }
+
+        const removeBtn = e.target.closest("[data-ep-remove]");
+        if (removeBtn) {
+          const queueId = Number(removeBtn.dataset.queueId);
+          const epId = removeBtn.dataset.epRemove;
+          try {
+            const res = await api.post("/api/queue/ep/remove", { queueId, epId });
+            applyQueueResponse(res);
+          } catch (err) {
+            toast("Failed to remove episode: " + err.message, "error");
+          }
+          return;
+        }
+
+        const moveUpBtn = e.target.closest("[data-ep-move-up]");
+        if (moveUpBtn) {
+          const queueId = Number(moveUpBtn.dataset.queueId);
+          const epId = moveUpBtn.dataset.epMoveUp;
+          try {
+            const res = await api.post("/api/queue/ep/move-up", { queueId, epId });
+            applyQueueResponse(res);
+          } catch (err) {
+            toast("Failed to move episode: " + err.message, "error");
+          }
+          return;
+        }
+
+        const toggleGroupBtn = e.target.closest("[data-group-toggle]");
+        if (toggleGroupBtn) {
+          const queueId = Number(toggleGroupBtn.dataset.groupToggle);
+          const group = (state.dlGroups || []).find(g => g.queueId === queueId);
+          const epItems = group?.epItems || [];
+          const allPaused = epItems.length > 0 && epItems.filter(i => ["queued", "paused", "downloading"].includes(i.status)).every(i => i.status === "paused");
+          const endpoint = allPaused ? "/api/queue/group/resume" : "/api/queue/group/pause";
+          try {
+            const res = await api.post(endpoint, { queueId });
+            applyQueueResponse(res);
+          } catch (err) {
+            toast("Failed to update anime: " + err.message, "error");
+          }
+          return;
+        }
+
+        const cancelGroupBtn = e.target.closest("[data-group-cancel]");
+        if (cancelGroupBtn) {
+          const queueId = Number(cancelGroupBtn.dataset.groupCancel);
+          try {
+            const res = await api.post("/api/queue/remove", { queueId });
+            applyQueueResponse(res);
+          } catch (err) {
+            toast("Failed to cancel anime: " + err.message, "error");
+          }
+          return;
         }
       });
     }
@@ -2683,6 +3229,9 @@
     if (closeBtn) {
       closeBtn.onclick = () => toggleActivityPanel(false);
     }
+    if ($("logsDrawerBtn")) $("logsDrawerBtn").onclick = () => toggleLogsDrawer(true);
+    if ($("closeLogsDrawer")) $("closeLogsDrawer").onclick = () => toggleLogsDrawer(false);
+    if ($("logsDrawerBackdrop")) $("logsDrawerBackdrop").onclick = () => toggleLogsDrawer(false);
     $$(".log-filters .chip").forEach(btn => btn.onclick = () => {
       state.logFilter = btn.dataset.level;
       $$(".log-filters .chip").forEach(b => b.classList.toggle("is-active", b === btn));
@@ -2696,6 +3245,20 @@
     // actions
     $("startBtn").onclick = handleMainAction;
     $("stopBtn").onclick = stopJob;
+    $("queueSelectionBtn").onclick = queueCurrentSelection;
+    $("queueHoldBtn").onclick = () => {
+      const url = state.queueHold ? "/api/queue/resume" : "/api/queue/pause";
+      api.post(url, {}).then(res => applyQueueResponse(res)).catch(e => toast("Queue update failed: " + e.message, "error"));
+    };
+    $("queueResumeBtn").onclick = () => {
+      api.post("/api/queue/resume", {}).then(res => {
+        applyQueueResponse(res);
+        toast("Queue resumed", "ok");
+      }).catch(e => toast("Queue resume failed: " + e.message, "error"));
+    };
+    $("queueClearBtn").onclick = () => {
+      api.post("/api/queue/clear", {}).then(res => applyQueueResponse(res, "info")).catch(e => toast("Clear failed: " + e.message, "error"));
+    };
 
     // copy slug
     $("copySlug").onclick = () => { if (state.selectedSlug) copyToClip(state.selectedSlug, "Slug copied"); };
@@ -2753,9 +3316,16 @@
         e.preventDefault();
         $("searchInput").focus();
         $("searchInput").select();
-      } else if (e.key === "Escape" && document.activeElement === $("searchInput")) {
-        $("searchInput").value = "";
-        setCatalogMode("local");
+      } else if (e.key === "Escape") {
+        if (state.logsDrawerOpen) {
+          e.preventDefault();
+          toggleLogsDrawer(false);
+          return;
+        }
+        if (document.activeElement === $("searchInput")) {
+          $("searchInput").value = "";
+          setCatalogMode("local");
+        }
       }
     });
   }

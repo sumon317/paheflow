@@ -47,6 +47,10 @@ Whether running as an APK on your phone or as a lightweight desktop service on L
   - Companion browser extension (`tools/extension`) for 1-click Cloudflare cookie synchronization on desktop.
 - 📚 **Library & File Manager**:
   - Built-in video library with safe deletion guards, folder organization, and direct playback launching.
+- 📥 **Download Queue**:
+  - Queue anime from Browse (whole series) or queue the current episode selection with its options from the Episodes tab.
+  - A background pump downloads queued anime one after another; the queue pauses on manual stop or after repeated failures and resumes from the Queue tab.
+  - Persists across restarts in `queue.json`.
 
 ---
 
@@ -145,6 +149,8 @@ Settings are saved in `config.json` (created automatically with restricted `0600
   "download_dir": "/path/to/downloads"
 }
 ```
+
+The download queue is stored next to it in `queue.json`; remove it to reset the queue.
 
 ### Storage Fallback Hierarchy (Android)
 On Android 11+, system Scoped Storage can prevent arbitrary file creation under `/storage/emulated/0/Download`. PaheFlow utilizes a 3-tier fallback strategy:

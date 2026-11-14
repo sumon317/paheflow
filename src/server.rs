@@ -61,6 +61,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/logs", get(get_logs))
         .route("/api/events", get(get_events))
         .route("/api/run", post(post_run))
+        .route("/api/queue", post(post_queue))
+        .route("/api/queue/remove", post(post_queue_remove))
+        .route("/api/queue/clear", post(post_queue_clear))
+        .route("/api/queue/pause", post(post_queue_pause))
+        .route("/api/queue/resume", post(post_queue_resume))
+        .route("/api/queue/ep/pause", post(post_queue_ep_pause))
+        .route("/api/queue/ep/resume", post(post_queue_ep_resume))
+        .route("/api/queue/ep/remove", post(post_queue_ep_remove))
+        .route("/api/queue/ep/move-up", post(post_queue_ep_move_up))
+        .route("/api/queue/group/pause", post(post_queue_group_pause))
+        .route("/api/queue/group/resume", post(post_queue_group_resume))
         .route("/api/pause", post(post_pause))
         .route("/api/resume", post(post_resume))
         .route("/api/stop", post(post_stop))
@@ -1109,6 +1120,29 @@ async fn post_run(
             Json(serde_json::json!({ "error": "Invalid token" })),
         ));
     }
+    let is_running = {
+        let snap = state.runner.snapshot(false).await;
+        snap.running
+    };
+    if is_running {
+        match state.runner.queue_add(&body).await {
+            Ok((message, _)) => {
+                let snap = state.runner.snapshot(false).await;
+                return Ok(Json(serde_json::json!({
+                    "ok": true,
+                    "queued": true,
+                    "message": message,
+                    "job": snap,
+                })));
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e })),
+                ));
+            }
+        }
+    }
     match state.runner.start(body, state.client.clone()).await {
         Ok(job) => Ok(Json(serde_json::json!({ "ok": true, "job": job }))),
         Err(e) => Err((
@@ -1116,6 +1150,352 @@ async fn post_run(
             Json(serde_json::json!({ "error": e })),
         )),
     }
+}
+
+async fn queue_payload(state: &AppState) -> serde_json::Value {
+    let snap = state.runner.snapshot(false).await;
+    serde_json::json!({ "queue": snap.queue, "queueHold": snap.queue_hold })
+}
+
+async fn post_queue(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    match state.runner.queue_add(&body).await {
+        Ok((message, updated)) => {
+            let mut payload = queue_payload(&state).await;
+            payload["ok"] = serde_json::json!(true);
+            payload["message"] = serde_json::json!(message);
+            payload["updated"] = serde_json::json!(updated);
+            Ok(Json(payload))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )),
+    }
+}
+
+async fn post_queue_remove(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let slug = body
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let queue_id = body
+        .get("queueId")
+        .or_else(|| body.get("id"))
+        .and_then(|v| v.as_u64());
+
+    if slug.is_empty() && queue_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "No slug or queueId provided" })),
+        ));
+    }
+
+    let remove_result = if let Some(qid) = queue_id {
+        let q = state.runner.snapshot(false).await.queue;
+        if let Some(target) = q.iter().find(|e| e.id == qid) {
+            state.runner.queue_remove(&target.slug).await
+        } else {
+            Err("Queue entry not found.".to_string())
+        }
+    } else {
+        state.runner.queue_remove(&slug).await
+    };
+
+    match remove_result {
+        Ok(title) => {
+            let mut payload = queue_payload(&state).await;
+            payload["ok"] = serde_json::json!(true);
+            payload["message"] = serde_json::json!(format!("Removed '{}' from the queue.", title));
+            Ok(Json(payload))
+        }
+        Err(e) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e })),
+        )),
+    }
+}
+
+async fn post_queue_clear(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let removed = state.runner.queue_clear().await;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    payload["removed"] = serde_json::json!(removed);
+    Ok(Json(payload))
+}
+
+async fn post_queue_pause(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    state.runner.queue_set_hold(true).await;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
+}
+
+async fn post_queue_resume(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    state.runner.queue_set_hold(false).await;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
+}
+
+fn parse_ep_body(body: &serde_json::Value) -> Result<(u64, String), String> {
+    let queue_id = body
+        .get("queueId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "Missing or invalid queueId".to_string())?;
+    let ep_id = body
+        .get("epId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing or invalid epId".to_string())?;
+    Ok((queue_id, ep_id))
+}
+
+async fn post_queue_ep_pause(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let (queue_id, ep_id) = parse_ep_body(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })?;
+    state
+        .runner
+        .queue_ep_set_status(queue_id, &ep_id, "paused")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
+}
+
+async fn post_queue_ep_resume(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let (queue_id, ep_id) = parse_ep_body(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })?;
+    state
+        .runner
+        .queue_ep_set_status(queue_id, &ep_id, "queued")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
+}
+
+async fn post_queue_ep_remove(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let (queue_id, ep_id) = parse_ep_body(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })?;
+    state
+        .runner
+        .queue_ep_remove(queue_id, &ep_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
+}
+
+async fn post_queue_ep_move_up(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let (queue_id, ep_id) = parse_ep_body(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+    })?;
+    state
+        .runner
+        .queue_ep_move_up(queue_id, &ep_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
+}
+
+async fn post_queue_group_pause(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let queue_id = body
+        .get("queueId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Missing or invalid queueId" })),
+            )
+        })?;
+    state
+        .runner
+        .queue_group_set_status(queue_id, "paused")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
+}
+
+async fn post_queue_group_resume(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let queue_id = body
+        .get("queueId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Missing or invalid queueId" })),
+            )
+        })?;
+    state
+        .runner
+        .queue_group_set_status(queue_id, "queued")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+    let mut payload = queue_payload(&state).await;
+    payload["ok"] = serde_json::json!(true);
+    Ok(Json(payload))
 }
 
 async fn post_pause(
@@ -1513,6 +1893,13 @@ pub async fn serve_on_listener(
     client: HttpClient,
 ) -> Result<(), String> {
     let token = generate_token();
+
+    let pump_runner = runner.clone();
+    let pump_client = client.clone();
+    tokio::spawn(async move {
+        pump_runner.run_queue_pump(pump_client).await;
+    });
+
     let state = Arc::new(AppState {
         client,
         runner,

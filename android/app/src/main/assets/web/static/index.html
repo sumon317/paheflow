@@ -24,6 +24,7 @@
     <nav class="tabs" role="tablist">
       <button class="tab is-active" data-tab="browse" role="tab">Browse</button>
       <button class="tab" data-tab="episodes" role="tab">Episodes</button>
+      <button class="tab" data-tab="queue" role="tab">Queue<span class="tab-badge hidden" id="queueTabCount">0</span></button>
       <button class="tab" data-tab="settings" role="tab">Settings</button>
     </nav>
 
@@ -230,6 +231,36 @@
       </div>
     </section>
 
+    <!-- ──────────────────────────────  QUEUE  ────────────────────────────── -->
+    <section class="panel" id="panel-queue">
+      <div class="panel-head">
+        <div>
+          <h2>Download queue</h2>
+          <p class="panel-sub">Queued anime are downloaded one after another, automatically. Adding to the queue resumes it.</p>
+        </div>
+        <div class="panel-actions">
+          <button class="btn btn-ghost btn-sm" id="queueHoldBtn" title="Pause or resume the automatic queue">Pause queue</button>
+          <button class="btn btn-ghost btn-sm" id="queueClearBtn" title="Remove all queued and failed entries">Clear queue</button>
+        </div>
+      </div>
+
+      <div class="banner hidden" id="queueHoldBanner" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.1);">
+        <div class="banner-icon" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b;">⏸</div>
+        <div class="banner-body">
+          <strong>Queue paused</strong>
+          <span>Auto-download is on hold, often because a download was stopped. Resume to continue with the next queued anime.</span>
+        </div>
+        <button class="btn btn-primary btn-sm" id="queueResumeBtn" style="background: #f59e0b; border-color: #f59e0b; color: #000; font-weight: 600;">▶ Resume queue</button>
+      </div>
+
+      <div class="queue-list" id="queueList">
+        <div class="empty">
+          <p class="empty-title">The queue is empty</p>
+          <p class="empty-text">Use the Queue button on any anime in Browse, or queue your episode selection from the Episodes tab.</p>
+        </div>
+      </div>
+    </section>
+
     <!-- ────────────────────────────  SETTINGS  ──────────────────────────── -->
     <section class="panel" id="panel-settings">
       <div class="panel-head">
@@ -407,7 +438,7 @@
       <div class="card danger-zone">
         <div class="card-head"><h3>Maintenance</h3></div>
         <div class="settings-actions no-margin">
-          <button class="btn btn-ghost" id="clearLogs">Clear activity log</button>
+          <button class="btn btn-ghost" id="openLogsSettings">Open activity log</button>
           <button class="btn btn-ghost" id="copyConfig">Copy config.json</button>
         </div>
         <div class="settings-actions" style="margin-top: 10px;">
@@ -427,26 +458,24 @@
   <!-- ─────────────────────────────  ACTIVITY  ───────────────────────────── -->
   <aside class="activity" id="activityPanel">
     <div class="activity-head">
-      <h3>Activity</h3>
+      <h3>Downloads</h3>
       <div class="activity-head-actions">
-        <button class="btn btn-ghost btn-sm" id="clearLogsTop" title="Clear the log">Clear</button>
-        <button class="btn btn-ghost btn-sm" id="copyLogs" title="Copy the log">Copy</button>
+        <button class="btn btn-ghost btn-sm" id="logsDrawerBtn" title="View activity logs">Logs</button>
         <button class="btn btn-ghost btn-sm btn-icon" id="closeActivity" title="Hide activity panel" aria-label="Close activity panel">✕</button>
       </div>
     </div>
 
-    <div class="progress-block">
-      <div class="progress-head">
-        <span id="progressLabel">Idle</span>
-        <span id="progressPercent" class="progress-percent">—</span>
+    <!-- Overall progress bar -->
+    <div class="dl-overall" id="dlOverall">
+      <div class="dl-overall-row">
+        <span id="dlOverallLabel">No active downloads</span>
+        <span id="dlOverallPercent" class="progress-percent"></span>
       </div>
-      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-      <div class="progress-meta">
-        <span id="progressEpisode"></span>
-        <span id="progressSpeed"></span>
-        <span id="progressEta"></span>
+      <div class="progress-track"><div class="progress-fill" id="dlOverallFill"></div></div>
+      <div class="dl-overall-meta">
+        <span id="dlOverallEps"></span>
+        <span id="dlOverallSpeed"></span>
       </div>
-      <div class="ep-status" id="epStatus"></div>
     </div>
 
     <div class="playlist-block hidden" id="playlistBlock">
@@ -457,22 +486,44 @@
       <div id="playlistList"></div>
     </div>
 
-    <div class="log-head">
-      <div class="log-filters">
-        <button class="chip is-active" data-level="all">All</button>
-        <button class="chip" data-level="info">Info</button>
-        <button class="chip" data-level="warn">Warn</button>
-        <button class="chip" data-level="error">Error</button>
-        <button class="chip" data-level="debug">Debug</button>
-      </div>
-      <label class="autoscroll">
-        <input type="checkbox" id="autoscroll" checked />
-        <span>Follow</span>
-      </label>
-    </div>
+    <!-- Per-anime download groups (rendered by JS) -->
+    <div id="dlGroups"></div>
 
-    <div class="logs" id="logs"></div>
+    <!-- Empty state -->
+    <div class="dl-empty" id="dlEmpty">
+      <p class="empty-title">No downloads</p>
+      <p class="empty-text">Queue episodes from the Episodes tab or use the Queue button on any anime.</p>
+    </div>
   </aside>
+
+  <!-- Logs drawer (slide-over) -->
+  <div class="logs-drawer" id="logsDrawer" aria-hidden="true">
+    <div class="logs-drawer-backdrop" id="logsDrawerBackdrop"></div>
+    <div class="logs-drawer-panel">
+      <div class="logs-drawer-head">
+        <h3>Activity Log</h3>
+        <div class="logs-drawer-actions">
+          <button class="btn btn-ghost btn-sm" id="clearLogsTop" title="Clear the log">Clear</button>
+          <button class="btn btn-ghost btn-sm" id="copyLogs" title="Copy the log">Copy</button>
+          <button class="btn btn-ghost btn-sm btn-icon" id="closeLogsDrawer" title="Close">✕</button>
+        </div>
+      </div>
+      <div class="log-head">
+        <div class="log-filters">
+          <button class="chip is-active" data-level="all">All</button>
+          <button class="chip" data-level="info">Info</button>
+          <button class="chip" data-level="warn">Warn</button>
+          <button class="chip" data-level="error">Error</button>
+          <button class="chip" data-level="debug">Debug</button>
+        </div>
+        <label class="autoscroll">
+          <input type="checkbox" id="autoscroll" checked />
+          <span>Follow</span>
+        </label>
+      </div>
+      <div class="logs" id="logs"></div>
+    </div>
+  </div>
 
   </main>
 
@@ -494,6 +545,7 @@
     </div>
     <div class="action-buttons">
       <button class="btn btn-ghost" id="stopBtn" disabled>Stop</button>
+      <button class="btn btn-ghost" id="queueSelectionBtn" disabled title="Add the selected episodes to the download queue">Queue</button>
       <button class="btn btn-primary btn-lg" id="startBtn" disabled>Start download</button>
     </div>
   </footer>

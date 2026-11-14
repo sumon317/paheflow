@@ -307,10 +307,7 @@ pub fn parse_latest_release_item(it: &serde_json::Value) -> Option<LatestRelease
                 format!("https:{}", s)
             } else if s.starts_with('/') {
                 format!("https://animepahe.pw{}", s)
-            } else if !s.starts_with("http://")
-                && !s.starts_with("https://")
-                && !s.is_empty()
-            {
+            } else if !s.starts_with("http://") && !s.starts_with("https://") && !s.is_empty() {
                 format!("https://{}", s)
             } else {
                 s.to_string()
@@ -353,9 +350,7 @@ pub async fn latest_releases(
                 let alt_url = format!("{}/?m=airing&page=1", API_URL);
                 match client.fetch_json(&alt_url, None, cfg).await {
                     Ok(j) => j,
-                    Err(_) => {
-                        return Err(format!("Failed to fetch recent releases: {}", e))
-                    }
+                    Err(_) => return Err(format!("Failed to fetch recent releases: {}", e)),
                 }
             }
         };
@@ -593,7 +588,9 @@ pub async fn release_with_status(
                 match res {
                     Ok((page_items, _)) => {
                         for item in page_items {
-                            if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
+                            if !item.session.is_empty()
+                                && seen_sessions.insert(item.session.clone())
+                            {
                                 all_episodes.push(item);
                             }
                         }
@@ -838,21 +835,19 @@ pub async fn play_sources(
                                     .get("audio")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("jpn");
-                                let size_str = sub_val
-                                    .get("filesize")
-                                    .and_then(|v| {
-                                        if let Some(n) = v.as_u64() {
+                                let size_str = sub_val.get("filesize").and_then(|v| {
+                                    if let Some(n) = v.as_u64() {
+                                        Some(format_bytes(n))
+                                    } else if let Some(s) = v.as_str() {
+                                        if let Ok(n) = s.parse::<u64>() {
                                             Some(format_bytes(n))
-                                        } else if let Some(s) = v.as_str() {
-                                            if let Ok(n) = s.parse::<u64>() {
-                                                Some(format_bytes(n))
-                                            } else {
-                                                Some(normalize_size_string(s))
-                                            }
                                         } else {
-                                            None
+                                            Some(normalize_size_string(s))
                                         }
-                                    });
+                                    } else {
+                                        None
+                                    }
+                                });
                                 let kwik_url = sub_val
                                     .get("kwik")
                                     .or_else(|| sub_val.get("kwik_pahewin"))
@@ -1167,11 +1162,7 @@ pub async fn refresh_catalog(
         let mut best_distance = usize::MAX;
 
         for (img_src, img_pos) in &img_positions {
-            let distance = if *img_pos < anchor_pos {
-                anchor_pos - *img_pos
-            } else {
-                *img_pos - anchor_pos
-            };
+            let distance = anchor_pos.abs_diff(*img_pos);
             if distance < best_distance && distance < 5000 {
                 // Within 5KB of HTML
                 best_distance = distance;
