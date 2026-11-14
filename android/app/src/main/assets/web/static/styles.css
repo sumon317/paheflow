@@ -1017,11 +1017,12 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
     display: flex !important;
     position: fixed;
     top: 0; left: 0; right: 0;
-    bottom: max(60px, env(safe-area-inset-bottom, 0px));
+    bottom: 0;
     z-index: 200;
     background: var(--bg);
     border-left: 0;
     padding-top: max(16px, env(safe-area-inset-top, 0px));
+    padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
     overflow: hidden;
   }
   .topbar {
@@ -1672,6 +1673,8 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
   border-left: 1px solid var(--line-soft, rgba(255, 255, 255, 0.1));
   display: flex;
   flex-direction: column;
+  padding-top: max(16px, env(safe-area-inset-top, 0px));
+  padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
   transform: translateX(100%);
   transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
   box-shadow: -8px 0 32px rgba(0, 0, 0, 0.45);

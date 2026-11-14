@@ -3172,7 +3172,7 @@
     $("reloadConfig").onclick = reloadConfig;
     $("testConnection").onclick = testConnection;
     $("copyConfig").onclick = copyConfig;
-    $("clearLogs").onclick = clearLogs;
+    if ($("clearLogs")) $("clearLogs").onclick = clearLogs;
     $("cfgFragMinus").onclick = () => { $("cfgFrag").value = Math.max(1, clampFragments($("cfgFrag").value) - 1); };
     $("cfgFragPlus").onclick = () => { $("cfgFrag").value = Math.min(64, clampFragments($("cfgFrag").value) + 1); };
     $("cfgFrag").onchange = () => { $("cfgFrag").value = clampFragments($("cfgFrag").value); };
@@ -3232,6 +3232,7 @@
     if ($("logsDrawerBtn")) $("logsDrawerBtn").onclick = () => toggleLogsDrawer(true);
     if ($("closeLogsDrawer")) $("closeLogsDrawer").onclick = () => toggleLogsDrawer(false);
     if ($("logsDrawerBackdrop")) $("logsDrawerBackdrop").onclick = () => toggleLogsDrawer(false);
+    if ($("openLogsSettings")) $("openLogsSettings").onclick = () => toggleLogsDrawer(true);
     $$(".log-filters .chip").forEach(btn => btn.onclick = () => {
       state.logFilter = btn.dataset.level;
       $$(".log-filters .chip").forEach(b => b.classList.toggle("is-active", b === btn));
