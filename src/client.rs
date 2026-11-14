@@ -33,6 +33,44 @@ pub fn is_animepahe_url(raw_url: &str) -> bool {
         .any(|d| lower == *d || lower.ends_with(&format!(".{}", d)))
 }
 
+pub fn format_cf_cookie(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Some(idx) = trimmed.find("cf_clearance=") {
+        let after = &trimmed[idx + "cf_clearance=".len()..];
+        let val = after
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        if val.is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("cf_clearance={}", val)
+        }
+    } else if trimmed.contains('=') {
+        trimmed.to_string()
+    } else {
+        format!("cf_clearance={}", trimmed)
+    }
+}
+
+pub fn is_cloudflare_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("cloudflare")
+        || lower.contains("cf_clearance")
+        || lower.contains("403 challenge")
+        || lower.contains("just a moment")
+        || lower.contains("cookie may be expired")
+        || lower.contains("cookie blocked")
+        || lower.contains("error 1015")
+        || lower.contains("returned error: 403")
+        || lower.contains("status code 403")
+}
+
 #[cfg(any(not(target_os = "android"), test))]
 fn is_rate_limit_text(lower_text: &str) -> bool {
     lower_text.contains(RATE_LIMIT_MARKER)
@@ -200,8 +238,11 @@ impl HttpClient {
 
                 // Only attach AnimePahe's cf_clearance to animepahe domains.
                 // Do NOT send it to kwik.cx or CDNs, which triggers a Cloudflare block!
-                if is_animepahe && !cfg.cf.trim().is_empty() {
-                    cmd.arg("-b").arg(format!("cf_clearance={}", cfg.cf.trim()));
+                if is_animepahe {
+                    let cookie_hdr = format_cf_cookie(&cfg.cf);
+                    if !cookie_hdr.is_empty() {
+                        cmd.arg("-b").arg(cookie_hdr);
+                    }
                 }
 
                 if !cfg.ua.trim().is_empty() {
@@ -304,7 +345,7 @@ impl HttpClient {
             req = req.header(reqwest::header::USER_AGENT, ua);
             if let Some(major) = extract_chrome_major(ua) {
                 let sec_ch_ua = format!(
-                    r#""Not(A:Brand";v="99", "Google Chrome";v="{0}", "Chromium";v="{0}""#,
+                    r#""Not A(Brand";v="99", "Google Chrome";v="{0}", "Chromium";v="{0}""#,
                     major
                 );
                 let is_mobile = if ua.contains("Mobile") { "?1" } else { "?0" };
@@ -340,17 +381,19 @@ impl HttpClient {
                     reqwest::header::ACCEPT,
                     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 );
+                req = req.header("Upgrade-Insecure-Requests", "1");
+                req = req.header("Sec-Fetch-User", "?1");
                 req = req.header("sec-fetch-dest", "document");
                 req = req.header("sec-fetch-mode", "navigate");
                 req = req.header("sec-fetch-site", fetch_site);
             }
             req = req.header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
 
-            if is_animepahe && !cfg.cf.trim().is_empty() {
-                req = req.header(
-                    reqwest::header::COOKIE,
-                    format!("cf_clearance={}", cfg.cf.trim()),
-                );
+            if is_animepahe {
+                let cookie_hdr = format_cf_cookie(&cfg.cf);
+                if !cookie_hdr.is_empty() {
+                    req = req.header(reqwest::header::COOKIE, cookie_hdr);
+                }
             }
 
             let effective_ref = referer.or(if is_animepahe {
@@ -494,11 +537,11 @@ impl HttpClient {
             );
             req = req.header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
 
-            if is_animepahe && !cfg.cf.trim().is_empty() {
-                req = req.header(
-                    reqwest::header::COOKIE,
-                    format!("cf_clearance={}", cfg.cf.trim()),
-                );
+            if is_animepahe {
+                let cookie_hdr = format_cf_cookie(&cfg.cf);
+                if !cookie_hdr.is_empty() {
+                    req = req.header(reqwest::header::COOKIE, cookie_hdr);
+                }
             }
 
             let effective_ref = referer.or(if is_animepahe {
@@ -594,5 +637,39 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn format_cf_cookie_handles_raw_or_prefixed_or_delimited() {
+        assert_eq!(format_cf_cookie(""), "");
+        assert_eq!(format_cf_cookie("   "), "");
+        assert_eq!(format_cf_cookie("abc123xyz"), "cf_clearance=abc123xyz");
+        assert_eq!(
+            format_cf_cookie("cf_clearance=abc123xyz"),
+            "cf_clearance=abc123xyz"
+        );
+        assert_eq!(
+            format_cf_cookie("cf_clearance=\"abc123xyz\"; path=/; domain=.animepahe.pw"),
+            "cf_clearance=abc123xyz"
+        );
+        assert_eq!(
+            format_cf_cookie("  cf_clearance=abc123xyz; other=value  "),
+            "cf_clearance=abc123xyz"
+        );
+    }
+
+    #[test]
+    fn is_cloudflare_error_detects_all_challenge_variants() {
+        assert!(is_cloudflare_error(
+            "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings."
+        ));
+        assert!(is_cloudflare_error(
+            "Cloudflare refused this request (IP or cookie blocked)."
+        ));
+        assert!(is_cloudflare_error("cloudflare error 1015"));
+        assert!(is_cloudflare_error("status code 403"));
+        assert!(is_cloudflare_error("just a moment... please wait"));
+        assert!(!is_cloudflare_error("connection reset by peer"));
+        assert!(!is_cloudflare_error("file not found (404)"));
     }
 }

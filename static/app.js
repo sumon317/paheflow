@@ -2307,7 +2307,10 @@
           error: e.error,
           epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
         }));
-        const hasCfQueueError = job.queue.some(e => e.status === "failed" && isCloudflareError(e.error));
+        const hasCfQueueError = job.queue.some(e =>
+          isCloudflareError(e.error) ||
+          (Array.isArray(e.episodeItems) && e.episodeItems.some(i => isCloudflareError(i.error)))
+        );
         if (hasCfQueueError) highlightSolveCfButton("needed");
       }
       if (typeof job.queueHold === "boolean") setQueueHold(job.queueHold);
@@ -3884,6 +3887,20 @@
     // Keep Solve Cloudflare green until a Cloudflare error arises
     highlightSolveCfButton(state.config.cfConfigured ? "solved" : "needed");
     toast("Cloudflare credentials updated!", "ok");
+
+    // Auto-resume queue if paused due to Cloudflare verification
+    const hasPausedCf = (state.queue || []).some(e =>
+      isCloudflareError(e.error) ||
+      (Array.isArray(e.episodeItems) && e.episodeItems.some(i => isCloudflareError(i.error)))
+    );
+    if (hasPausedCf || (state.queueHold && (state.queue || []).length > 0)) {
+      try {
+        const res = await api.post("/api/queue/resume", {});
+        applyQueueResponse(res);
+        toast("Cloudflare solved! Resuming downloads…", "ok");
+      } catch (_) {}
+    }
+
     if (state.selectedSlug) {
       loadEpisodes(state.selectedSlug, state.epPage, state.audioFilter);
     } else if (state.searchMode === "recent") {

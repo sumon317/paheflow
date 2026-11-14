@@ -2440,7 +2440,33 @@ impl RunnerHelper {
             }
             Err(e) => {
                 if !self.stop.load(Ordering::Relaxed) && !self.job_pause.load(Ordering::Relaxed) {
-                    if api::is_rotated_or_missing_error(&e) {
+                    if crate::client::is_cloudflare_error(&e) {
+                        self.log(
+                            "warn",
+                            &format!(
+                                "Cloudflare verification required for '{}'. Pausing downloads — tap 'Solve Cloudflare' in the top bar to continue.",
+                                anime_title
+                            ),
+                        )
+                        .await;
+                        {
+                            let mut st = self.state.lock().await;
+                            st.paused = true;
+                            st.episodes.current = None;
+                        }
+                        {
+                            let mut q = self.queue.lock().await;
+                            if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                                entry.status = "paused".to_string();
+                                entry.error = e.clone();
+                            }
+                        }
+                        self.job_pause.store(true, Ordering::Relaxed);
+                        self.queue_hold.store(true, Ordering::Relaxed);
+                        self.queue_persist().await;
+                        self.pause_notify.notify_waiters();
+                        return;
+                    } else if api::is_rotated_or_missing_error(&e) {
                         self.log(
                             "error",
                             &format!(
@@ -2699,10 +2725,25 @@ impl RunnerHelper {
                 };
 
                 // Fetch play sources (cancellable on pause/stop)
-                let sources_res = tokio::select! {
-                    res = api::play_sources(&client, &actual_slug, ep_session, &cfg) => res,
+                let mut current_cfg = read_config();
+                let mut sources_res = tokio::select! {
+                    res = api::play_sources(&client, &actual_slug, ep_session, &current_cfg) => res,
                     _ = self.wait_ep_cancelled() => Err("Cancelled".to_string()),
                 };
+
+                // If Cloudflare challenged, check if user solved Cloudflare in the background
+                if let Err(ref e) = sources_res {
+                    if crate::client::is_cloudflare_error(e) {
+                        let fresh_cfg = read_config();
+                        if fresh_cfg.cf != current_cfg.cf {
+                            current_cfg = fresh_cfg;
+                            sources_res = tokio::select! {
+                                res = api::play_sources(&client, &actual_slug, ep_session, &current_cfg) => res,
+                                _ = self.wait_ep_cancelled() => Err("Cancelled".to_string()),
+                            };
+                        }
+                    }
+                }
                 let sources = match sources_res {
                     Ok(s) => s,
                     Err(e) => {
@@ -2718,6 +2759,40 @@ impl RunnerHelper {
                             self.handle_ep_paused(&actual_slug, &ep_num).await;
                             continue;
                         }
+
+                        if crate::client::is_cloudflare_error(&e) {
+                            self.log(
+                                "warn",
+                                &format!("Episode {}: Cloudflare verification required. Pausing downloads — tap 'Solve Cloudflare' in the top bar to continue.", ep_num),
+                            )
+                            .await;
+                            {
+                                let mut st = self.state.lock().await;
+                                st.paused = true;
+                                st.episodes.current = None;
+                            }
+                            {
+                                let mut q = self.queue.lock().await;
+                                if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                                    entry.status = "paused".to_string();
+                                    entry.error = e.clone();
+                                    if let Some(item) =
+                                        entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num)
+                                    {
+                                        item.status = "paused".to_string();
+                                        item.error = e.clone();
+                                        item.speed.clear();
+                                        item.eta.clear();
+                                    }
+                                }
+                            }
+                            self.job_pause.store(true, Ordering::Relaxed);
+                            self.queue_hold.store(true, Ordering::Relaxed);
+                            self.queue_persist().await;
+                            self.pause_notify.notify_waiters();
+                            break;
+                        }
+
                         self.log(
                             "warn",
                             &format!("Episode {}: could not load play page: {}", ep_num, e),

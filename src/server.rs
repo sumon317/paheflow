@@ -1480,7 +1480,7 @@ async fn post_queue_resume(
             Json(serde_json::json!({ "error": "Invalid token" })),
         ));
     }
-    state.runner.queue_set_hold(false).await;
+    state.runner.resume().await;
     let mut payload = queue_payload(&state).await;
     payload["ok"] = serde_json::json!(true);
     Ok(Json(payload))
