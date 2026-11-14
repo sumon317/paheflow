@@ -81,6 +81,8 @@
     selectedSlug: "",
     selectedTitle: "",
     episodes: [],
+    epLoading: false,
+    epRequestSeq: 0,
     epPage: 1,
     epLastPage: 1,
     epFilter: "",
@@ -96,7 +98,8 @@
     recentLastPage: 1,
     recentTotal: 0,
     recentLoading: false,
-    recentAudioFilter: "all",
+    recentMetaCache: {},
+    recentMetaInFlight: {},
     pendingSelectEpisode: null,
     allKnownEpisodes: {},
     config: { ua: "", concurrent_fragments: 8, cfConfigured: false, cfLength: 0 },
@@ -108,6 +111,7 @@
     dlGroups: [],
     logsDrawerOpen: false,
     logSeq: 0,
+    bootLogSeq: 0,
     lastLogSeq: 0,
     logFilter: "all",
     autoscroll: true,
@@ -169,16 +173,21 @@
   }
 
   /* Detect Cloudflare / cookie problems so the UI can point at the fix. */
-  function noteApiError(message) {
+  function isCloudflareError(message) {
     const text = String(message || "").toLowerCase();
-    const broken =
+    return (
       text.includes("cf_clearance") ||
       text.includes("cloudflare") ||
       text.includes("just a moment") ||
-      text.includes("expired") ||
+      text.includes("cookie may be expired") ||
+      text.includes("cookie blocked") ||
       text.includes("403 challenge") ||
-      text.includes("403");
-    if (!broken) return;
+      /\b403\b/.test(text)
+    );
+  }
+
+  function noteApiError(message) {
+    if (!isCloudflareError(message)) return;
     const banner = $("cookieBanner");
     if (banner) {
       $("cookieBannerText").textContent = message;
@@ -216,70 +225,80 @@
     }
   };
 
-  // Test connection to animepahe.pw
-  async function testConnection() {
+  let cfStatusPillTimer = null;
+
+  function showConnectedStatusPill() {
+    const statusPill = $("statusPill");
+    const statusText = $("statusText");
+    if (!statusPill || !statusText || state.job?.running) return;
+    if (cfStatusPillTimer) {
+      clearTimeout(cfStatusPillTimer);
+      cfStatusPillTimer = null;
+    }
+    statusPill.dataset.state = "connected";
+    statusText.textContent = "Connected";
+    cfStatusPillTimer = setTimeout(() => {
+      cfStatusPillTimer = null;
+      if (statusPill.dataset.state === "connected" && !state.job?.running) {
+        statusPill.dataset.state = "idle";
+        statusText.textContent = "Idle";
+      }
+    }, 3000);
+  }
+
+  // Silent connection probe to animepahe.pw
+  async function probeConnection() {
     try {
       const res = await api.post("/api/test-connection", {});
-      return res.ok === true;
+      return { ok: res?.ok === true, message: res?.message || "" };
     } catch (e) {
-      return false;
+      return { ok: false, message: e?.message || "Connection test failed" };
     }
   }
 
   // Check connection and update UI accordingly
   async function checkConnectionAndUpdateUI() {
-    const connected = await testConnection();
-    const solveBtn = $("topbarSolveCf");
-    const bannerBtn = $("bannerSolveCookie");
+    if (!state.config.cfConfigured) {
+      highlightSolveCfButton("needed");
+      return false;
+    }
+
+    const res = await probeConnection();
     const statusPill = $("statusPill");
     const statusText = $("statusText");
 
-    if (connected) {
-      // Connection OK - show subtle indicator
-      if (statusPill && statusText) {
-        statusPill.dataset.state = "connected";
-        statusText.textContent = "Connected";
-        // Reset after 3 seconds to idle
-        setTimeout(() => {
-          if (statusPill.dataset.state === "connected") {
-            statusPill.dataset.state = "idle";
-            statusText.textContent = "Idle";
-          }
-        }, 3000);
-      }
-      // Show green "solved" state on buttons
+    if (res.ok) {
+      const banner = $("cookieBanner");
+      if (banner) banner.classList.add("hidden");
+      showConnectedStatusPill();
+      // Keep Solve Cloudflare green until a Cloudflare error arises
       highlightSolveCfButton("solved");
-      // Fade to normal after a moment
-      setTimeout(() => highlightSolveCfButton(false), 4000);
-    } else {
-      // Connection failed - highlight the Solve Cloudflare button (red)
-      highlightSolveCfButton("needed");
-      if (statusPill && statusText) {
+      return true;
+    }
+
+    if (isCloudflareError(res.message)) {
+      noteApiError(res.message);
+      if (statusPill && statusText && !state.job?.running) {
         statusPill.dataset.state = "disconnected";
         statusText.textContent = "Cloudflare blocked";
       }
     }
-    return connected;
+    return false;
   }
 
   // Highlight or un-highlight the Solve Cloudflare buttons
-  // State: "needed" / true = red pulsing, "solved" = green pulsing, false/undefined = normal
-  function highlightSolveCfButton(state) {
+  // State: "needed" / true = red pulsing, "solved" = green, false/undefined = normal
+  function highlightSolveCfButton(btnState) {
     const solveBtn = $("topbarSolveCf");
     const bannerBtn = $("bannerSolveCookie");
-    
-    // Remove both classes first
-    if (solveBtn) {
-      solveBtn.classList.remove("cf-needed", "cf-solved");
-    }
-    if (bannerBtn) {
-      bannerBtn.classList.remove("cf-needed", "cf-solved");
-    }
-    
-    if (state === "needed" || state === true) {
+
+    if (solveBtn) solveBtn.classList.remove("cf-needed", "cf-solved");
+    if (bannerBtn) bannerBtn.classList.remove("cf-needed", "cf-solved");
+
+    if (btnState === "needed" || btnState === true) {
       if (solveBtn) solveBtn.classList.add("cf-needed");
       if (bannerBtn) bannerBtn.classList.add("cf-needed");
-    } else if (state === "solved") {
+    } else if (btnState === "solved") {
       if (solveBtn) solveBtn.classList.add("cf-solved");
       if (bannerBtn) bannerBtn.classList.add("cf-solved");
     }
@@ -634,12 +653,8 @@
     if (pager) {
       pager.classList.add("hidden");
     }
-    const recentSeg = $("recentAudioSeg");
-    if (recentSeg) {
-      recentSeg.classList.toggle("hidden", mode !== "recent");
-    }
     if (mode === "recent") {
-      if (!state.recentItems.length || !isModeChange || forceReload) {
+      if (!state.recentItems.length || forceReload) {
         loadRecentReleases(1, false);
       } else {
         renderRecentReleases(true);
@@ -664,24 +679,186 @@
     }
   }
 
-  function getFilteredRecentItems() {
-    const items = state.recentItems || [];
-    const filter = (state.recentAudioFilter || "all").toLowerCase();
-    if (filter === "all") return items;
-    return items.filter(it => {
-      const titleLower = (it.anime_title || it.animeTitle || "").toLowerCase();
-      const rawAudio = (it.audio || "").toLowerCase();
-      const isDub = rawAudio === "dub" || rawAudio === "eng" || titleLower.includes("(dub)") || titleLower.includes("[dub]") || titleLower.includes(" dub");
-      if (filter === "dub") return isDub;
-      if (filter === "sub") return !isDub;
-      return true;
-    });
+  function recentItemKey(item) {
+    const slug = item?.anime_session || item?.animeSession || "";
+    const epSess = item?.session || "";
+    const ep = item?.episode !== undefined && item?.episode !== null ? String(item.episode) : "";
+    return `${slug}:${epSess || ep}`;
+  }
+
+  function recentEpisodeNorm(ep) {
+    const s = String(ep ?? "").trim();
+    if (!s) return "";
+    const trimmed = s.replace(/^0+/, "");
+    return trimmed || "0";
+  }
+
+  function mergeRecentItemsList(existing, incoming) {
+    const out = [...existing];
+    for (const raw of incoming) {
+      const item = { ...raw };
+      const cached = state.recentMetaCache[recentItemKey(item)];
+      if (cached) {
+        Object.assign(item, cached, { meta_resolved: true });
+      }
+      const slug = item.anime_session || item.animeSession || "";
+      const epNorm = recentEpisodeNorm(item.episode);
+      const matchIdx = out.findIndex(e =>
+        (e.anime_session || e.animeSession || "") === slug &&
+        recentEpisodeNorm(e.episode) === epNorm
+      );
+      if (matchIdx >= 0) {
+        const prev = out[matchIdx];
+        prev.has_sub = Boolean(prev.has_sub || item.has_sub);
+        prev.has_dub = Boolean(prev.has_dub || item.has_dub);
+        if (!prev.snapshot && item.snapshot) prev.snapshot = item.snapshot;
+        if (!prev.duration && item.duration) prev.duration = item.duration;
+        if (!prev.session && item.session) prev.session = item.session;
+        if (!prev.filesize && item.filesize) prev.filesize = item.filesize;
+        if (item.filesizes && Object.keys(item.filesizes).length) {
+          prev.filesizes = { ...(item.filesizes || {}), ...(prev.filesizes || {}) };
+        }
+        if ((!prev.resolutions || !prev.resolutions.length) && item.resolutions?.length) {
+          prev.resolutions = item.resolutions;
+        }
+        prev.meta_resolved = Boolean(prev.meta_resolved || item.meta_resolved);
+      } else {
+        out.push(item);
+      }
+    }
+    return out;
+  }
+
+  function formatRecentSize(item) {
+    const sizes = item?.filesizes || {};
+    const pref = ($("optResolution")?.value || state.config?.default_resolution || "").trim();
+    if (pref && sizes[pref]) {
+      return `${sizes[pref]} (${pref}p)`;
+    }
+    const resolutions = Array.isArray(item?.resolutions) && item.resolutions.length
+      ? item.resolutions
+      : Object.keys(sizes).sort((a, b) => (parseInt(b, 10) || 0) - (parseInt(a, 10) || 0));
+    for (const r of resolutions) {
+      if (sizes[r]) return `${sizes[r]} (${r}p)`;
+    }
+    return item?.filesize || "";
+  }
+
+  function buildRecentMetaHtml(item) {
+    const epNum = (item.episode !== undefined && item.episode !== null) ? String(item.episode) : "";
+    const titleLower = (item.anime_title || item.animeTitle || "").toLowerCase();
+    const rawAudio = (item.audio || "").toLowerCase();
+    const dubHint = rawAudio === "dub" || rawAudio === "eng" || titleLower.includes("(dub)") || titleLower.includes("[dub]") || titleLower.includes(" dub");
+    const hasDub = typeof item.has_dub === "boolean" ? item.has_dub : dubHint;
+    const hasSub = typeof item.has_sub === "boolean" ? (item.has_sub || (!item.meta_resolved && !hasDub)) : true;
+    const sizeStr = formatRecentSize(item);
+    const key = recentItemKey(item);
+    const isResolving = Boolean(item.session && !item.meta_resolved && state.recentMetaInFlight[key]);
+    const timeStr = timeAgo(item.created_at || item.createdAt);
+    const duration = item.duration || "";
+
+    return `
+      <span class="badge recent-badge-ep">EP ${escapeHtml(epNum)}</span>
+      ${hasSub ? `<span class="badge recent-badge-sub">SUB</span>` : ""}
+      ${hasDub ? `<span class="badge recent-badge-dub">DUB</span>` : ""}
+      ${sizeStr
+        ? `<span class="badge recent-badge-size" title="Download file size">📦 ${escapeHtml(sizeStr)}</span>`
+        : (isResolving ? `<span class="badge recent-badge-size is-loading" title="Checking file size…">📦 …</span>` : "")}
+      ${duration ? `<span>${escapeHtml(duration)}</span>` : ""}
+      ${timeStr ? `<span class="recent-time">🕒 ${escapeHtml(timeStr)}</span>` : ""}
+    `;
+  }
+
+  function patchRecentCardMetaDOM(item) {
+    const slug = item.anime_session || item.animeSession || "";
+    const epNum = (item.episode !== undefined && item.episode !== null) ? String(item.episode) : "";
+    const epSess = item.session || "";
+    const box = $("resultsList");
+    if (!box) return;
+    const cards = $$(".result.recent", box);
+    for (const card of cards) {
+      const matchSlug = card.dataset.session === slug;
+      const matchEp = epSess
+        ? (card.dataset.epSession === epSess || recentEpisodeNorm(card.dataset.ep) === recentEpisodeNorm(epNum))
+        : (recentEpisodeNorm(card.dataset.ep) === recentEpisodeNorm(epNum));
+      if (matchSlug && matchEp) {
+        const metaEl = card.querySelector(".result-meta");
+        if (metaEl) metaEl.innerHTML = buildRecentMetaHtml(item);
+      }
+    }
+  }
+
+  async function enrichRecentCards(items) {
+    const candidates = [];
+    for (const item of items || []) {
+      const slug = item.anime_session || item.animeSession || "";
+      const epSess = item.session || "";
+      if (!slug || !epSess) continue;
+      const key = recentItemKey(item);
+      if (state.recentMetaCache[key]) {
+        Object.assign(item, state.recentMetaCache[key], { meta_resolved: true });
+        patchRecentCardMetaDOM(item);
+        continue;
+      }
+      if (item.meta_resolved || state.recentMetaInFlight[key]) continue;
+      state.recentMetaInFlight[key] = true;
+      patchRecentCardMetaDOM(item);
+      candidates.push(item);
+    }
+
+    const CHUNK = 6;
+    for (let i = 0; i < candidates.length; i += CHUNK) {
+      if (state.searchMode !== "recent" || state.activeTab !== "home") {
+        for (let j = i; j < candidates.length; j++) {
+          delete state.recentMetaInFlight[recentItemKey(candidates[j])];
+        }
+        return;
+      }
+      const batch = candidates.slice(i, i + CHUNK);
+      try {
+        const res = await api.post("/api/latest/meta", {
+          items: batch.map(it => ({
+            slug: it.anime_session || it.animeSession || "",
+            session: it.session || "",
+            episode: it.episode !== undefined && it.episode !== null ? String(it.episode) : "",
+          })),
+        });
+        const resolved = Array.isArray(res?.items) ? res.items : [];
+        for (const meta of resolved) {
+          const mKey = `${meta.slug}:${meta.session || meta.episode}`;
+          const patch = {
+            has_sub: Boolean(meta.has_sub),
+            has_dub: Boolean(meta.has_dub),
+            audios: meta.audios || [],
+            resolutions: meta.resolutions || [],
+            filesizes: meta.filesizes || {},
+            filesize: meta.filesize || null,
+            meta_resolved: true,
+          };
+          state.recentMetaCache[mKey] = patch;
+          for (const it of state.recentItems) {
+            if (recentItemKey(it) === mKey) {
+              Object.assign(it, patch);
+              patchRecentCardMetaDOM(it);
+            }
+          }
+        }
+      } catch (_) {
+        // Leave fallback badges intact if enrichment fails
+      } finally {
+        for (const it of batch) {
+          const k = recentItemKey(it);
+          delete state.recentMetaInFlight[k];
+          it.meta_resolved = true;
+          patchRecentCardMetaDOM(it);
+        }
+      }
+    }
   }
 
   async function loadRecentReleases(page = 1, append = false) {
     if (state.recentLoading) return;
     state.recentLoading = true;
-    state.recentPage = page;
     const box = $("resultsList");
     if (!append) {
       box.innerHTML = `<div class="ep-loading"><span class="spinner"></span> Loading recent releases from AnimePahe...</div>`;
@@ -691,17 +868,36 @@
     try {
       const res = await api.get(`/api/latest?page=${page}&all=0`);
       const list = res.items || res.data || [];
+      const prevCount = state.recentItems.length;
       if (append) {
-        state.recentItems = (state.recentItems || []).concat(list);
+        state.recentItems = mergeRecentItemsList(state.recentItems || [], list);
       } else {
-        state.recentItems = list;
+        state.recentItems = mergeRecentItemsList([], list);
       }
       state.recentPage = page;
       state.recentLastPage = res.lastPage || res.last_page || 1;
       state.recentTotal = res.total ?? state.recentItems.length;
       state.recentLoading = false;
+      $("cookieBanner").classList.add("hidden");
+      if (state.config.cfConfigured) highlightSolveCfButton("solved");
       if (state.searchMode === "recent") {
-        renderRecentReleases(!append);
+        if (!append) {
+          renderRecentReleases(true);
+        } else {
+          const addedCount = state.recentItems.length - prevCount;
+          if (addedCount > 0) {
+            appendMoreRecent(state.recentItems);
+          } else {
+            const sentinel = $("recentSentinel");
+            if (sentinel) {
+              if (state.recentPage < state.recentLastPage) {
+                sentinel.innerHTML = `<span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases...`;
+              } else {
+                sentinel.remove();
+              }
+            }
+          }
+        }
       }
     } catch (e) {
       state.recentLoading = false;
@@ -719,17 +915,14 @@
 
   function renderRecentReleases(resetLimit = true) {
     const box = $("resultsList");
-    const items = getFilteredRecentItems();
+    const items = state.recentItems || [];
     if (!items.length) {
       if (state.catalogObserver) {
         state.catalogObserver.disconnect();
         state.catalogObserver = null;
       }
-      const emptyMsg = (state.recentItems && state.recentItems.length)
-        ? `No ${state.recentAudioFilter === "dub" ? "Dub" : "Sub"} releases in current batch.`
-        : "No recent releases found.";
-      box.innerHTML = `<div class="empty"><p class="empty-title">${emptyMsg}</p><p class="empty-text">Check your internet connection or Cloudflare clearance.</p></div>`;
-      $("catalogMeta").textContent = emptyMsg;
+      box.innerHTML = `<div class="empty"><p class="empty-title">No recent releases found.</p><p class="empty-text">Check your internet connection or Cloudflare clearance.</p></div>`;
+      $("catalogMeta").textContent = "No recent releases found.";
       updateRecentPager();
       return;
     }
@@ -744,7 +937,7 @@
 
     const cardsHtml = shown.map(item => renderRecentCardHtml(item)).join("");
     const hasMore = shownCount < total || (state.recentPage < state.recentLastPage);
-    const sentinelHtml = hasMore ? `<div id="recentSentinel" class="recent-sentinel" style="padding: 16px; text-align: center; color: var(--text-faint); font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;"><span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${shownCount} of ${total})...</div>` : "";
+    const sentinelHtml = hasMore ? `<div id="recentSentinel" class="recent-sentinel" style="padding: 16px; text-align: center; color: var(--text-faint); font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 8px;"><span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${shownCount} of ${state.recentTotal || total})...</div>` : "";
 
     box.innerHTML = cardsHtml + sentinelHtml;
 
@@ -753,25 +946,20 @@
     updateRecentPager();
 
     setupRecentObserver(items);
+    enrichRecentCards(shown);
   }
 
   function renderRecentCardHtml(item) {
     const title = item.anime_title || item.animeTitle || "";
     const session = item.anime_session || item.animeSession || "";
+    const epSess = item.session || "";
     const epNum = (item.episode !== undefined && item.episode !== null) ? String(item.episode) : "";
-    const titleLower = title.toLowerCase();
-    const rawAudio = (item.audio || "").toLowerCase();
-    const isDub = rawAudio === "dub" || rawAudio === "eng" || titleLower.includes("(dub)") || titleLower.includes("[dub]") || titleLower.includes(" dub");
-    const audioClass = isDub ? "recent-badge-dub" : "recent-badge-sub";
-    const audioLabel = isDub ? "DUB" : "SUB";
-    const timeStr = timeAgo(item.created_at || item.createdAt);
     const isSelected = session === state.selectedSlug;
     const snapshot = item.snapshot || "";
     const thumbUrl = snapshot ? `/api/thumb?url=${encodeURIComponent(snapshot)}&token=${encodeURIComponent(token())}` : "";
-    const duration = item.duration || "";
 
     return `
-      <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(session)}" data-title="${escapeHtml(title)}" data-ep="${escapeHtml(epNum)}">
+      <div class="result recent ${isSelected ? "is-selected" : ""}" data-session="${escapeHtml(session)}" data-ep-session="${escapeHtml(epSess)}" data-title="${escapeHtml(title)}" data-ep="${escapeHtml(epNum)}">
         ${snapshot ? `
           <div class="recent-thumb-wrap">
             <img class="recent-thumb" src="${escapeHtml(thumbUrl)}" alt="${escapeHtml(title)}" width="88" height="52" loading="lazy" decoding="async" onerror="this.parentElement.style.display='none'" />
@@ -780,10 +968,7 @@
         <div class="result-main">
           <div class="result-title">${escapeHtml(title)}</div>
           <div class="result-meta">
-            <span class="badge recent-badge-ep">EP ${escapeHtml(epNum)}</span>
-            <span class="badge ${audioClass}">${audioLabel}</span>
-            ${duration ? `<span>${escapeHtml(duration)}</span>` : ""}
-            ${timeStr ? `<span class="recent-time">🕒 ${escapeHtml(timeStr)}</span>` : ""}
+            ${buildRecentMetaHtml(item)}
           </div>
         </div>
         <div class="result-actions">
@@ -803,7 +988,7 @@
 
     state.catalogObserver = new IntersectionObserver((entries) => {
       if (entries[0] && entries[0].isIntersecting) {
-        appendMoreRecent(items);
+        appendMoreRecent(state.recentItems || items);
       }
     }, { rootMargin: "300px" });
     state.catalogObserver.observe(sentinel);
@@ -837,22 +1022,19 @@
 
     if (sentinel) {
       box.insertBefore(fragment, sentinel);
-      if (state.recentLimit >= total) {
-        if (state.recentPage < state.recentLastPage && !state.recentLoading) {
-          loadRecentReleases(state.recentPage + 1, true);
-        } else {
-          sentinel.remove();
-          if (state.catalogObserver) {
-            state.catalogObserver.disconnect();
-            state.catalogObserver = null;
-          }
+      if (state.recentLimit >= total && state.recentPage >= state.recentLastPage) {
+        sentinel.remove();
+        if (state.catalogObserver) {
+          state.catalogObserver.disconnect();
+          state.catalogObserver = null;
         }
       } else {
-        sentinel.innerHTML = `<span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${state.recentLimit} of ${total})...`;
+        sentinel.innerHTML = `<span class="spinner" style="width: 14px; height: 14px;"></span> Loading more releases (${state.recentLimit} of ${state.recentTotal || total})...`;
       }
     } else {
       box.appendChild(fragment);
     }
+    enrichRecentCards(nextBatch);
   }
 
   function updateRecentPager() {
@@ -863,12 +1045,10 @@
 
   function selectRecentEpisode(slug, title, episodeNum) {
     if (!slug) return;
-    state.selectedTitle = title || slug;
-    state.selectedSlug = slug;
     state.pendingSelectEpisode = String(episodeNum);
     $$(".result").forEach(el => el.classList.toggle("is-selected", el.dataset.session === slug || el.dataset.slug === slug));
     showTab("episodes");
-    loadEpisodes(slug);
+    loadEpisodes(slug, 1, null, title || slug);
   }
 
   async function doSearch() {
@@ -881,6 +1061,7 @@
       state.remoteCatalog = items;
       renderCatalog();
       $("cookieBanner").classList.add("hidden");
+      if (state.config.cfConfigured) highlightSolveCfButton("solved");
     } catch (e) {
       toast("Search failed: " + e.message, "error");
       noteApiError(e.message);
@@ -937,15 +1118,18 @@
    *  render: episodes
    * ───────────────────────────────────────────────────────────────── */
 
-  async function loadEpisodes(slug, page = 1, audio = null) {
+  async function loadEpisodes(slug, page = 1, audio = null, overrideTitle = null, forceRefresh = false) {
     if (!slug) return;
+    const reqSeq = ++state.epRequestSeq;
     const animeChanged = state.selectedSlug !== slug;
     state.selectedSlug = slug;
+    if (overrideTitle) state.selectedTitle = overrideTitle;
     state.epPage = page;
     if (audio !== null) {
       state.audioFilter = audio;
     }
     state.episodes = [];
+    state.epLoading = true;
     state.epLastPage = 1;
     if (animeChanged) {
       // Episode numbers are only meaningful inside one anime. Keeping the
@@ -971,12 +1155,20 @@
     try {
       const titleParam = state.selectedTitle ? `&title=${encodeURIComponent(state.selectedTitle)}` : "";
       const audioParam = state.audioFilter ? `&audio=${encodeURIComponent(state.audioFilter)}` : "";
-      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&all=1&page=${page}${titleParam}${audioParam}`);
+      const refreshParam = forceRefresh ? "&refresh=1" : "";
+      const res = await api.get(`/api/episodes?slug=${encodeURIComponent(slug)}&all=1&page=${page}${titleParam}${audioParam}${refreshParam}`);
+      if (reqSeq !== state.epRequestSeq) return;
       if (res.slug && res.slug !== slug) {
+        const oldSlug = slug;
         state.selectedSlug = res.slug;
         slug = res.slug;
+        for (const list of [state.localCatalog, state.remoteCatalog]) {
+          const item = list.find(a => a.slug === oldSlug);
+          if (item) item.slug = res.slug;
+        }
       }
       if (state.selectedSlug !== slug || state.epPage !== page) return;
+      state.epLoading = false;
       state.epNotFound = !!res.notFound;
       state.episodes = res.items || [];
       state.epLastPage = res.lastPage ?? 1;
@@ -990,11 +1182,16 @@
       });
 
       const displayList = getDisplayEpisodes();
+      let probeTarget = null;
       if (state.pendingSelectEpisode) {
         const targetEp = state.pendingSelectEpisode;
-        const exists = displayList.some(e => epId(e.episode) === targetEp);
-        if (exists) {
-          state.episodesSelected = [targetEp];
+        const targetNorm = recentEpisodeNorm(targetEp);
+        const matched = displayList.find(e =>
+          epId(e.episode) === targetEp || recentEpisodeNorm(epId(e.episode)) === targetNorm
+        );
+        if (matched) {
+          state.episodesSelected = [epId(matched.episode)];
+          probeTarget = matched.episode;
         }
         state.pendingSelectEpisode = null;
       } else {
@@ -1006,17 +1203,29 @@
       syncAudioControlUI();
       renderEpGrid();
       updatePagination();
-      if (!res.notFound) {
-        probeFirstEpisode();
+      if (!res.notFound && state.episodes.length) {
+        if (probeTarget !== null && probeTarget !== undefined) {
+          probeOptions(probeTarget);
+        } else {
+          probeFirstEpisode();
+        }
       }
-      $("cookieBanner").classList.add("hidden");
       if (res.stale) {
         // The site refused the live request; this list came from the disk cache or not found.
         if (res.warning && !res.notFound) {
           toast(res.warning, "warn");
+          noteApiError(res.warning);
         }
+      } else {
+        if (res.warning && !res.notFound) {
+          toast(res.warning, "warn");
+        }
+        $("cookieBanner").classList.add("hidden");
+        if (state.config.cfConfigured) highlightSolveCfButton("solved");
       }
     } catch (e) {
+      if (reqSeq !== state.epRequestSeq) return;
+      state.epLoading = false;
       const is404 = String(e.message || "").includes("404") || String(e.message || "").toLowerCase().includes("not found");
       if (is404) {
         state.epNotFound = true;
@@ -1024,11 +1233,17 @@
         renderEpGrid();
         updatePagination();
       } else {
+        renderEpGrid();
         toast("Failed to load episodes: " + e.message, "error");
         noteApiError(e.message);
       }
     }
-    finally { setBusy($("reloadEpisodes"), false); }
+    finally {
+      if (reqSeq === state.epRequestSeq) {
+        state.epLoading = false;
+        setBusy($("reloadEpisodes"), false);
+      }
+    }
   }
 
   function syncAudioControlUI() {
@@ -1083,6 +1298,11 @@
 
   function renderEpGrid() {
     const box = $("epGrid");
+    if (state.epLoading) {
+      box.innerHTML = `<div class="ep-loading"><span class="spinner"></span> Loading episodes from AnimePahe...</div>`;
+      updateEpSelectionUI();
+      return;
+    }
     const displayList = getDisplayEpisodes();
     const filtered = displayList.filter(e => {
       const hay = ("E" + epId(e.episode) + " " + epId(e.episode) + " " + (e.audio || "") + " " + (e.created_at || "")).toLowerCase();
@@ -1702,16 +1922,24 @@
     const btn = $("testConnection");
     setBusy(btn, true);
     try {
-      const res = await api.post("/api/test-connection", {});
+      const res = await probeConnection();
       toast(res.ok ? "Connection OK" : "Connection failed: " + res.message, res.ok ? "ok" : "error");
       if (res.ok) {
         $("cookieBanner").classList.add("hidden");
+        showConnectedStatusPill();
+        if (state.config.cfConfigured) {
+          highlightSolveCfButton("solved");
+        } else {
+          highlightSolveCfButton("needed");
+        }
       } else {
         noteApiError(res.message);
       }
+      return res.ok;
     } catch (e) {
       toast("Test failed: " + e.message, "error");
       noteApiError(e.message);
+      return false;
     }
     finally { setBusy(btn, false); }
   }
@@ -1734,6 +1962,11 @@
       updateCommandPreview();
       updateSaveHint("ok", "Saved");
       toast("Configuration saved", "ok");
+      if (cfValue) {
+        void checkConnectionAndUpdateUI();
+      } else if (!state.config.cfConfigured) {
+        highlightSolveCfButton("needed");
+      }
       return true;
     } catch (e) {
       updateSaveHint("err", "Failed: " + e.message);
@@ -2010,6 +2243,7 @@
       const saved = await api.post("/api/config", { cf: "" });
       state.config = normalizeConfig(saved);
       renderSettings();
+      highlightSolveCfButton("needed");
       toast("Cookie cleared", "ok");
     } catch (e) {
       toast("Could not clear cookie: " + e.message, "error");
@@ -2073,6 +2307,8 @@
           error: e.error,
           epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
         }));
+        const hasCfQueueError = job.queue.some(e => e.status === "failed" && isCloudflareError(e.error));
+        if (hasCfQueueError) highlightSolveCfButton("needed");
       }
       if (typeof job.queueHold === "boolean") setQueueHold(job.queueHold);
     }
@@ -2106,6 +2342,7 @@
 
   function queueStatusBadge(status, error) {
     if (status === "downloading") return `<span class="badge ok queue-status">Downloading</span>`;
+    if (status === "paused") return `<span class="badge warn queue-status">Paused</span>`;
     if (status === "failed") return `<span class="badge err queue-status" title="${escapeHtml(error || "Failed")}">${escapeHtml(error || "Failed")}</span>`;
     return `<span class="badge queue-status">Queued</span>`;
   }
@@ -2123,9 +2360,76 @@
     return parts.join(" ");
   }
 
+  function computeSeriesProgress(item) {
+    const epItems = Array.isArray(item?.epItems)
+      ? item.epItems
+      : (Array.isArray(item?.episodeItems) ? item.episodeItems : []);
+    const activeSlug = state.job?.anime?.slug || "";
+    const curEpId = state.job?.episodes?.current || "";
+    const liveJobPct = (activeSlug && item?.slug === activeSlug && typeof state.job?.progress?.percent === "number")
+      ? Math.max(0, Math.min(100, state.job.progress.percent))
+      : null;
+
+    const total = epItems.length;
+    if (total > 0) {
+      let done = 0;
+      let sumPct = 0;
+      for (const ep of epItems) {
+        if (ep.status === "done" || ep.status === "skipped") {
+          done += 1;
+          sumPct += 100;
+        } else if (ep.status === "downloading" || ep.status === "paused") {
+          let epPct = typeof ep.percent === "number" ? ep.percent : 0;
+          if (ep.status === "downloading" && liveJobPct !== null && (!curEpId || ep.epId === curEpId)) {
+            epPct = Math.max(epPct, liveJobPct);
+          }
+          sumPct += Math.max(0, Math.min(100, epPct));
+        }
+      }
+      const pct = Math.max(0, Math.min(100, Math.round(sumPct / total)));
+      const activeEp = epItems.find(e => e.status === "downloading") || null;
+      return { total, done, pct, activeEp };
+    }
+
+    const fallbackPct = item?.status === "downloading" && liveJobPct !== null
+      ? Math.round(liveJobPct)
+      : 0;
+    return { total: 0, done: 0, pct: fallbackPct, activeEp: null };
+  }
+
+  function seriesProgressText(status, prog) {
+    if (prog.total > 0) {
+      const base = `${prog.done}/${prog.total} ${prog.total === 1 ? "ep" : "eps"}`;
+      if (status === "downloading" && prog.activeEp) {
+        const curLabel = prog.activeEp.label || `EP ${prog.activeEp.epId}`;
+        const spd = prog.activeEp.speed || state.job?.progress?.speed || "";
+        return spd ? `${base} · ${curLabel} · ${spd}` : `${base} · ${curLabel}`;
+      }
+      if (status === "paused") return `${base} · Paused`;
+      if (status === "failed") return `${base} · Failed`;
+      if (prog.done === prog.total) return `${base} · Completed`;
+      return base;
+    }
+    if (status === "downloading") return "Starting download…";
+    if (status === "paused") return "Paused";
+    if (status === "failed") return "Failed";
+    return "Waiting in queue";
+  }
+
+  function seriesProgressFillClass(status, prog) {
+    if (status === "paused") return "is-paused";
+    if (status === "failed") return "is-failed";
+    if (prog.total > 0 && prog.done === prog.total) return "is-done";
+    if (status === "downloading") return "is-downloading";
+    return "";
+  }
+
   function renderQueuePanel() {
     const hold = Boolean(state.queueHold);
-    const key = JSON.stringify(state.queue) + "|" + hold;
+    const activeJobKey = state.job && state.job.running
+      ? `${state.job.anime?.slug || ""}:${state.job.episodes?.current || ""}:${Math.round(state.job.progress?.percent || 0)}:${state.job.progress?.speed || ""}`
+      : "";
+    const key = JSON.stringify(state.queue) + "|" + hold + "|" + activeJobKey;
     if (key === state.queueRenderKey) return;
     state.queueRenderKey = key;
 
@@ -2144,6 +2448,7 @@
     const list = $("queueList");
     if (!list) return;
     if (!state.queue.length) {
+      list.dataset.structureKey = "";
       list.innerHTML = `
         <div class="empty">
           <p class="empty-title">The queue is empty</p>
@@ -2152,16 +2457,53 @@
       return;
     }
 
+    const structureKey = state.queue.map(e => `${e.id || e.slug}:${e.slug}:${e.title || ""}:${e.status || "queued"}:${e.error || ""}:${e.episodes || "*"}:${e.resolution || ""}:${e.audio || ""}:${Boolean(e.replace)}:${Boolean(e.listOnly)}`).join("|");
+    if (list.dataset.structureKey === structureKey) {
+      const rows = list.children;
+      state.queue.forEach((entry, i) => {
+        const row = rows[i];
+        if (!row || row.dataset.slug !== entry.slug) return;
+        const status = entry.status || "queued";
+        const prog = computeSeriesProgress(entry);
+        const text = seriesProgressText(status, prog);
+        const fillClass = seriesProgressFillClass(status, prog);
+        const textEl = row.querySelector(".queue-progress-text");
+        if (textEl && textEl.textContent !== text) textEl.textContent = text;
+        const pctEl = row.querySelector(".queue-progress-pct");
+        const pctStr = `${prog.pct}%`;
+        if (pctEl && pctEl.textContent !== pctStr) pctEl.textContent = pctStr;
+        const fillEl = row.querySelector(".queue-series-progress .progress-fill");
+        if (fillEl) {
+          fillEl.style.width = pctStr;
+          fillEl.className = `progress-fill ${fillClass}`.trim();
+        }
+      });
+      return;
+    }
+
+    list.dataset.structureKey = structureKey;
     list.innerHTML = state.queue.map((entry, i) => {
       const status = entry.status || "queued";
+      const prog = computeSeriesProgress(entry);
+      const progText = seriesProgressText(status, prog);
+      const fillClass = seriesProgressFillClass(status, prog);
       return `
-        <div class="queue-row ${status === "downloading" ? "is-downloading" : ""} ${status === "failed" ? "is-failed" : ""}" data-slug="${escapeHtml(entry.slug)}">
+        <div class="queue-row ${status === "downloading" ? "is-downloading" : ""} ${status === "paused" ? "is-paused" : ""} ${status === "failed" ? "is-failed" : ""}" data-slug="${escapeHtml(entry.slug)}">
           <div class="queue-pos">${i + 1}</div>
           <div class="result-main">
             <div class="result-title">${escapeHtml(entry.title || entry.slug)}</div>
             <div class="result-meta">
               ${queueSpecMeta(entry)}
               ${queueStatusBadge(status, entry.status === "downloading" ? "" : entry.error)}
+            </div>
+            <div class="queue-series-progress">
+              <div class="queue-progress-head">
+                <span class="queue-progress-text">${escapeHtml(progText)}</span>
+                <span class="queue-progress-pct">${prog.pct}%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-fill ${fillClass}" style="width: ${prog.pct}%;"></div>
+              </div>
             </div>
           </div>
           <div class="result-actions">
@@ -2199,6 +2541,7 @@
     updateQueueCardButtons();
     renderDlGroups();
     updateDlOverall();
+    updateMainActionButton();
     if (res && res.message) toast(res.message, fallbackOk || "ok");
     else if (fallbackErr) toast(fallbackErr, fallbackOk || "ok");
   }
@@ -2264,22 +2607,49 @@
         const groupEl = container.querySelector(`.dl-group[data-queue-id="${group.queueId}"]`);
         if (!groupEl) return;
         const isDownloading = group.status === "downloading";
+        const isPaused = group.status === "paused";
         const isFailed = group.status === "failed";
+        const isCollapsed = Boolean(state.collapsedGroups?.[group.queueId]);
         groupEl.classList.toggle("is-downloading", isDownloading);
+        groupEl.classList.toggle("is-paused", isPaused);
         groupEl.classList.toggle("is-failed", isFailed);
+        groupEl.classList.toggle("is-collapsed", isCollapsed);
+        const collapseBtn = groupEl.querySelector("[data-group-collapse]");
+        if (collapseBtn) {
+          collapseBtn.setAttribute("aria-expanded", String(!isCollapsed));
+          collapseBtn.title = isCollapsed ? "Expand episodes" : "Collapse episodes";
+        }
+
+        const statusEl = groupEl.querySelector(".dl-group-head .queue-status");
+        if (statusEl) {
+          const badgeHtml = queueStatusBadge(group.status, group.error);
+          if (statusEl.outerHTML !== badgeHtml) statusEl.outerHTML = badgeHtml;
+        }
 
         const epItems = group.epItems || [];
-        const total = epItems.length;
-        const done = epItems.filter(e => e.status === "done").length;
-        const pct = total > 0 ? Math.round((done / total) * 100) : (isDownloading ? 50 : 0);
+        const prog = computeSeriesProgress(group);
+        const progText = seriesProgressText(group.status || "queued", prog);
+        const fillClass = seriesProgressFillClass(group.status || "queued", prog);
+        const progTextEl = groupEl.querySelector(".dl-group-progress-text");
+        if (progTextEl && progTextEl.textContent !== progText) progTextEl.textContent = progText;
+        const progPctEl = groupEl.querySelector(".dl-group-progress-pct");
+        const pctStr = `${prog.pct}%`;
+        if (progPctEl && progPctEl.textContent !== pctStr) progPctEl.textContent = pctStr;
         const barFill = groupEl.querySelector(".dl-group-bar-fill");
-        if (barFill) barFill.style.width = `${pct}%`;
+        if (barFill) {
+          barFill.style.width = pctStr;
+          barFill.className = `dl-group-bar-fill ${fillClass}`.trim();
+        }
 
-        const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading", "failed"].includes(e.status)).every(e => e.status === "paused" || e.status === "failed");
+        const pendingOrPaused = epItems.filter(e => ["queued", "paused", "downloading", "failed"].includes(e.status));
+        const allPaused = pendingOrPaused.length > 0
+          ? pendingOrPaused.every(e => e.status === "paused" || e.status === "failed")
+          : group.status === "paused";
         const toggleBtn = groupEl.querySelector("[data-group-toggle]");
         if (toggleBtn) {
           const expected = allPaused ? "▶ Resume all" : "⏸ Pause all";
           if (toggleBtn.textContent.trim() !== expected) toggleBtn.textContent = expected;
+          toggleBtn.title = allPaused ? "Resume all episodes" : "Pause all episodes";
         }
 
         epItems.forEach(ep => {
@@ -2305,11 +2675,12 @@
           if (detailsEl) {
             let details = "";
             if (isEpDone) {
-              if (ep.size) details = `<span>${escapeHtml(ep.size)}</span>`;
+              details = `<span>100%</span>` + (ep.size ? `<span>${escapeHtml(ep.size)}</span>` : "");
             } else if (isEpActive) {
-              const spd = ep.speed ? `⚡ ${escapeHtml(ep.speed)}` : "";
-              const eta = ep.eta ? `⏱ ${escapeHtml(ep.eta)}` : "";
-              details = `<span>${epPct}%</span>` + [spd, eta].filter(Boolean).map(s => `<span>${s}</span>`).join("");
+              const spdEta = [ep.speed ? `⚡ ${escapeHtml(ep.speed)}` : "", ep.eta ? `⏱ ${escapeHtml(ep.eta)}` : ""].filter(Boolean).join(" · ");
+              details = `<span>${epPct}%</span>` + (spdEta ? `<span>${spdEta}</span>` : "");
+            } else if (isEpPaused && (epPct > 0 || ep.size)) {
+              details = (epPct > 0 ? `<span>${epPct}%</span>` : "") + (ep.size ? `<span>${escapeHtml(ep.size)}</span>` : "");
             }
             if (detailsEl.innerHTML !== details) detailsEl.innerHTML = details;
           }
@@ -2350,15 +2721,22 @@
       return;
     }
 
+    const prevScroll = container.scrollTop;
     container.dataset.renderedStructure = structureKey;
+    state.collapsedGroups = state.collapsedGroups || {};
     container.innerHTML = groups.map(group => {
       const isDownloading = group.status === "downloading";
+      const isPaused = group.status === "paused";
       const isFailed = group.status === "failed";
+      const isCollapsed = Boolean(state.collapsedGroups[group.queueId]);
       const epItems = group.epItems || [];
-      const total = epItems.length;
-      const done = epItems.filter(e => e.status === "done").length;
-      const pct = total > 0 ? Math.round((done / total) * 100) : (isDownloading ? 50 : 0);
-      const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading", "failed"].includes(e.status)).every(e => e.status === "paused" || e.status === "failed");
+      const prog = computeSeriesProgress(group);
+      const progText = seriesProgressText(group.status || "queued", prog);
+      const fillClass = seriesProgressFillClass(group.status || "queued", prog);
+      const pendingOrPaused = epItems.filter(e => ["queued", "paused", "downloading", "failed"].includes(e.status));
+      const allPaused = pendingOrPaused.length > 0
+        ? pendingOrPaused.every(e => e.status === "paused" || e.status === "failed")
+        : group.status === "paused";
 
       const epsHtml = epItems.map(ep => {
         const isEpActive = ep.status === "downloading";
@@ -2372,14 +2750,16 @@
         let details = "";
         if (isEpDone) {
           statusPill = `<span class="badge ok">✓ Done</span>`;
-          if (ep.size) details = `<span>${escapeHtml(ep.size)}</span>`;
+          details = `<span>100%</span>` + (ep.size ? `<span>${escapeHtml(ep.size)}</span>` : "");
         } else if (isEpActive) {
           statusPill = `<span class="badge ok" style="animation: queuePulse 1.8s infinite;">Downloading</span>`;
-          const spd = ep.speed ? `⚡ ${escapeHtml(ep.speed)}` : "";
-          const eta = ep.eta ? `⏱ ${escapeHtml(ep.eta)}` : "";
-          details = [spd, eta].filter(Boolean).map(s => `<span>${s}</span>`).join("");
+          const spdEta = [ep.speed ? `⚡ ${escapeHtml(ep.speed)}` : "", ep.eta ? `⏱ ${escapeHtml(ep.eta)}` : ""].filter(Boolean).join(" · ");
+          details = `<span>${epPct}%</span>` + (spdEta ? `<span>${spdEta}</span>` : "");
         } else if (isEpPaused) {
           statusPill = `<span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);">Paused</span>`;
+          if (epPct > 0 || ep.size) {
+            details = (epPct > 0 ? `<span>${epPct}%</span>` : "") + (ep.size ? `<span>${escapeHtml(ep.size)}</span>` : "");
+          }
         } else if (isEpFailed) {
           statusPill = `<span class="badge err" title="${escapeHtml(ep.error || "Failed")}">✗ Failed</span>`;
         } else {
@@ -2406,10 +2786,7 @@
               <div class="progress-track">
                 <div class="progress-fill ${isEpPaused ? "is-paused" : ""}" style="width: ${isEpDone ? 100 : epPct}%;"></div>
               </div>
-              <div class="dl-ep-details">
-                <span>${isEpActive ? epPct + "%" : (isEpDone ? "100%" : "")}</span>
-                ${details}
-              </div>
+              <div class="dl-ep-details">${details}</div>
             </div>
             <div class="dl-ep-meta">
               ${statusPill}
@@ -2422,23 +2799,36 @@
       }).join("");
 
       return `
-        <div class="dl-group ${isDownloading ? "is-downloading" : ""} ${isFailed ? "is-failed" : ""}" data-queue-id="${group.queueId}">
+        <div class="dl-group ${isDownloading ? "is-downloading" : ""} ${isPaused ? "is-paused" : ""} ${isFailed ? "is-failed" : ""} ${isCollapsed ? "is-collapsed" : ""}" data-queue-id="${group.queueId}">
           <div class="dl-group-head">
-            <div class="dl-group-info">
-              <span class="dl-group-title" title="${escapeHtml(group.title || group.slug)}">${escapeHtml(group.title || group.slug)}</span>
-              ${queueStatusBadge(group.status, group.error)}
+            <div class="dl-group-title-row">
+              <div class="dl-group-title" title="${escapeHtml(group.title || group.slug)}">${escapeHtml(group.title || group.slug)}</div>
+              <button class="btn btn-ghost btn-sm dl-group-collapse-btn" data-group-collapse="${group.queueId}" title="${isCollapsed ? "Expand episodes" : "Collapse episodes"}" aria-expanded="${!isCollapsed}" aria-label="${isCollapsed ? "Expand episodes" : "Collapse episodes"}">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>
+              </button>
             </div>
-            <div class="dl-group-actions">
-              <button class="btn btn-ghost btn-sm" data-group-toggle="${group.queueId}" title="${allPaused ? "Resume all episodes" : "Pause all episodes"}">
-                ${allPaused ? "▶ Resume all" : "⏸ Pause all"}
-              </button>
-              <button class="btn btn-ghost btn-sm" data-group-cancel="${group.queueId}" title="Cancel and remove anime from queue">
-                ✕ Cancel
-              </button>
+            <div class="dl-group-controls">
+              <div class="dl-group-status">
+                ${queueStatusBadge(group.status, group.error)}
+              </div>
+              <div class="dl-group-actions">
+                <button class="btn btn-ghost btn-sm" data-group-toggle="${group.queueId}" title="${allPaused ? "Resume all episodes" : "Pause all episodes"}">
+                  ${allPaused ? "▶ Resume all" : "⏸ Pause all"}
+                </button>
+                <button class="btn btn-ghost btn-sm" data-group-cancel="${group.queueId}" title="Cancel and remove anime from queue">
+                  ✕ Cancel
+                </button>
+              </div>
             </div>
           </div>
-          <div class="dl-group-bar">
-            <div class="dl-group-bar-fill" style="width: ${pct}%;"></div>
+          <div class="dl-group-progress">
+            <div class="dl-group-progress-head">
+              <span class="dl-group-progress-text">${escapeHtml(progText)}</span>
+              <span class="dl-group-progress-pct">${prog.pct}%</span>
+            </div>
+            <div class="dl-group-bar">
+              <div class="dl-group-bar-fill ${fillClass}" style="width: ${prog.pct}%;"></div>
+            </div>
           </div>
           <div class="dl-eps">
             ${epsHtml || `<div style="padding: 10px; font-size: 11.5px; color: var(--text-faint); text-align: center;">Episodes will appear once catalog resolves...</div>`}
@@ -2446,6 +2836,7 @@
         </div>
       `;
     }).join("");
+    container.scrollTop = prevScroll;
   }
 
   function updateDlOverall() {
@@ -2455,6 +2846,11 @@
     const done = allEps.filter(e => e.status === "done").length;
     const active = allEps.find(e => e.status === "downloading");
     const activeGroup = groups.find(g => g.status === "downloading");
+    const hasDownloading = Boolean(active || activeGroup);
+    const queuedEpsCount = allEps.filter(e => e.status === "queued" || e.status === "downloading").length;
+    const hasQueued = queuedEpsCount > 0 || groups.some(g => g.status === "queued");
+    const hasPaused = allEps.some(e => e.status === "paused") || groups.some(g => g.status === "paused");
+    const allPausedState = !hasDownloading && !hasQueued && (Boolean(state.job?.paused) || Boolean(state.queueHold) || hasPaused);
 
     const label = $("dlOverallLabel");
     const pct = $("dlOverallPercent");
@@ -2471,10 +2867,17 @@
       return;
     }
 
-    const overallPct = total > 0 ? Math.round((done / total) * 100) : 0;
+    let overallSum = 0;
+    for (const ep of allEps) {
+      if (ep.status === "done" || ep.status === "skipped") overallSum += 100;
+      else if (ep.status === "downloading" || ep.status === "paused") {
+        overallSum += Math.max(0, Math.min(100, typeof ep.percent === "number" ? ep.percent : 0));
+      }
+    }
+    const overallPct = total > 0 ? Math.max(0, Math.min(100, Math.round(overallSum / total))) : 0;
     if (fill) {
       fill.style.width = `${overallPct}%`;
-      fill.classList.toggle("is-paused", Boolean(state.job?.paused));
+      fill.classList.toggle("is-paused", allPausedState);
     }
     if (pct) pct.textContent = `${overallPct}%`;
 
@@ -2483,14 +2886,20 @@
       const speedStr = active.speed ? `⚡ ${active.speed}` : (state.job?.progress?.speed ? `⚡ ${state.job.progress.speed}` : "");
       const etaStr = active.eta ? `⏱ ETA ${active.eta}` : (state.job?.progress?.eta ? `⏱ ETA ${state.job.progress.eta}` : "");
       if (spd) spd.textContent = [speedStr, etaStr].filter(Boolean).join(" · ");
-    } else if (state.job?.paused || state.queueHold) {
-      if (label) label.textContent = "Downloads paused";
+    } else if (activeGroup) {
+      if (label) label.textContent = `Preparing ${escapeHtml(activeGroup.title || "anime")}...`;
+      if (spd) spd.textContent = "Starting";
+    } else if (allPausedState) {
+      if (label) label.textContent = state.queueHold ? "Queue paused" : "Downloads paused";
       if (spd) spd.textContent = "⏸ Paused";
     } else if (done === total && total > 0) {
       if (label) label.textContent = "All downloads completed";
       if (spd) spd.textContent = "✓ Completed";
     } else {
-      if (label) label.textContent = `${total - done} episode(s) queued`;
+      const queuedGroupsCount = groups.filter(g => g.status === "queued").length;
+      if (label) label.textContent = queuedEpsCount > 0
+        ? `${queuedEpsCount} episode(s) queued`
+        : `${queuedGroupsCount || groups.length} anime in queue`;
       if (spd) spd.textContent = "Queued";
     }
 
@@ -2566,6 +2975,11 @@
     }
   }
 
+  function findPausedGroupForSelected() {
+    if (!state.selectedSlug) return null;
+    return (state.queue || []).find(g => g.slug === state.selectedSlug && g.status === "paused") || null;
+  }
+
   function updateMainActionButton() {
     const isCurrentJob = Boolean(
       state.job &&
@@ -2575,6 +2989,7 @@
     );
     const hasJobRunning = Boolean(state.job && (state.job.running || state.job.paused));
     const count = state.episodesSelected ? state.episodesSelected.length : 0;
+    const pausedGroup = !isCurrentJob ? findPausedGroupForSelected() : null;
 
     const stopBtn = $("stopBtn");
     const startBtn = $("startBtn");
@@ -2584,6 +2999,10 @@
       if (stopBtn) stopBtn.disabled = false;
       startBtn.disabled = false;
       startBtn.textContent = state.job.paused ? "Resume" : "Pause";
+    } else if (count === 0 && pausedGroup) {
+      if (stopBtn) stopBtn.disabled = !hasJobRunning;
+      startBtn.disabled = false;
+      startBtn.textContent = "Resume";
     } else {
       if (stopBtn) stopBtn.disabled = !hasJobRunning;
       startBtn.disabled = count === 0;
@@ -2641,6 +3060,9 @@
       if (seq <= state.lastLogSeq) return;
       state.lastLogSeq = seq;
       state.logSeq = Math.max(state.logSeq, seq);
+      if (seq > (state.bootLogSeq || 0) && (entry.level === "error" || entry.level === "warn")) {
+        noteApiError(entry.text);
+      }
     }
     logQueue.push(entry);
     if (logQueue.length > MAX_QUEUED_LOGS) {
@@ -2707,7 +3129,7 @@
       applyJob(res.job);
       state.lastDoneJob = "";
       if (res.queued) {
-        toast(`'${state.selectedTitle || state.selectedSlug}' added to downloads — will start after current finishes`, "ok");
+        toast(res.message || `'${state.selectedTitle || state.selectedSlug}' added to downloads — will start after current finishes`, "ok");
       } else {
         toast(`Download started for '${state.selectedTitle || state.selectedSlug}'`, "ok");
       }
@@ -2725,21 +3147,20 @@
   }
 
   function pauseJob() {
-    api.post("/api/pause", {}).then(() => {
-      if (state.job) state.job.paused = true;
-      updatePill("paused");
-      updateMainActionButton();
+    api.post("/api/pause", {}).then(res => {
+      if (res && res.job) applyJob(res.job);
       updateProgressUI();
-      toast("Download paused", "warn");
+      updateMainActionButton();
+      const hasMoreQueued = (state.queue || []).some(e => e.status === "queued");
+      toast(hasMoreQueued ? "Current download paused — starting next queued anime" : "Download paused", "warn");
     }).catch(e => toast("Pause failed: " + e.message, "error"));
   }
 
   function resumeJob() {
-    api.post("/api/resume", {}).then(() => {
-      if (state.job) state.job.paused = false;
-      updatePill("running");
-      updateMainActionButton();
+    api.post("/api/resume", {}).then(res => {
+      if (res && res.job) applyJob(res.job);
       updateProgressUI();
+      updateMainActionButton();
       toast("Download resumed", "ok");
     }).catch(e => toast("Resume failed: " + e.message, "error"));
   }
@@ -2758,20 +3179,26 @@
       } else {
         pauseJob();
       }
-    } else {
-      startJob();
+      return;
     }
+
+    const count = state.episodesSelected ? state.episodesSelected.length : 0;
+    const pausedGroup = count === 0 ? findPausedGroupForSelected() : null;
+    if (pausedGroup) {
+      api.post("/api/queue/group/resume", { queueId: pausedGroup.id }).then(res => {
+        applyQueueResponse(res, "ok", "Download resumed");
+      }).catch(e => toast("Resume failed: " + e.message, "error"));
+      return;
+    }
+
+    startJob();
   }
 
   function stopJob() {
-    api.post("/api/stop", {}).then(() => {
-      if (state.job) {
-        state.job.running = false;
-        state.job.paused = false;
-      }
-      updatePill("idle");
-      updateMainActionButton();
+    api.post("/api/stop", {}).then(res => {
+      if (res && res.job) applyJob(res.job);
       updateProgressUI();
+      updateMainActionButton();
     }).catch(e => toast("Stop failed: " + e.message, "error"));
   }
 
@@ -2832,26 +3259,11 @@
       renderSettings();
       renderCatalog();
 
-      // Test connection on startup
-      await checkConnectionAndUpdateUI();
-
-      // Default to false - only auto-solve if user explicitly enabled it
-      const autoSolveOnLaunch = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "false") !== "false";
-      if (!state.config.cfConfigured) {
-        // Don't auto-open - just highlight the button
-        highlightSolveCfButton(true);
-      } else if (autoSolveOnLaunch) {
-        // Only auto-open if explicitly enabled AND connection failed
-        setTimeout(async () => {
-          // Check connection again before auto-opening
-          const connected = await testConnection();
-          if (!connected) {
-            openCfSolverModal();
-          }
-        }, 350);
-      }
       applyJob(init.job);
-      if (init.job?.logSeq !== undefined) state.logSeq = init.job.logSeq;
+      if (init.job?.logSeq !== undefined) {
+        state.logSeq = init.job.logSeq;
+        state.bootLogSeq = Number(init.job.logSeq || 0);
+      }
       if (init.job?.running) {
         updatePill(init.job?.paused ? "paused" : "running");
       } else if (init.job?.exitCode !== null && init.job?.exitCode !== undefined) {
@@ -2859,7 +3271,24 @@
       }
       updateMainActionButton();
       updateActionBarVisibility();
-      checkAppUpdates(true);
+
+      // At first start (no cf_clearance yet), keep Solve Cloudflare red so the
+      // user solves Cloudflare first; otherwise keep it green unless a CF error arises.
+      const autoSolveOnLaunch = (localStorage.getItem("paheflow_auto_solve_cf_on_launch") ?? "false") !== "false";
+      if (!state.config.cfConfigured) {
+        highlightSolveCfButton("needed");
+        if (autoSolveOnLaunch) {
+          openCfSolverModal();
+        }
+      } else {
+        highlightSolveCfButton("solved");
+        void checkConnectionAndUpdateUI().then((connected) => {
+          if (!connected && autoSolveOnLaunch) {
+            openCfSolverModal();
+          }
+        });
+      }
+      void checkAppUpdates(true);
     } catch (e) {
       toast("Failed to load initial state: " + e.message, "error");
     }
@@ -3039,12 +3468,30 @@
           return;
         }
 
+        const collapseGroupBtn = e.target.closest("[data-group-collapse]");
+        if (collapseGroupBtn) {
+          const queueId = Number(collapseGroupBtn.dataset.groupCollapse);
+          state.collapsedGroups = state.collapsedGroups || {};
+          const next = !state.collapsedGroups[queueId];
+          state.collapsedGroups[queueId] = next;
+          const groupEl = collapseGroupBtn.closest(".dl-group");
+          if (groupEl) groupEl.classList.toggle("is-collapsed", next);
+          const label = next ? "Expand episodes" : "Collapse episodes";
+          collapseGroupBtn.title = label;
+          collapseGroupBtn.setAttribute("aria-label", label);
+          collapseGroupBtn.setAttribute("aria-expanded", String(!next));
+          return;
+        }
+
         const toggleGroupBtn = e.target.closest("[data-group-toggle]");
         if (toggleGroupBtn) {
           const queueId = Number(toggleGroupBtn.dataset.groupToggle);
           const group = (state.dlGroups || []).find(g => g.queueId === queueId);
           const epItems = group?.epItems || [];
-          const allPaused = epItems.length > 0 && epItems.filter(i => ["queued", "paused", "downloading", "failed"].includes(i.status)).every(i => i.status === "paused" || i.status === "failed");
+          const pendingOrPaused = epItems.filter(i => ["queued", "paused", "downloading", "failed"].includes(i.status));
+          const allPaused = pendingOrPaused.length > 0
+            ? pendingOrPaused.every(i => i.status === "paused" || i.status === "failed")
+            : group?.status === "paused";
           const endpoint = allPaused ? "/api/queue/group/resume" : "/api/queue/group/pause";
           try {
             const res = await api.post(endpoint, { queueId });
@@ -3088,18 +3535,10 @@
     }, 150));
     $("clearSearch").onclick = () => { $("searchInput").value = ""; setCatalogMode("local"); };
     $$("#resultModes .seg").forEach(btn => btn.onclick = () => setCatalogMode(btn.dataset.mode));
-    $$("#recentAudioSeg .seg").forEach(btn => {
-      btn.onclick = () => {
-        $$("#recentAudioSeg .seg").forEach(b => b.classList.remove("is-active"));
-        btn.classList.add("is-active");
-        state.recentAudioFilter = btn.dataset.recentAudio || "all";
-        renderRecentReleases(true);
-      };
-    });
     $("refreshCatalog").onclick = refreshCatalog;
 
     // episodes
-    $("reloadEpisodes").onclick = () => loadEpisodes(state.selectedSlug, 1, state.audioFilter);
+    $("reloadEpisodes").onclick = () => loadEpisodes(state.selectedSlug, 1, state.audioFilter, null, true);
     $("epFilter").addEventListener("input", debounce(() => { state.epFilter = $("epFilter").value; renderEpGrid(); }));
     $$("#epAudioSegmented .seg").forEach(btn => {
       btn.onclick = () => {
@@ -3395,10 +3834,9 @@
     const banner = $("cookieBanner");
     if (banner) banner.classList.add("hidden");
     closeCfSolverModal();
-    // Show green "solved" state on buttons
-    highlightSolveCfButton("solved");
-    // Fade to normal after a moment
-    setTimeout(() => highlightSolveCfButton(false), 4000);
+    showConnectedStatusPill();
+    // Keep Solve Cloudflare green until a Cloudflare error arises
+    highlightSolveCfButton(state.config.cfConfigured ? "solved" : "needed");
     toast("Cloudflare credentials updated!", "ok");
     if (state.selectedSlug) {
       loadEpisodes(state.selectedSlug, state.epPage, state.audioFilter);

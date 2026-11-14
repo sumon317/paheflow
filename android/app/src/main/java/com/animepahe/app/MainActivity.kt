@@ -37,7 +37,6 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
-import java.net.Socket
 
 class MainActivity : AppCompatActivity() {
 
@@ -311,34 +310,40 @@ class MainActivity : AppCompatActivity() {
 
     private fun waitForServerAndLoad() {
         lifecycleScope.launch {
-            var ready = false
-            var attempts = 0
-            while (!ready && attempts < 30) {
-                delay(300)
-                attempts++
-                val p = NativeEngine.getServerPort()
-                if (p > 0) {
-                    serverPort = p
-                    ready = isPortOpen("127.0.0.1", p)
+            val port = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val app = AnimePaheApp.instance
+                app.awaitAssetsReady()
+                try {
+                    android.system.Os.setenv("ANIMEPAHE_APP_EXT_DOWNLOAD_DIR", app.getExternalDownloadDir().absolutePath, true)
+                    android.system.Os.setenv("ANIMEPAHE_GUI_CACHE_DIR", app.getAppCacheDir().absolutePath, true)
+                } catch (_: Exception) {}
+
+                var p = NativeEngine.startServer(
+                    preferredPort = 8765,
+                    resDir = app.getResourceDir().absolutePath,
+                    dataDir = app.getAppDataDir().absolutePath
+                )
+                var attempts = 0
+                while (p <= 0 && attempts < 40) {
+                    delay(50)
+                    attempts++
+                    p = NativeEngine.getServerPort()
                 }
+                p
             }
 
-            if (ready) {
+            if (port > 0) {
+                serverPort = port
                 webView.loadUrl("http://127.0.0.1:$serverPort/")
             } else {
                 Toast.makeText(this@MainActivity, "Server starting up, retrying…", Toast.LENGTH_SHORT).show()
-                delay(1000)
+                delay(300)
                 val p = NativeEngine.getServerPort()
-                if (p > 0) webView.loadUrl("http://127.0.0.1:$p/")
+                if (p > 0) {
+                    serverPort = p
+                    webView.loadUrl("http://127.0.0.1:$p/")
+                }
             }
-        }
-    }
-
-    private fun isPortOpen(host: String, port: Int): Boolean {
-        return try {
-            Socket(host, port).use { true }
-        } catch (_: Exception) {
-            false
         }
     }
 
@@ -420,6 +425,11 @@ class MainActivity : AppCompatActivity() {
         dialogView.findViewById<android.widget.Button>(R.id.btnStay).setOnClickListener { dialog.dismiss() }
         dialogView.findViewById<android.widget.Button>(R.id.btnExit).setOnClickListener {
             dialog.dismiss()
+            if (AnimePaheService.hasActiveDownload) {
+                Toast.makeText(this, "Downloads continuing in background", Toast.LENGTH_SHORT).show()
+            } else {
+                AnimePaheService.stopIfIdle(applicationContext)
+            }
             finish()
         }
 
@@ -803,9 +813,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun shutdown() {
-        AnimePaheService.stop(this)
-        finishAndRemoveTask()
-        android.os.Process.killProcess(android.os.Process.myPid())
+        AnimePaheService.performFullShutdown(applicationContext)
     }
 
     override fun onDestroy() {

@@ -54,6 +54,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/catalog", get(get_catalog))
         .route("/api/search", get(get_search))
         .route("/api/latest", get(get_latest_releases))
+        .route("/api/latest/meta", post(post_latest_meta))
         .route("/api/thumb", get(get_thumbnail))
         .route("/api/episodes", get(get_episodes))
         .route("/api/episode-options", get(get_episode_options))
@@ -205,7 +206,10 @@ fn resolve_static_file(raw_path: &str) -> Option<PathBuf> {
     resolve_static_in(&resource_dir().join("static"), raw_path)
 }
 
-async fn serve_static(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
+async fn serve_static(
+    headers: HeaderMap,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> impl IntoResponse {
     let Some(file_path) = resolve_static_file(&path) else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -213,14 +217,44 @@ async fn serve_static(axum::extract::Path(path): axum::extract::Path<String>) ->
             .unwrap();
     };
 
+    let etag = fs::metadata(&file_path).ok().and_then(|meta| {
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(format!("\"{:x}-{:x}\"", meta.len(), mtime))
+    });
+
+    if let (Some(ref tag), Some(if_none_match)) = (
+        &etag,
+        headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        if if_none_match.trim() == tag.as_str() {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(header::ETAG, tag.as_str())
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::empty())
+                .unwrap();
+        }
+    }
+
     let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
     match fs::read(&file_path) {
-        Ok(bytes) => Response::builder()
-            .header(header::CONTENT_TYPE, mime.as_ref())
-            .header(header::CACHE_CONTROL, "no-cache")
-            .header("X-Content-Type-Options", "nosniff")
-            .body(Body::from(bytes))
-            .unwrap(),
+        Ok(bytes) => {
+            let mut builder = Response::builder()
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header("X-Content-Type-Options", "nosniff");
+            if let Some(ref tag) = etag {
+                builder = builder.header(header::ETAG, tag.as_str());
+            }
+            builder.body(Body::from(bytes)).unwrap()
+        }
         Err(_) => Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::from("Error reading static file"))
@@ -656,6 +690,27 @@ async fn get_latest_releases(
     }
 }
 
+async fn post_latest_meta(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+    let queries: Vec<api::LatestMetaQuery> = body
+        .get("items")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let cfg = read_config();
+    let items = api::enrich_latest_item_meta(&state.client, queries, &cfg).await;
+    Ok(Json(serde_json::json!({ "ok": true, "items": items })))
+}
+
 async fn get_thumbnail(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
@@ -838,14 +893,18 @@ async fn get_episodes(
         .get("all")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
+    let refresh = query
+        .get("refresh")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     let audio_param = query.get("audio").cloned().unwrap_or_default();
     let cfg = read_config();
 
     let audio_filter = audio_param.trim().to_lowercase();
 
-    // 1. If the anime's full release is already cached on disk, use it directly
+    // 1. If the anime's full release is already cached on disk (and refresh is not requested), use it directly
     let (cached, saved_at) = api::load_release_cache_with_meta(&slug);
-    if !cached.is_empty() {
+    if !refresh && !cached.is_empty() {
         let available_audios = api::detect_available_audios(&cached);
         let total_all = cached.len();
         let filtered = api::filter_episodes_by_audio(&cached, &audio_filter);
@@ -885,18 +944,20 @@ async fn get_episodes(
     // 2. If all episodes requested (all=true) or no specific page, fetch the full release
     if all_param || page.is_none() {
         let mut rel_res = api::release_with_status(&state.client, &slug, &cfg).await;
-        if let Err(ref e) = rel_res {
-            if api::is_rotated_or_missing_error(e) {
-                if let Some(new_slug) =
-                    api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg).await
-                {
-                    println!(
-                        "[Slug Auto-Heal] Self-healed rotated slug: {} -> {}",
-                        slug, new_slug
-                    );
-                    slug = new_slug;
-                    rel_res = api::release_with_status(&state.client, &slug, &cfg).await;
-                }
+        let needs_heal = match &rel_res {
+            Err(e) => api::is_rotated_or_missing_error(e),
+            Ok(rel) => rel.items.is_empty(),
+        };
+        if needs_heal {
+            if let Some(new_slug) =
+                api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg).await
+            {
+                println!(
+                    "[Slug Auto-Heal] Self-healed rotated slug: {} -> {}",
+                    slug, new_slug
+                );
+                slug = new_slug;
+                rel_res = api::release_with_status(&state.client, &slug, &cfg).await;
             }
         }
         match rel_res {
@@ -906,6 +967,12 @@ async fn get_episodes(
                 let total_all = items.len();
                 let filtered = api::filter_episodes_by_audio(&items, &audio_filter);
                 let total = filtered.len();
+                let not_found = total_all == 0;
+                let warning = if not_found && rel.warning.is_none() {
+                    Some("No release data found on AnimePahe. This title may have been removed or unavailable.".to_string())
+                } else {
+                    rel.warning
+                };
 
                 return Ok(Json(serde_json::json!({
                     "items": filtered,
@@ -916,8 +983,9 @@ async fn get_episodes(
                     "totalAll": total_all,
                     "availableAudios": available_audios,
                     "audio": if audio_filter.is_empty() || audio_filter == "all" { serde_json::Value::Null } else { serde_json::json!(audio_filter) },
-                    "stale": rel.stale,
-                    "warning": rel.warning,
+                    "stale": rel.stale || not_found,
+                    "notFound": not_found,
+                    "warning": warning,
                 })));
             }
             Err(e) => {
@@ -957,8 +1025,13 @@ async fn get_episodes(
                 }
 
                 // If rate limited on full fetch, attempt to return page 1 gracefully
-                if e.contains("429") || e.to_lowercase().contains("too many requests") || e.contains("1015") {
-                    if let Ok((p1_items, last_p)) = api::release_page(&state.client, &slug, 1, &cfg).await {
+                if e.contains("429")
+                    || e.to_lowercase().contains("too many requests")
+                    || e.contains("1015")
+                {
+                    if let Ok((p1_items, last_p)) =
+                        api::release_page(&state.client, &slug, 1, &cfg).await
+                    {
                         if !p1_items.is_empty() {
                             let available_audios = api::detect_available_audios(&p1_items);
                             let total_all = p1_items.len();
@@ -991,19 +1064,20 @@ async fn get_episodes(
     // 3. Paginated single-page request fallback
     if let Some(pg) = page {
         let mut res = api::release_page(&state.client, &slug, pg, &cfg).await;
-        if let Err(ref e) = res {
-            if api::is_rotated_or_missing_error(e) {
-                if let Some(new_slug) =
-                    api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg)
-                        .await
-                {
-                    println!(
-                        "[Slug Auto-Heal] Self-healed rotated slug: {} -> {}",
-                        slug, new_slug
-                    );
-                    slug = new_slug;
-                    res = api::release_page(&state.client, &slug, pg, &cfg).await;
-                }
+        let needs_heal = match &res {
+            Err(e) => api::is_rotated_or_missing_error(e),
+            Ok((items, _)) => items.is_empty() && pg == 1,
+        };
+        if needs_heal {
+            if let Some(new_slug) =
+                api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg).await
+            {
+                println!(
+                    "[Slug Auto-Heal] Self-healed rotated slug: {} -> {}",
+                    slug, new_slug
+                );
+                slug = new_slug;
+                res = api::release_page(&state.client, &slug, pg, &cfg).await;
             }
         }
         match res {
@@ -1012,6 +1086,7 @@ async fn get_episodes(
                 let total_all = items.len();
                 let filtered = api::filter_episodes_by_audio(&items, &audio_filter);
                 let total = filtered.len();
+                let not_found = total_all == 0 && pg == 1;
 
                 // If this is the only page, cache it immediately so subsequent loads are instant
                 if last_page <= 1 && !items.is_empty() {
@@ -1027,7 +1102,9 @@ async fn get_episodes(
                     "totalAll": total_all,
                     "availableAudios": available_audios,
                     "audio": if audio_filter.is_empty() || audio_filter == "all" { serde_json::Value::Null } else { serde_json::json!(audio_filter) },
-                    "stale": false,
+                    "stale": not_found,
+                    "notFound": not_found,
+                    "warning": if not_found { Some("No release data found on AnimePahe. This title may have been removed or unavailable.") } else { None },
                 })))
             }
             Err(e) => {
@@ -1073,19 +1150,20 @@ async fn get_episodes(
         }
     } else {
         let mut res = api::release_with_status(&state.client, &slug, &cfg).await;
-        if let Err(ref e) = res {
-            if api::is_rotated_or_missing_error(e) {
-                if let Some(new_slug) =
-                    api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg)
-                        .await
-                {
-                    println!(
-                        "[Slug Auto-Heal] Self-healed rotated slug: {} -> {}",
-                        slug, new_slug
-                    );
-                    slug = new_slug;
-                    res = api::release_with_status(&state.client, &slug, &cfg).await;
-                }
+        let needs_heal = match &res {
+            Err(e) => api::is_rotated_or_missing_error(e),
+            Ok(list) => list.items.is_empty(),
+        };
+        if needs_heal {
+            if let Some(new_slug) =
+                api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg).await
+            {
+                println!(
+                    "[Slug Auto-Heal] Self-healed rotated slug: {} -> {}",
+                    slug, new_slug
+                );
+                slug = new_slug;
+                res = api::release_with_status(&state.client, &slug, &cfg).await;
             }
         }
         match res {
@@ -1094,6 +1172,7 @@ async fn get_episodes(
                 let total_all = list.items.len();
                 let filtered = api::filter_episodes_by_audio(&list.items, &audio_filter);
                 let total = filtered.len();
+                let not_found = total_all == 0;
                 Ok(Json(serde_json::json!({
                     "items": filtered,
                     "lastPage": 1,
@@ -1103,7 +1182,8 @@ async fn get_episodes(
                     "totalAll": total_all,
                     "availableAudios": available_audios,
                     "audio": if audio_filter.is_empty() || audio_filter == "all" { serde_json::Value::Null } else { serde_json::json!(audio_filter) },
-                    "stale": list.stale,
+                    "stale": list.stale || not_found,
+                    "notFound": not_found,
                     "warning": list.warning,
                 })))
             }
@@ -1605,7 +1685,10 @@ async fn post_pause(
         return Err(StatusCode::FORBIDDEN);
     }
     let paused = state.runner.pause().await;
-    Ok(Json(serde_json::json!({ "ok": true, "paused": paused })))
+    let snap = state.runner.snapshot(false).await;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "paused": paused, "job": snap }),
+    ))
 }
 
 async fn post_resume(
@@ -1616,7 +1699,10 @@ async fn post_resume(
         return Err(StatusCode::FORBIDDEN);
     }
     let resumed = state.runner.resume().await;
-    Ok(Json(serde_json::json!({ "ok": true, "resumed": resumed })))
+    let snap = state.runner.snapshot(false).await;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "resumed": resumed, "job": snap }),
+    ))
 }
 
 async fn post_stop(
@@ -1627,7 +1713,10 @@ async fn post_stop(
         return Err(StatusCode::FORBIDDEN);
     }
     let stopped = state.runner.stop().await;
-    Ok(Json(serde_json::json!({ "ok": true, "stopped": stopped })))
+    let snap = state.runner.snapshot(false).await;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "stopped": stopped, "job": snap }),
+    ))
 }
 
 async fn post_shutdown(

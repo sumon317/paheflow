@@ -291,8 +291,8 @@ impl HttpClient {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    let is_429 = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status.as_u16() == 429;
+                    let is_429 =
+                        status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 429;
 
                     let retry_after_secs = if is_429 {
                         resp.headers()
@@ -355,7 +355,9 @@ impl HttpClient {
 
                     if status.is_success() {
                         return Ok(text);
-                    } else if status == reqwest::StatusCode::NOT_FOUND {
+                    } else if status == reqwest::StatusCode::NOT_FOUND
+                        || status == reqwest::StatusCode::GONE
+                    {
                         return Err(format!("HTTP request failed with status code {}", status));
                     } else {
                         last_error = format!("HTTP request failed with status code {}", status);
@@ -379,8 +381,15 @@ impl HttpClient {
         cfg: &AppConfig,
     ) -> Result<serde_json::Value, String> {
         let body = self.fetch(url, referer, cfg).await?;
-        serde_json::from_str(&body).map_err(|e| {
-            if body.contains("<html") {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "animepahe.pw returned an empty response — slug may have rotated.".to_string(),
+            );
+        }
+        serde_json::from_str(trimmed).map_err(|e| {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("<html") || lower.starts_with("<!doctype") || trimmed.starts_with('<') {
                 "animepahe.pw returned HTML instead of JSON — slug may have rotated or cookie expired.".to_string()
             } else {
                 format!("Failed to parse JSON response: {}", e)

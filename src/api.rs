@@ -1,9 +1,12 @@
 use chrono::TimeZone;
+use futures_util::stream::{self, StreamExt};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use crate::client::HttpClient;
 use crate::config::{data_dir, resource_dir, AppConfig};
@@ -78,6 +81,41 @@ pub struct LatestReleaseItem {
     pub session: Option<String>,
     pub created_at: Option<String>,
     pub audio: Option<String>,
+    #[serde(default)]
+    pub has_sub: bool,
+    #[serde(default)]
+    pub has_dub: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesize: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub filesizes: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolutions: Vec<String>,
+    #[serde(default)]
+    pub meta_resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestMetaQuery {
+    pub slug: String,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub episode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestMetaResult {
+    pub slug: String,
+    pub session: String,
+    pub episode: String,
+    pub has_sub: bool,
+    pub has_dub: bool,
+    pub audios: Vec<String>,
+    pub resolutions: Vec<String>,
+    pub filesizes: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesize: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +191,9 @@ pub fn cache_warning(error: &str, count: usize, saved_at: Option<i64>) -> String
 }
 
 pub fn save_release_cache(slug: &str, episodes: &[EpisodeItem]) {
+    if episodes.is_empty() {
+        return;
+    }
     let path = cache_file(slug);
     let payload = serde_json::json!({
         "slug": slug,
@@ -262,7 +303,57 @@ pub async fn search(
     Ok(results)
 }
 
+fn episode_value_str(ep: &serde_json::Value) -> String {
+    match ep {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+pub fn pick_preferred_filesize(
+    resolutions: &[String],
+    filesizes: &HashMap<String, String>,
+    preferred_res: &str,
+) -> Option<String> {
+    let pref = preferred_res.trim();
+    if !pref.is_empty() {
+        if let Some(sz) = filesizes.get(pref) {
+            return Some(format!("{} ({}p)", sz, pref));
+        }
+    }
+    for r in resolutions {
+        if let Some(sz) = filesizes.get(r) {
+            return Some(format!("{} ({}p)", sz, r));
+        }
+    }
+    filesizes
+        .iter()
+        .next()
+        .map(|(r, sz)| format!("{} ({}p)", sz, r))
+}
+
+pub fn audio_flags_from_list(audios: &[String], fallback_dub: bool) -> (bool, bool) {
+    if audios.is_empty() {
+        return (true, fallback_dub);
+    }
+    let has_sub = audios
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case("jpn") || a.eq_ignore_ascii_case("sub"));
+    let has_dub = audios
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case("eng") || a.eq_ignore_ascii_case("dub"));
+    (has_sub, has_dub)
+}
+
 pub fn parse_latest_release_item(it: &serde_json::Value) -> Option<LatestReleaseItem> {
+    parse_latest_release_item_with_pref(it, "")
+}
+
+pub fn parse_latest_release_item_with_pref(
+    it: &serde_json::Value,
+    preferred_res: &str,
+) -> Option<LatestReleaseItem> {
     let anime_title = it
         .get("anime_title")
         .and_then(|v| v.as_str())
@@ -285,26 +376,59 @@ pub fn parse_latest_release_item(it: &serde_json::Value) -> Option<LatestRelease
         .trim()
         .to_lowercase();
     let title_lower = anime_title.to_lowercase();
-    let audio = if raw_audio == "dub"
+    let is_dub_hint = raw_audio == "dub"
         || raw_audio == "eng"
         || title_lower.contains("(dub)")
         || title_lower.contains("[dub]")
-        || title_lower.contains(" dub")
-    {
+        || title_lower.contains(" dub");
+    let audio = if is_dub_hint {
         Some("dub".to_string())
     } else {
         Some("sub".to_string())
     };
+
+    let episode = it
+        .get("episode")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let ep_str = episode_value_str(&episode);
+    let ep_session = it
+        .get("session")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let mut has_sub = true;
+    let mut has_dub = is_dub_hint;
+    let mut filesize = None;
+    let mut filesizes = HashMap::new();
+    let mut resolutions = Vec::new();
+    let mut meta_resolved = false;
+
+    if !ep_str.is_empty() {
+        if let Some(cached) = load_options_cache(&anime_session, &ep_str) {
+            let session_ok = ep_session
+                .as_deref()
+                .map(|s| s.is_empty() || cached.session == s)
+                .unwrap_or(true);
+            if session_ok && !cached.filesizes.is_empty() {
+                let (sub_flag, dub_flag) = audio_flags_from_list(&cached.audios, is_dub_hint);
+                has_sub = sub_flag;
+                has_dub = dub_flag || is_dub_hint;
+                filesize =
+                    pick_preferred_filesize(&cached.resolutions, &cached.filesizes, preferred_res);
+                filesizes = cached.filesizes;
+                resolutions = cached.resolutions;
+                meta_resolved = true;
+            }
+        }
+    }
 
     Some(LatestReleaseItem {
         id: it.get("id").and_then(|v| v.as_u64()),
         anime_id: it.get("anime_id").and_then(|v| v.as_u64()),
         anime_title,
         anime_session,
-        episode: it
-            .get("episode")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
+        episode,
         snapshot: it.get("snapshot").and_then(|v| v.as_str()).map(|s| {
             let s = s.trim();
             let mut url = if s.starts_with("//") {
@@ -327,16 +451,58 @@ pub fn parse_latest_release_item(it: &serde_json::Value) -> Option<LatestRelease
             .get("duration")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        session: it
-            .get("session")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        session: ep_session,
         created_at: it
             .get("created_at")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         audio,
+        has_sub,
+        has_dub,
+        filesize,
+        filesizes,
+        resolutions,
+        meta_resolved,
     })
+}
+
+pub fn merge_latest_release_items(items: Vec<LatestReleaseItem>) -> Vec<LatestReleaseItem> {
+    let mut merged: Vec<LatestReleaseItem> = Vec::with_capacity(items.len());
+    for item in items {
+        let ep_str = episode_value_str(&item.episode);
+        if let Some(existing) = merged.iter_mut().find(|e| {
+            e.anime_session == item.anime_session
+                && ep_matches(&episode_value_str(&e.episode), &ep_str)
+        }) {
+            existing.has_sub = existing.has_sub || item.has_sub;
+            existing.has_dub = existing.has_dub || item.has_dub;
+            if existing.has_dub {
+                existing.audio = Some("dub".to_string());
+            }
+            if existing.snapshot.as_deref().unwrap_or("").is_empty() {
+                existing.snapshot = item.snapshot;
+            }
+            if existing.duration.as_deref().unwrap_or("").is_empty() {
+                existing.duration = item.duration;
+            }
+            if existing.session.as_deref().unwrap_or("").is_empty() {
+                existing.session = item.session;
+            }
+            if existing.filesize.is_none() && item.filesize.is_some() {
+                existing.filesize = item.filesize;
+            }
+            for (k, v) in item.filesizes {
+                existing.filesizes.entry(k).or_insert(v);
+            }
+            if existing.resolutions.is_empty() && !item.resolutions.is_empty() {
+                existing.resolutions = item.resolutions;
+            }
+            existing.meta_resolved = existing.meta_resolved || item.meta_resolved;
+        } else {
+            merged.push(item);
+        }
+    }
+    merged
 }
 
 pub async fn latest_releases(
@@ -345,6 +511,7 @@ pub async fn latest_releases(
     cfg: &AppConfig,
     all: bool,
 ) -> Result<LatestReleasesPage, String> {
+    let pref_res = "";
     if all {
         const MAX_PAGES: u32 = 5;
         let url = format!("{}?m=airing&page=1", API_URL);
@@ -374,7 +541,7 @@ pub async fn latest_releases(
         let mut all_items = Vec::new();
         if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
             for it in data {
-                if let Some(item) = parse_latest_release_item(it) {
+                if let Some(item) = parse_latest_release_item_with_pref(it, pref_res) {
                     all_items.push(item);
                 }
             }
@@ -388,7 +555,7 @@ pub async fn latest_releases(
                 if let Ok(page_json) = client.fetch_json(&u, None, cfg).await {
                     if let Some(data) = page_json.get("data").and_then(|d| d.as_array()) {
                         for it in data {
-                            if let Some(item) = parse_latest_release_item(it) {
+                            if let Some(item) = parse_latest_release_item_with_pref(it, pref_res) {
                                 all_items.push(item);
                             }
                         }
@@ -397,14 +564,15 @@ pub async fn latest_releases(
             }
         }
 
+        let merged = merge_latest_release_items(all_items);
         Ok(LatestReleasesPage {
             page: 1,
             current_page: 1,
             last_page: 1,
             last_page_camel: 1,
-            total: if total > 0 { total } else { all_items.len() },
-            items: all_items.clone(),
-            data: all_items,
+            total: if total > 0 { total } else { merged.len() },
+            items: merged.clone(),
+            data: merged,
         })
     } else {
         // Single page fetch
@@ -438,22 +606,74 @@ pub async fn latest_releases(
         let mut items = Vec::new();
         if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
             for it in data {
-                if let Some(item) = parse_latest_release_item(it) {
+                if let Some(item) = parse_latest_release_item_with_pref(it, pref_res) {
                     items.push(item);
                 }
             }
         }
 
+        let merged = merge_latest_release_items(items);
         Ok(LatestReleasesPage {
             page: page_val,
             current_page: page_val,
             last_page,
             last_page_camel: last_page,
-            total: if total > 0 { total } else { items.len() },
-            items: items.clone(),
-            data: items,
+            total: if total > 0 { total } else { merged.len() },
+            items: merged.clone(),
+            data: merged,
         })
     }
+}
+
+pub async fn enrich_latest_item_meta(
+    client: &HttpClient,
+    queries: Vec<LatestMetaQuery>,
+    cfg: &AppConfig,
+) -> Vec<LatestMetaResult> {
+    let capped: Vec<LatestMetaQuery> = queries
+        .into_iter()
+        .filter(|q| !q.slug.trim().is_empty() && !q.session.trim().is_empty())
+        .take(20)
+        .collect();
+
+    stream::iter(capped)
+        .map(|q| {
+            let client = client.clone();
+            let cfg = cfg.clone();
+            async move {
+                let ep_val = q
+                    .episode
+                    .trim()
+                    .parse::<u64>()
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|_| serde_json::Value::String(q.episode.clone()));
+                let opts = match episode_options_by_session(
+                    &client, &q.slug, &q.session, &q.episode, ep_val, &cfg,
+                )
+                .await
+                {
+                    Ok(o) => o,
+                    Err(_) => return None,
+                };
+                let (has_sub, has_dub) = audio_flags_from_list(&opts.audios, false);
+                let filesize = pick_preferred_filesize(&opts.resolutions, &opts.filesizes, "");
+                Some(LatestMetaResult {
+                    slug: q.slug,
+                    session: q.session,
+                    episode: q.episode,
+                    has_sub,
+                    has_dub,
+                    audios: opts.audios,
+                    resolutions: opts.resolutions,
+                    filesizes: opts.filesizes,
+                    filesize,
+                })
+            }
+        })
+        .buffer_unordered(3)
+        .filter_map(|x| async move { x })
+        .collect()
+        .await
 }
 
 pub async fn release_page(
@@ -577,31 +797,37 @@ pub async fn release_with_status(
     if last_page > 1 {
         let target_pages: Vec<u32> = (2..=last_page.min(MAX_RELEASE_PAGES)).collect();
         for &page in &target_pages {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             match release_page(client, slug, page, cfg).await {
                 Ok((page_items, _)) => {
                     for item in page_items {
-                        if !item.session.is_empty()
-                            && seen_sessions.insert(item.session.clone())
-                        {
+                        if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
                             all_episodes.push(item);
                         }
                     }
                 }
                 Err(err) => {
-                    // Back off 1.5s on error / rate-limit and retry once
-                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                    match release_page(client, slug, page, cfg).await {
-                        Ok((page_items, _)) => {
-                            for item in page_items {
-                                if !item.session.is_empty()
-                                    && seen_sessions.insert(item.session.clone())
-                                {
-                                    all_episodes.push(item);
+                    let lower_err = err.to_lowercase();
+                    let already_rate_limited = lower_err.contains("429")
+                        || lower_err.contains("rate-limit")
+                        || lower_err.contains("rate limit")
+                        || lower_err.contains("1015");
+                    if already_rate_limited {
+                        page_errors.push(format!("page {}: {}", page, err));
+                    } else {
+                        // Back off 1.5s on transient error and retry once
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        match release_page(client, slug, page, cfg).await {
+                            Ok((page_items, _)) => {
+                                for item in page_items {
+                                    if !item.session.is_empty()
+                                        && seen_sessions.insert(item.session.clone())
+                                    {
+                                        all_episodes.push(item);
+                                    }
                                 }
                             }
+                            Err(_) => page_errors.push(format!("page {}: {}", page, err)),
                         }
-                        Err(_) => page_errors.push(format!("page {}: {}", page, err)),
                     }
                 }
             }
@@ -619,7 +845,9 @@ pub async fn release_with_status(
             serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
             _ => 0.0,
         };
-        a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal)
+        a_num
+            .partial_cmp(&b_num)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     // Save whenever full or we fetched multiple pages successfully
@@ -744,16 +972,17 @@ pub fn parse_sources_from_html(html: &str) -> Vec<PlaySource> {
     // 2. Parse download links from #pickDownload or dropdown items
     // e.g. <a href="https://pahe.win/..." class="dropdown-item" target="_blank">Show - 720p (145MB)</a>
     if let (Some(res_re), Some(size_re)) = (&res_re, &size_re) {
-        if let Ok(a_re) = Regex::new(r#"(?i)<a\b([^>]*)>(.*?)</a>"#) {
+        if let Ok(a_re) = Regex::new(r#"(?is)<a\b([^>]*)>(.*?)</a>"#) {
             if let Ok(href_re) = Regex::new(r#"(?i)href\s*=\s*"([^"]*)""#) {
                 for cap in a_re.captures_iter(html) {
                     let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
                     let text = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
+                    let text_upper = text.to_ascii_uppercase();
 
                     let is_download_link = attrs.contains("dropdown-item")
                         || attrs.contains("pahe.win")
-                        || text.contains("MB")
-                        || text.contains("GB");
+                        || text_upper.contains("MB")
+                        || text_upper.contains("GB");
 
                     if !is_download_link {
                         continue;
@@ -910,78 +1139,36 @@ pub async fn play_sources(
     Ok(sources)
 }
 
-pub async fn available_options(
-    client: &HttpClient,
-    slug: &str,
-    episode_num: &str,
-    cfg: &AppConfig,
-) -> Result<AvailableOptions, String> {
-    // 1. Fast path: check disk cache first!
-    let (cached_eps, _) = load_release_cache_with_meta(slug);
-    let target = if let Some(target_ep) = cached_eps.iter().find(|e| {
-        let ep_str = match &e.episode {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            _ => String::new(),
-        };
-        ep_matches(&ep_str, episode_num)
-    }) {
-        target_ep.clone()
-    } else {
-        // 2. Not in disk cache: fetch page 1 first (most requested episodes are on page 1)
-        let (p1_items, last_page) = release_page(client, slug, 1, cfg).await?;
-        if let Some(target_ep) = p1_items.iter().find(|e| {
-            let ep_str = match &e.episode {
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::String(s) => s.clone(),
-                _ => String::new(),
-            };
-            ep_matches(&ep_str, episode_num)
-        }) {
-            if last_page <= 1 && !p1_items.is_empty() {
-                save_release_cache(slug, &p1_items);
-            }
-            target_ep.clone()
-        } else {
-            // 3. Fallback: fetch full release list
-            let list = release(client, slug, cfg).await?;
-            list.into_iter()
-                .find(|e| {
-                    let ep_str = match &e.episode {
-                        serde_json::Value::Number(n) => n.to_string(),
-                        serde_json::Value::String(s) => s.clone(),
-                        _ => String::new(),
-                    };
-                    ep_matches(&ep_str, episode_num)
-                })
-                .ok_or_else(|| format!("Episode {} not found for this anime", episode_num))?
-        }
-    };
-
-    let sources = match play_sources(client, slug, &target.session, cfg).await {
-        Ok(s) => s,
-        Err(err) => {
-            if let Some(cached) = load_options_cache(slug, episode_num) {
-                return Ok(cached);
-            }
-            return Err(err);
-        }
-    };
-
+fn build_available_options(
+    episode: serde_json::Value,
+    session: String,
+    sources: &[PlaySource],
+) -> AvailableOptions {
     let mut resolutions_set = HashSet::new();
     let mut audios_set = HashSet::new();
     let mut combinations = Vec::new();
     let mut seen_pairs = HashSet::new();
     let mut filesizes = HashMap::new();
 
-    for s in &sources {
+    // Prefer non-AV1 sizes first so size display matches the default downloaded stream.
+    for prefer_non_av1 in [true, false] {
+        for s in sources {
+            if prefer_non_av1 && s.av1 == "1" {
+                continue;
+            }
+            if !s.resolution.is_empty() {
+                if let Some(ref sz) = s.filesize {
+                    filesizes
+                        .entry(s.resolution.clone())
+                        .or_insert_with(|| sz.clone());
+                }
+            }
+        }
+    }
+
+    for s in sources {
         if !s.resolution.is_empty() {
             resolutions_set.insert(s.resolution.clone());
-            if let Some(ref sz) = s.filesize {
-                filesizes
-                    .entry(s.resolution.clone())
-                    .or_insert_with(|| sz.clone());
-            }
         }
         if !s.audio.is_empty() {
             audios_set.insert(s.audio.clone());
@@ -1009,19 +1196,99 @@ pub async fn available_options(
     let mut audios: Vec<String> = audios_set.into_iter().collect();
     audios.sort();
 
-    let res = AvailableOptions {
-        episode: target.episode.clone(),
-        session: target.session.clone(),
+    AvailableOptions {
+        episode,
+        session,
         resolutions,
         audios,
         combinations,
         source_count: sources.len(),
         filesizes,
+    }
+}
+
+pub async fn episode_options_by_session(
+    client: &HttpClient,
+    slug: &str,
+    ep_session: &str,
+    episode_num: &str,
+    episode_val: serde_json::Value,
+    cfg: &AppConfig,
+) -> Result<AvailableOptions, String> {
+    if !episode_num.trim().is_empty() {
+        if let Some(cached) = load_options_cache(slug, episode_num) {
+            if (cached.session == ep_session || ep_session.trim().is_empty())
+                && !cached.filesizes.is_empty()
+            {
+                return Ok(cached);
+            }
+        }
+    }
+
+    let sources = match play_sources(client, slug, ep_session, cfg).await {
+        Ok(s) => s,
+        Err(err) => {
+            if !episode_num.trim().is_empty() {
+                if let Some(cached) = load_options_cache(slug, episode_num) {
+                    return Ok(cached);
+                }
+            }
+            return Err(err);
+        }
     };
 
-    save_options_cache(slug, episode_num, &res);
-
+    let res = build_available_options(episode_val, ep_session.to_string(), &sources);
+    if !episode_num.trim().is_empty() {
+        save_options_cache(slug, episode_num, &res);
+    }
     Ok(res)
+}
+
+pub async fn available_options(
+    client: &HttpClient,
+    slug: &str,
+    episode_num: &str,
+    cfg: &AppConfig,
+) -> Result<AvailableOptions, String> {
+    // 1. Fast path: check disk cache first!
+    let (cached_eps, _) = load_release_cache_with_meta(slug);
+    let target = if let Some(target_ep) = cached_eps.iter().find(|e| {
+        let ep_str = episode_value_str(&e.episode);
+        ep_matches(&ep_str, episode_num)
+    }) {
+        target_ep.clone()
+    } else {
+        // 2. Not in disk cache: fetch page 1 first (most requested episodes are on page 1)
+        let (p1_items, last_page) = release_page(client, slug, 1, cfg).await?;
+        if let Some(target_ep) = p1_items.iter().find(|e| {
+            let ep_str = episode_value_str(&e.episode);
+            ep_matches(&ep_str, episode_num)
+        }) {
+            if last_page <= 1 && !p1_items.is_empty() {
+                save_release_cache(slug, &p1_items);
+            }
+            target_ep.clone()
+        } else {
+            // 3. Fallback: fetch full release list
+            let list = release(client, slug, cfg).await?;
+            list.into_iter()
+                .find(|e| {
+                    let ep_str = episode_value_str(&e.episode);
+                    ep_matches(&ep_str, episode_num)
+                })
+                .ok_or_else(|| format!("Episode {} not found for this anime", episode_num))?
+        }
+    };
+
+    episode_options_by_session(
+        client,
+        slug,
+        &target.session,
+        episode_num,
+        target.episode.clone(),
+        cfg,
+    )
+    .await
 }
 
 pub fn catalog_path() -> PathBuf {
@@ -1032,42 +1299,118 @@ pub fn catalog_path() -> PathBuf {
 
 fn ensure_catalog_seeded() {
     let path = catalog_path();
-    if path.exists() {
+    let bundled = resource_dir().join("anime.list");
+    if !bundled.is_file() || bundled == path {
         return;
     }
-    let bundled = resource_dir().join("anime.list");
-    if bundled.is_file() && bundled != path {
-        let _ = fs::copy(&bundled, &path);
+    if !path.exists() {
+        if fs::copy(&bundled, &path).is_ok() {
+            invalidate_catalog_cache();
+        }
+        return;
     }
+
+    // If the app/APK was upgraded with a newer bundled anime.list (for example,
+    // after site-wide slug rotations), update the seeded data_dir copy as long
+    // as the user hasn't refreshed anime.list more recently than the bundle.
+    if let (Ok(b_meta), Ok(p_meta)) = (fs::metadata(&bundled), fs::metadata(&path)) {
+        if let (Ok(b_mtime), Ok(p_mtime)) = (b_meta.modified(), p_meta.modified()) {
+            if b_mtime > p_mtime && fs::copy(&bundled, &path).is_ok() {
+                invalidate_catalog_cache();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CatalogCache {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    entries: Vec<CatalogEntry>,
+}
+
+static CATALOG_CACHE: OnceLock<Mutex<Option<CatalogCache>>> = OnceLock::new();
+
+fn catalog_cache() -> &'static Mutex<Option<CatalogCache>> {
+    CATALOG_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn invalidate_catalog_cache() {
+    if let Ok(mut guard) = catalog_cache().lock() {
+        *guard = None;
+    }
+}
+
+fn parse_catalog_line(line: &str) -> Option<CatalogEntry> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix('[')?;
+    let (slug_raw, after_bracket) = rest.split_once(']')?;
+    let slug = slug_raw.trim();
+    if slug.is_empty() {
+        return None;
+    }
+    let after = after_bracket.trim_start();
+    let (title, poster) = match after.split_once('|') {
+        Some((t, p)) => {
+            let p_trimmed = p.trim();
+            let poster = if p_trimmed.is_empty() {
+                None
+            } else {
+                Some(p_trimmed.to_string())
+            };
+            (t.trim().to_string(), poster)
+        }
+        None => (after.trim().to_string(), None),
+    };
+    Some(CatalogEntry {
+        slug: slug.to_string(),
+        title,
+        poster,
+    })
 }
 
 pub fn catalog() -> Vec<CatalogEntry> {
     ensure_catalog_seeded();
     let path = catalog_path();
+
+    let meta = fs::metadata(&path).ok();
+    let modified = meta.as_ref().and_then(|m| m.modified().ok());
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+
+    if let Ok(guard) = catalog_cache().lock() {
+        if let Some(ref cached) = *guard {
+            if cached.path == path && cached.modified == modified && cached.len == len {
+                return cached.entries.clone();
+            }
+        }
+    }
+
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
     if let Ok(raw) = fs::read_to_string(&path) {
         // Format: [slug] title | poster_url
-        let line_re = Regex::new(r#"^\[([^\]]+)\]\s*(.*?)(?:\s*\|\s*(.*?))?\s*$"#).unwrap();
         for line in raw.lines() {
-            if let Some(caps) = line_re.captures(line.trim()) {
-                let slug = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-                let title = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                let poster = caps
-                    .get(3)
-                    .map(|m| m.as_str().trim().to_string())
-                    .filter(|s| !s.is_empty());
-                if !slug.is_empty() && seen.insert(slug.to_string()) {
-                    entries.push(CatalogEntry {
-                        slug: slug.to_string(),
-                        title: title.to_string(),
-                        poster,
-                    });
+            if let Some(entry) = parse_catalog_line(line) {
+                if seen.insert(entry.slug.clone()) {
+                    entries.push(entry);
                 }
             }
         }
     }
+
+    if meta.is_some() {
+        if let Ok(mut guard) = catalog_cache().lock() {
+            *guard = Some(CatalogCache {
+                path,
+                modified,
+                len,
+                entries: entries.clone(),
+            });
+        }
+    }
+
     entries
 }
 
@@ -1094,6 +1437,7 @@ fn write_catalog_atomic(content: &str) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         return Err(format!("Cannot replace anime.list: {}", e));
     }
+    invalidate_catalog_cache();
     Ok(())
 }
 
@@ -1106,11 +1450,16 @@ pub fn ensure_entry(slug: &str, title: &str) {
     use std::io::Write;
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = file.write_all(catalog_line(slug, title, None).as_bytes());
+        invalidate_catalog_cache();
     }
 }
 
 pub fn update_slug_in_catalog(old_slug: &str, new_slug: &str, title: &str) {
     let mut current = catalog();
+    let preserved_poster = current
+        .iter()
+        .find(|e| e.slug == old_slug || e.title.eq_ignore_ascii_case(title))
+        .and_then(|e| e.poster.clone());
 
     // Remove old_slug or existing duplicate entries for the same title
     current.retain(|e| {
@@ -1121,7 +1470,7 @@ pub fn update_slug_in_catalog(old_slug: &str, new_slug: &str, title: &str) {
         current.push(CatalogEntry {
             slug: new_slug.to_string(),
             title: title.to_string(),
-            poster: None,
+            poster: preserved_poster,
         });
     }
 
@@ -1215,11 +1564,36 @@ pub async fn refresh_catalog(
 
 pub fn is_rotated_or_missing_error(err: &str) -> bool {
     let lower = err.to_lowercase();
+    if lower.contains("cloudflare") || lower.contains("cf_clearance") || lower.contains("403") {
+        return false;
+    }
     lower.contains("404")
+        || lower.contains("410")
         || lower.contains("not found")
         || lower.contains("slug may have rotated")
         || lower.contains("returned html instead of json")
         || lower.contains("no data for this request")
+        || lower.contains("empty response")
+}
+
+fn push_unique_term(terms: &mut Vec<String>, candidate: String) {
+    let c = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+    if c.len() >= 2 && !terms.iter().any(|t| t.eq_ignore_ascii_case(&c)) {
+        terms.push(c);
+    }
+}
+
+fn strip_season_and_tags(title: &str) -> String {
+    let mut out = title.to_string();
+    if let Ok(re_parens) = Regex::new(r#"(?i)\s*[\(\[][^\)\]]*[\)\]]"#) {
+        out = re_parens.replace_all(&out, " ").to_string();
+    }
+    if let Ok(re_season) = Regex::new(
+        r#"(?i)\b(?:season\s*\d+|\d+(?:st|nd|rd|th)\s*season|part\s*\d+|cour\s*\d+|specials?|ova|ona)\b"#,
+    ) {
+        out = re_season.replace_all(&out, " ").to_string();
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn generate_search_terms(title: &str) -> Vec<String> {
@@ -1243,24 +1617,41 @@ fn generate_search_terms(title: &str) -> Vec<String> {
         terms.push(cleaned.clone());
     }
 
-    // If title has multiple parts (e.g. separated by colon, slash, dash, semicolon)
-    if let Some(pos) = trimmed.find([':', '/', '-', ';']) {
-        let prefix = trimmed[..pos].trim();
-        if prefix.len() >= 3 && prefix != trimmed {
-            terms.push(prefix.to_string());
-            let clean_prefix: String = prefix
+    // Segments separated by ':', '/', '-', ';'
+    for (idx, seg) in trimmed.split([':', '/', '-', ';']).enumerate() {
+        let seg_trim = seg.trim();
+        let min_len = if idx == 0 { 3 } else { 5 };
+        if seg_trim.len() >= min_len && seg_trim != trimmed {
+            push_unique_term(&mut terms, seg_trim.to_string());
+            let clean_seg: String = seg_trim
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { ' ' })
                 .collect::<String>()
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            if !clean_prefix.is_empty() && clean_prefix != prefix {
-                terms.push(clean_prefix);
+            if clean_seg.len() >= min_len {
+                push_unique_term(&mut terms, clean_seg);
             }
         }
     }
 
+    // Without season/bracket tags (so search returns all seasons to score)
+    let stripped = strip_season_and_tags(&cleaned);
+    if stripped.len() >= 3 {
+        push_unique_term(&mut terms, stripped);
+    }
+
+    // First 4 words / first 3 words for long titles
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.len() > 4 {
+        push_unique_term(&mut terms, words[..4].join(" "));
+    }
+    if words.len() > 3 {
+        push_unique_term(&mut terms, words[..3].join(" "));
+    }
+
+    terms.truncate(6);
     terms
 }
 
@@ -1269,6 +1660,96 @@ fn normalize_for_match(s: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .collect::<String>()
         .to_lowercase()
+}
+
+fn extract_season_number(s: &str) -> Option<u32> {
+    let lower = s.to_lowercase();
+    if let Ok(re) = Regex::new(
+        r#"(?i)(?:\bseason\s*(\d+)|\b(\d+)(?:st|nd|rd|th)\s*season|\bs(\d+)\b|\bpart\s*(\d+)|\bcour\s*(\d+))"#,
+    ) {
+        if let Some(caps) = re.captures(&lower) {
+            for i in 1..=5 {
+                if let Some(m) = caps.get(i) {
+                    if let Ok(n) = m.as_str().parse::<u32>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(last_word) = lower.split_whitespace().last() {
+        let clean = last_word.trim_matches(|c: char| !c.is_alphanumeric());
+        match clean {
+            "ii" => return Some(2),
+            "iii" => return Some(3),
+            "iv" => return Some(4),
+            "v" => return Some(5),
+            _ => {
+                if let Ok(n) = clean.parse::<u32>() {
+                    if (2..=20).contains(&n) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn score_slug_match(target: &str, candidate: &str) -> Option<i32> {
+    let t_trim = target.trim();
+    let c_trim = candidate.trim();
+    if t_trim.is_empty() || c_trim.is_empty() {
+        return None;
+    }
+    if c_trim.eq_ignore_ascii_case(t_trim) {
+        return Some(1000);
+    }
+    let norm_t = normalize_for_match(t_trim);
+    let norm_c = normalize_for_match(c_trim);
+    if norm_t.is_empty() || norm_c.is_empty() {
+        return None;
+    }
+    if norm_t == norm_c {
+        return Some(900);
+    }
+
+    // Do not confuse different numbered seasons/parts (e.g. Overlord vs Overlord II)
+    let season_t = extract_season_number(t_trim);
+    let season_c = extract_season_number(c_trim);
+    if season_t != season_c && (season_t.is_some() || season_c.is_some()) {
+        // Allow "Title 2" vs "Title Season 2" (both extract Some(2)), reject Some(1)/None vs Some(2)
+        return None;
+    }
+
+    if norm_c.starts_with(&norm_t) || norm_t.starts_with(&norm_c) {
+        let diff = norm_c.len().abs_diff(norm_t.len()) as i32;
+        return Some((750 - diff * 5).max(450));
+    }
+
+    // Token overlap score (handles slightly reworded subtitles or Japanese/English hybrids)
+    let t_words: HashSet<String> = t_trim
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .map(String::from)
+        .collect();
+    let c_words: HashSet<String> = c_trim
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 2)
+        .map(String::from)
+        .collect();
+    if t_words.is_empty() || c_words.is_empty() {
+        return None;
+    }
+    let overlap = t_words.intersection(&c_words).count();
+    let union = t_words.union(&c_words).count();
+    if union > 0 && overlap * 100 / union >= 65 {
+        return Some(450 + ((overlap * 200) / union) as i32);
+    }
+
+    None
 }
 
 pub async fn resolve_active_slug(
@@ -1286,29 +1767,38 @@ pub async fn resolve_active_slug(
     }
 
     let search_terms = generate_search_terms(&title);
-    let norm_target = normalize_for_match(&title);
+    let mut best_match: Option<(i32, String, String)> = None;
 
     for term in search_terms {
         if let Ok(results) = search(client, &term, cfg).await {
             for res in results {
-                let norm_res = normalize_for_match(&res.title);
-                let is_match = res.title.trim().eq_ignore_ascii_case(title.trim())
-                    || (!norm_res.is_empty()
-                        && !norm_target.is_empty()
-                        && (norm_res == norm_target
-                            || norm_res.starts_with(&norm_target)
-                            || norm_target.starts_with(&norm_res)));
-
-                if is_match {
-                    let new_slug = res.slug;
-                    if !new_slug.is_empty() && new_slug != slug {
-                        update_slug_in_catalog(slug, &new_slug, &res.title);
-                        return Some(new_slug);
+                if res.slug.is_empty() || res.slug == slug {
+                    continue;
+                }
+                if let Some(score) = score_slug_match(&title, &res.title) {
+                    let replace = best_match
+                        .as_ref()
+                        .map(|(best_s, _, _)| score > *best_s)
+                        .unwrap_or(true);
+                    if replace {
+                        best_match = Some((score, res.slug.clone(), res.title.clone()));
+                    }
+                    if score >= 850 {
+                        update_slug_in_catalog(slug, &res.slug, &res.title);
+                        return Some(res.slug);
                     }
                 }
             }
         }
     }
+
+    if let Some((score, new_slug, new_title)) = best_match {
+        if score >= 450 {
+            update_slug_in_catalog(slug, &new_slug, &new_title);
+            return Some(new_slug);
+        }
+    }
+
     None
 }
 
@@ -1522,6 +2012,8 @@ mod tests {
         });
         let item1 = parse_latest_release_item(&dub_item).unwrap();
         assert_eq!(item1.audio, Some("dub".to_string()));
+        assert!(item1.has_sub);
+        assert!(item1.has_dub);
 
         let sub_item = serde_json::json!({
             "id": 101,
@@ -1533,6 +2025,8 @@ mod tests {
         });
         let item2 = parse_latest_release_item(&sub_item).unwrap();
         assert_eq!(item2.audio, Some("sub".to_string()));
+        assert!(item2.has_sub);
+        assert!(!item2.has_dub);
 
         let explicit_dub = serde_json::json!({
             "id": 102,
@@ -1544,6 +2038,60 @@ mod tests {
         });
         let item3 = parse_latest_release_item(&explicit_dub).unwrap();
         assert_eq!(item3.audio, Some("dub".to_string()));
+        assert!(item3.has_sub);
+        assert!(item3.has_dub);
+    }
+
+    #[test]
+    fn merges_duplicate_recent_releases_across_sub_and_dub() {
+        let sub_only = parse_latest_release_item(&serde_json::json!({
+            "anime_title": "Frieren",
+            "anime_session": "frieren-1",
+            "episode": 5,
+            "audio": "jpn",
+            "session": "ep5-sub"
+        }))
+        .unwrap();
+        let dub_only = parse_latest_release_item(&serde_json::json!({
+            "anime_title": "Frieren",
+            "anime_session": "frieren-1",
+            "episode": 5,
+            "audio": "eng",
+            "session": "ep5-dub"
+        }))
+        .unwrap();
+
+        let merged = merge_latest_release_items(vec![sub_only, dub_only]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].has_sub);
+        assert!(merged[0].has_dub);
+        assert_eq!(merged[0].audio, Some("dub".to_string()));
+    }
+
+    #[test]
+    fn parses_multiline_pick_download_links_and_sizes() {
+        let html = r#"
+            <div id="resolutionMenu">
+                <button type="button" data-src="https://kwik.cx/e/1" data-resolution="1080" data-audio="eng" data-av1="0">1080p</button>
+                <button type="button" data-src="https://kwik.cx/e/2" data-resolution="1080" data-audio="jpn" data-av1="0">1080p</button>
+            </div>
+            <div id="pickDownload">
+                <a href="https://pahe.win/a" class="dropdown-item">
+                    Show - 1080p (312MB) <span class="badge">eng</span>
+                </a>
+                <a href="https://pahe.win/b" class="dropdown-item">
+                    Show - 1080p (290MB) <span class="badge">jpn</span>
+                </a>
+            </div>
+        "#;
+        let sources = parse_sources_from_html(html);
+        let opts = build_available_options(serde_json::json!(1), "ep1".to_string(), &sources);
+        assert_eq!(opts.audios, vec!["eng", "jpn"]);
+        assert_eq!(opts.resolutions, vec!["1080"]);
+        assert_eq!(
+            opts.filesizes.get("1080").map(String::as_str),
+            Some("312 MB")
+        );
     }
 
     #[test]
@@ -1576,5 +2124,30 @@ mod tests {
         assert_eq!(normalize_for_match(".hack // Gift"), "hackgift");
         assert_eq!(normalize_for_match("hack gift"), "hackgift");
         assert_eq!(normalize_for_match(".hack//Roots"), "hackroots");
+    }
+
+    #[test]
+    fn scores_slug_matches_without_confusing_seasons() {
+        assert!(score_slug_match("Overlord", "Overlord").unwrap() == 1000);
+        assert!(score_slug_match("Overlord", "Overlord II").is_none());
+        assert!(score_slug_match("[Oshi No Ko] Season 2", "Oshi no Ko").is_none());
+        assert!(score_slug_match("[Oshi No Ko] Season 2", "Oshi no Ko Season 2").unwrap() >= 900);
+        assert!(
+            score_slug_match(
+                "Solo Leveling Season 2: Arise from the Shadow",
+                "Solo Leveling Season 2"
+            )
+            .unwrap()
+                >= 450
+        );
+    }
+
+    #[test]
+    fn generates_search_terms_for_rezero_and_long_titles() {
+        let rezero = generate_search_terms("Re:ZERO -Starting Life in Another World-");
+        assert!(rezero.iter().any(|t| t.contains("Starting Life")));
+        let long =
+            generate_search_terms("Chillin in Another World with Level 2 Super Cheat Powers");
+        assert!(long.iter().any(|t| t == "Chillin in Another World"));
     }
 }

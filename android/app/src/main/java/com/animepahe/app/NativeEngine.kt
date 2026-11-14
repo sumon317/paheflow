@@ -10,4 +10,5 @@ object NativeEngine {
     external fun isServerRunning(): Boolean
     external fun getServerToken(): String
     external fun notifyCloudflareSolved(cfCookie: String, userAgent: String): Boolean
+    external fun shutdownEngine()
 }

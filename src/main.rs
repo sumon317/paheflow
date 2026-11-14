@@ -14,9 +14,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = client::HttpClient::new();
     let runner = Arc::new(runner::Runner::new());
 
-    // Auto-detect fresh Cloudflare cookies from local browser profiles (e.g. Firefox)
-    let _ = animepahe_gui::autocookie::try_auto_import();
-
     // Bind before launching the browser so a busy port is reported instead of
     // opening a dead page, and so port 0 resolves to a real port.
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -43,12 +40,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(port);
     let url = format!("http://127.0.0.1:{}", actual_port);
 
+    // Auto-detect fresh Cloudflare cookies from local browser profiles off the critical path
+    tokio::task::spawn_blocking(|| {
+        let _ = animepahe_gui::autocookie::try_auto_import();
+    });
+
     let no_browser = std::env::var("ANIMEPAHE_GUI_NO_BROWSER")
         .map(|v| v == "1")
         .unwrap_or(false);
     if !no_browser {
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
             open_app_window(&url);
         });
     }

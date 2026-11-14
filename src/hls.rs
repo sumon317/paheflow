@@ -542,20 +542,36 @@ impl HlsDownloader {
         }
 
         // Wait for all fragments to finish. Abort the remaining tasks as soon
-        // as one fails so a failed job does not keep consuming bandwidth.
+        // as one fails or stop_signal is triggered so a failed/paused/stopped
+        // job does not keep consuming bandwidth or wait on slow sockets.
         let mut pending = tasks.into_iter();
         let mut failure = None;
         for task in pending.by_ref() {
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    failure = Some(e);
+            tokio::pin!(task);
+            loop {
+                if stop_signal.load(Ordering::Relaxed) {
+                    task.abort();
+                    failure = Some("Cancelled by user".to_string());
                     break;
                 }
-                Err(e) => {
-                    failure = Some(format!("Task error: {}", e));
-                    break;
+                tokio::select! {
+                    res = &mut task => {
+                        match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                failure = Some(e);
+                            }
+                            Err(e) => {
+                                failure = Some(format!("Task error: {}", e));
+                            }
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                 }
+            }
+            if failure.is_some() {
+                break;
             }
         }
         if let Some(e) = failure {

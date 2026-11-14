@@ -14,6 +14,8 @@ use crate::server;
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
 static SERVER_TOKEN: OnceLock<Mutex<String>> = OnceLock::new();
+static START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static RUNNER: OnceLock<Mutex<Option<Arc<Runner>>>> = OnceLock::new();
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn get_runtime() -> &'static tokio::runtime::Runtime {
@@ -34,6 +36,15 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
     res_dir: JString,
     data_dir: JString,
 ) -> jint {
+    if RUNNING.load(Ordering::SeqCst) {
+        return BOUND_PORT.load(Ordering::SeqCst) as jint;
+    }
+
+    let _start_guard = START_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     if RUNNING.load(Ordering::SeqCst) {
         return BOUND_PORT.load(Ordering::SeqCst) as jint;
     }
@@ -86,6 +97,12 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
 
         let client = HttpClient::new();
         let runner = Arc::new(Runner::new());
+        {
+            let lock = RUNNER.get_or_init(|| Mutex::new(None));
+            if let Ok(mut guard) = lock.lock() {
+                *guard = Some(runner.clone());
+            }
+        }
 
         let pump_runner = runner.clone();
         let pump_client = client.clone();
@@ -194,4 +211,29 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_notifyCloudflareSolve
 
     println!("[NativeEngine] Cloudflare credentials successfully updated");
     JNI_TRUE
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_animepahe_app_NativeEngine_shutdownEngine(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    RUNNING.store(false, Ordering::SeqCst);
+    BOUND_PORT.store(0, Ordering::SeqCst);
+
+    let runner = RUNNER
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|mut g| g.take());
+
+    if let Some(runner) = runner {
+        let rt = get_runtime();
+        rt.block_on(async {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let _ = runner.stop().await;
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            })
+            .await;
+        });
+    }
 }
