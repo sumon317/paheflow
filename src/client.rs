@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{resource_dir, AppConfig};
 
-pub const MIN_INTERVAL_MS: u64 = 50;
+pub const MIN_INTERVAL_MS: u64 = 350;
 pub const TIMEOUT_SECS: u64 = 30;
 pub const RATE_LIMIT_MARKER: &str = "error code: 1015";
 
@@ -95,6 +95,15 @@ impl HttpClient {
         self.last_request.store(stored, Ordering::Relaxed);
     }
 
+    pub fn enforce_backoff(&self, backoff_ms: u64) {
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+            + backoff_ms;
+        self.last_request.store(future_ms, Ordering::Relaxed);
+    }
+
     pub async fn fetch(
         &self,
         url: &str,
@@ -114,7 +123,7 @@ impl HttpClient {
 
             let mut last_error = String::from("Request to animepahe failed.");
 
-            for attempt in 1..=4 {
+            for attempt in 1..=5 {
                 self.throttle().await;
 
                 let mut cmd = Command::new(&bin);
@@ -150,24 +159,40 @@ impl HttpClient {
                 match output_res {
                     Ok(output) => {
                         let stdout_str = String::from_utf8_lossy(&output.stdout).to_string();
-                        if stdout_str.contains(RATE_LIMIT_MARKER) {
-                            last_error = String::from(
-                                "animepahe.pw rate-limited the request (Cloudflare 1015). Retrying...",
+                        let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+                        let combined = format!("{}\n{}", stdout_str, stderr_str);
+                        let lower_combined = combined.to_lowercase();
+
+                        let is_rate_limit = combined.contains(RATE_LIMIT_MARKER)
+                            || lower_combined.contains("too many requests")
+                            || lower_combined.contains("rate limit")
+                            || lower_combined.contains("error 1015")
+                            || lower_combined.contains("429");
+
+                        if is_rate_limit {
+                            let backoff_ms = (1200 * (1 << attempt)).min(16000) + (attempt * 150);
+                            eprintln!(
+                                "[HttpClient] Rate limit reached on animepahe (curl 429/1015). Backing off for {}ms (attempt {}/5)...",
+                                backoff_ms, attempt
                             );
-                            tokio::time::sleep(Duration::from_millis(1000 * attempt)).await;
+                            self.enforce_backoff(backoff_ms);
+                            last_error = format!(
+                                "animepahe.pw rate-limited requests (HTTP 429 Too Many Requests). Backing off {}s...",
+                                backoff_ms / 1000
+                            );
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                             continue;
                         }
 
-                        let lower = stdout_str.to_lowercase();
-                        if lower.contains("just a moment...")
-                            || lower.contains("cf-browser-verification")
+                        if lower_combined.contains("just a moment...")
+                            || lower_combined.contains("cf-browser-verification")
                         {
                             return Err(String::from(
                                 "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings.",
                             ));
                         }
-                        if lower.contains("sorry, you have been blocked")
-                            || lower.contains("cf-error-details")
+                        if lower_combined.contains("sorry, you have been blocked")
+                            || lower_combined.contains("cf-error-details")
                         {
                             return Err(String::from(
                                 "Cloudflare refused this request (IP or cookie blocked). Tap 'Solve Cloudflare' or copy a fresh cf_clearance into Settings.",
@@ -210,7 +235,7 @@ impl HttpClient {
         let is_animepahe = url.contains("animepahe.");
         let mut last_error = String::from("Request to animepahe failed.");
 
-        for attempt in 1..=4 {
+        for attempt in 1..=5 {
             self.throttle().await;
 
             let mut req = self.http.get(url);
@@ -266,6 +291,18 @@ impl HttpClient {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    let is_429 = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.as_u16() == 429;
+
+                    let retry_after_secs = if is_429 {
+                        resp.headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                    } else {
+                        None
+                    };
+
                     let text = match resp.text().await {
                         Ok(t) => t,
                         Err(e) => {
@@ -275,15 +312,32 @@ impl HttpClient {
                         }
                     };
 
-                    if text.contains(RATE_LIMIT_MARKER) {
-                        last_error = String::from(
-                            "animepahe.pw rate-limited the request (Cloudflare 1015). Retrying...",
+                    let lower = text.to_lowercase();
+                    let is_rate_limit = is_429
+                        || text.contains(RATE_LIMIT_MARKER)
+                        || lower.contains("too many requests")
+                        || lower.contains("rate limit")
+                        || lower.contains("error 1015");
+
+                    if is_rate_limit {
+                        let backoff_ms = if let Some(secs) = retry_after_secs {
+                            (secs * 1000).max(2000)
+                        } else {
+                            (1200 * (1 << attempt)).min(16000) + (attempt * 150)
+                        };
+                        eprintln!(
+                            "[HttpClient] Rate limit reached on animepahe (HTTP {} / 1015). Backing off for {}ms (attempt {}/5)...",
+                            status, backoff_ms, attempt
                         );
-                        tokio::time::sleep(Duration::from_millis(1000 * attempt)).await;
+                        self.enforce_backoff(backoff_ms);
+                        last_error = format!(
+                            "animepahe.pw rate-limited requests (HTTP 429 Too Many Requests). Backing off {}s...",
+                            backoff_ms / 1000
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
 
-                    let lower = text.to_lowercase();
                     if lower.contains("just a moment...")
                         || lower.contains("cf-browser-verification")
                     {

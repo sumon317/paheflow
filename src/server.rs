@@ -921,27 +921,69 @@ async fn get_episodes(
                 })));
             }
             Err(e) => {
-                if cached.is_empty() {
-                    if api::is_rotated_or_missing_error(&e) {
-                        return Ok(Json(serde_json::json!({
-                            "items": [],
-                            "lastPage": 1,
-                            "page": 1,
-                            "slug": slug,
-                            "total": 0,
-                            "totalAll": 0,
-                            "availableAudios": [],
-                            "audio": serde_json::Value::Null,
-                            "stale": true,
-                            "notFound": true,
-                            "warning": "No release data found on AnimePahe. This title may have been removed or unavailable.",
-                        })));
-                    }
-                    return Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({ "error": e })),
-                    ));
+                if !cached.is_empty() {
+                    let available_audios = api::detect_available_audios(&cached);
+                    let total_all = cached.len();
+                    let filtered = api::filter_episodes_by_audio(&cached, &audio_filter);
+                    let total = filtered.len();
+                    return Ok(Json(serde_json::json!({
+                        "items": filtered,
+                        "lastPage": 1,
+                        "page": 1,
+                        "slug": slug,
+                        "total": total,
+                        "totalAll": total_all,
+                        "availableAudios": available_audios,
+                        "audio": if audio_filter.is_empty() || audio_filter == "all" { serde_json::Value::Null } else { serde_json::json!(audio_filter) },
+                        "stale": true,
+                        "warning": format!("Using cached episodes (network rate limit: {})", e),
+                    })));
                 }
+
+                if api::is_rotated_or_missing_error(&e) {
+                    return Ok(Json(serde_json::json!({
+                        "items": [],
+                        "lastPage": 1,
+                        "page": 1,
+                        "slug": slug,
+                        "total": 0,
+                        "totalAll": 0,
+                        "availableAudios": [],
+                        "audio": serde_json::Value::Null,
+                        "stale": true,
+                        "notFound": true,
+                        "warning": "No release data found on AnimePahe. This title may have been removed or unavailable.",
+                    })));
+                }
+
+                // If rate limited on full fetch, attempt to return page 1 gracefully
+                if e.contains("429") || e.to_lowercase().contains("too many requests") || e.contains("1015") {
+                    if let Ok((p1_items, last_p)) = api::release_page(&state.client, &slug, 1, &cfg).await {
+                        if !p1_items.is_empty() {
+                            let available_audios = api::detect_available_audios(&p1_items);
+                            let total_all = p1_items.len();
+                            let filtered = api::filter_episodes_by_audio(&p1_items, &audio_filter);
+                            let total = filtered.len();
+                            return Ok(Json(serde_json::json!({
+                                "items": filtered,
+                                "lastPage": last_p,
+                                "page": 1,
+                                "slug": slug,
+                                "total": total,
+                                "totalAll": total_all,
+                                "availableAudios": available_audios,
+                                "audio": if audio_filter.is_empty() || audio_filter == "all" { serde_json::Value::Null } else { serde_json::json!(audio_filter) },
+                                "stale": true,
+                                "warning": "AnimePahe rate-limited multi-page episode request. Showing available episodes — please wait a moment.",
+                            })));
+                        }
+                    }
+                }
+
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": e })),
+                ));
             }
         }
     }
@@ -974,13 +1016,6 @@ async fn get_episodes(
                 // If this is the only page, cache it immediately so subsequent loads are instant
                 if last_page <= 1 && !items.is_empty() {
                     api::save_release_cache(&slug, &items);
-                } else if last_page > 1 {
-                    let bg_client = state.client.clone();
-                    let bg_slug = slug.clone();
-                    let bg_cfg = cfg.clone();
-                    tokio::spawn(async move {
-                        let _ = api::release_with_status(&bg_client, &bg_slug, &bg_cfg).await;
-                    });
                 }
 
                 Ok(Json(serde_json::json!({

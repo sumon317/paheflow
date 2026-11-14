@@ -382,20 +382,15 @@ pub async fn latest_releases(
 
         if lp > 1 {
             let target_pages: Vec<u32> = (2..=lp.min(MAX_PAGES)).collect();
-            let fetch_futures = target_pages.into_iter().map(|p| {
-                let client = client.clone();
-                let cfg = cfg.clone();
-                async move {
-                    let u = format!("{}?m=airing&page={}", API_URL, p);
-                    client.fetch_json(&u, None, &cfg).await.ok()
-                }
-            });
-            let extra_pages = futures_util::future::join_all(fetch_futures).await;
-            for page_json in extra_pages.into_iter().flatten() {
-                if let Some(data) = page_json.get("data").and_then(|d| d.as_array()) {
-                    for it in data {
-                        if let Some(item) = parse_latest_release_item(it) {
-                            all_items.push(item);
+            for p in target_pages {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let u = format!("{}?m=airing&page={}", API_URL, p);
+                if let Ok(page_json) = client.fetch_json(&u, None, cfg).await {
+                    if let Some(data) = page_json.get("data").and_then(|d| d.as_array()) {
+                        for it in data {
+                            if let Some(item) = parse_latest_release_item(it) {
+                                all_items.push(item);
+                            }
                         }
                     }
                 }
@@ -581,39 +576,32 @@ pub async fn release_with_status(
 
     if last_page > 1 {
         let target_pages: Vec<u32> = (2..=last_page.min(MAX_RELEASE_PAGES)).collect();
-        for chunk in target_pages.chunks(6) {
-            let tasks = chunk.iter().map(|&page| {
-                let c = client.clone();
-                let s = slug.to_string();
-                let cf = cfg.clone();
-                async move { (page, release_page(&c, &s, page, &cf).await) }
-            });
-            let results = futures_util::future::join_all(tasks).await;
-            for (page, res) in results {
-                match res {
-                    Ok((page_items, _)) => {
-                        for item in page_items {
-                            if !item.session.is_empty()
-                                && seen_sessions.insert(item.session.clone())
-                            {
-                                all_episodes.push(item);
-                            }
+        for &page in &target_pages {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            match release_page(client, slug, page, cfg).await {
+                Ok((page_items, _)) => {
+                    for item in page_items {
+                        if !item.session.is_empty()
+                            && seen_sessions.insert(item.session.clone())
+                        {
+                            all_episodes.push(item);
                         }
                     }
-                    Err(err) => {
-                        // Retry failed page once
-                        match release_page(client, slug, page, cfg).await {
-                            Ok((page_items, _)) => {
-                                for item in page_items {
-                                    if !item.session.is_empty()
-                                        && seen_sessions.insert(item.session.clone())
-                                    {
-                                        all_episodes.push(item);
-                                    }
+                }
+                Err(err) => {
+                    // Back off 1.5s on error / rate-limit and retry once
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    match release_page(client, slug, page, cfg).await {
+                        Ok((page_items, _)) => {
+                            for item in page_items {
+                                if !item.session.is_empty()
+                                    && seen_sessions.insert(item.session.clone())
+                                {
+                                    all_episodes.push(item);
                                 }
                             }
-                            Err(_) => page_errors.push(format!("page {}: {}", page, err)),
                         }
+                        Err(_) => page_errors.push(format!("page {}: {}", page, err)),
                     }
                 }
             }

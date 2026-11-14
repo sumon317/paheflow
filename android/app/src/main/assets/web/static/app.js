@@ -439,9 +439,16 @@
    * ───────────────────────────────────────────────────────────────── */
 
   function toast(msg, type = "info") {
+    let cleanMsg = String(msg || "");
+    let cleanType = type;
+    const lower = cleanMsg.toLowerCase();
+    if (lower.includes("429") || lower.includes("too many requests") || lower.includes("rate limit")) {
+      cleanMsg = "AnimePahe rate limit reached. Backing off & retrying automatically...";
+      cleanType = "warn";
+    }
     const el = document.createElement("div");
-    el.className = `toast ${type === "error" ? "error" : type === "warn" ? "warn" : type === "ok" ? "success" : ""}`;
-    el.textContent = msg;
+    el.className = `toast ${cleanType === "error" ? "error" : cleanType === "warn" ? "warn" : cleanType === "ok" ? "success" : ""}`;
+    el.textContent = cleanMsg;
     $("toasts").appendChild(el);
     setTimeout(() => { el.style.animation = "slideIn .22s ease reverse"; setTimeout(() => el.remove(), 220); }, 3500);
   }
