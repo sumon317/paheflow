@@ -2275,7 +2275,7 @@
         const barFill = groupEl.querySelector(".dl-group-bar-fill");
         if (barFill) barFill.style.width = `${pct}%`;
 
-        const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading"].includes(e.status)).every(e => e.status === "paused");
+        const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading", "failed"].includes(e.status)).every(e => e.status === "paused" || e.status === "failed");
         const toggleBtn = groupEl.querySelector("[data-group-toggle]");
         if (toggleBtn) {
           const expected = allPaused ? "▶ Resume all" : "⏸ Pause all";
@@ -2333,7 +2333,7 @@
               let ctrlHtml = "";
               if (isEpActive) {
                 ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-pause="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Pause episode">⏸</button>`;
-              } else if (isEpPaused) {
+              } else if (isEpPaused || isEpFailed) {
                 ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-resume="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Start / resume episode">▶</button>`;
               } else if (ep.status === "queued") {
                 ctrlHtml = `
@@ -2358,7 +2358,7 @@
       const total = epItems.length;
       const done = epItems.filter(e => e.status === "done").length;
       const pct = total > 0 ? Math.round((done / total) * 100) : (isDownloading ? 50 : 0);
-      const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading"].includes(e.status)).every(e => e.status === "paused");
+      const allPaused = epItems.length > 0 && epItems.filter(e => ["queued", "paused", "downloading", "failed"].includes(e.status)).every(e => e.status === "paused" || e.status === "failed");
 
       const epsHtml = epItems.map(ep => {
         const isEpActive = ep.status === "downloading";
@@ -2389,7 +2389,7 @@
         let ctrlHtml = "";
         if (isEpActive) {
           ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-pause="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Pause episode">⏸</button>`;
-        } else if (isEpPaused) {
+        } else if (isEpPaused || isEpFailed) {
           ctrlHtml = `<button class="btn btn-ghost btn-sm btn-icon" data-ep-resume="${escapeHtml(ep.epId)}" data-queue-id="${group.queueId}" title="Start / resume episode">▶</button>`;
         } else if (isEpQueued) {
           ctrlHtml = `
@@ -3044,7 +3044,7 @@
           const queueId = Number(toggleGroupBtn.dataset.groupToggle);
           const group = (state.dlGroups || []).find(g => g.queueId === queueId);
           const epItems = group?.epItems || [];
-          const allPaused = epItems.length > 0 && epItems.filter(i => ["queued", "paused", "downloading"].includes(i.status)).every(i => i.status === "paused");
+          const allPaused = epItems.length > 0 && epItems.filter(i => ["queued", "paused", "downloading", "failed"].includes(i.status)).every(i => i.status === "paused" || i.status === "failed");
           const endpoint = allPaused ? "/api/queue/group/resume" : "/api/queue/group/pause";
           try {
             const res = await api.post(endpoint, { queueId });

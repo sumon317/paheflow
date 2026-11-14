@@ -87,6 +87,12 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
         let client = HttpClient::new();
         let runner = Arc::new(Runner::new());
 
+        let pump_runner = runner.clone();
+        let pump_client = client.clone();
+        tokio::spawn(async move {
+            pump_runner.run_queue_pump(pump_client).await;
+        });
+
         let token = server::generate_token();
         {
             let lock = SERVER_TOKEN.get_or_init(|| Mutex::new(String::new()));

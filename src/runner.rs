@@ -23,7 +23,7 @@ pub struct LogEntry {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressState {
     pub percent: Option<f64>,
@@ -224,6 +224,7 @@ pub struct Runner {
     seq: Arc<AtomicU64>,
     stop_signal: Arc<AtomicBool>,
     pause_signal: Arc<AtomicBool>,
+    ep_cancel_signal: Arc<AtomicBool>,
     pause_notify: Arc<tokio::sync::Notify>,
     event_tx: broadcast::Sender<String>,
     /// FIFO of queued anime. Lock ordering: `state` first, then `queue`.
@@ -238,6 +239,13 @@ pub struct Runner {
 impl Default for Runner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Runner {
+    pub fn cancel_current_ep(&self) {
+        self.ep_cancel_signal.store(true, Ordering::Relaxed);
+        self.pause_notify.notify_waiters();
     }
 }
 
@@ -275,6 +283,7 @@ impl Runner {
             seq: Arc::new(AtomicU64::new(0)),
             stop_signal: Arc::new(AtomicBool::new(false)),
             pause_signal: Arc::new(AtomicBool::new(false)),
+            ep_cancel_signal: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(tokio::sync::Notify::new()),
             event_tx: tx,
             queue: Arc::new(Mutex::new(persisted.entries)),
@@ -598,6 +607,7 @@ impl Runner {
 
         self.stop_signal.store(false, Ordering::Relaxed);
         self.pause_signal.store(false, Ordering::Relaxed);
+        self.ep_cancel_signal.store(false, Ordering::Relaxed);
 
         let (queue_snapshot, queue_hold_snapshot) = {
             let mut q = self.queue.lock().await;
@@ -674,18 +684,24 @@ impl Runner {
         let state_arc = self.state.clone();
         let stop_arc = self.stop_signal.clone();
         let pause_arc = self.pause_signal.clone();
+        let ep_cancel_arc = self.ep_cancel_signal.clone();
         let pause_notify_arc = self.pause_notify.clone();
         let runner_seq = self.seq.clone();
         let event_tx = self.event_tx.clone();
         let logs_arc = self.logs.clone();
         let queue_arc = self.queue.clone();
+        let queue_hold_arc = self.queue_hold.clone();
+        let queue_next_id_arc = self.queue_next_id.clone();
 
         tokio::spawn(async move {
             let runner_helper = RunnerHelper {
                 state: state_arc,
                 queue: queue_arc,
+                queue_hold: queue_hold_arc,
+                queue_next_id: queue_next_id_arc,
                 stop: stop_arc,
                 pause: pause_arc,
+                ep_cancel: ep_cancel_arc,
                 pause_notify: pause_notify_arc,
                 seq: runner_seq,
                 event_tx,
@@ -975,6 +991,31 @@ impl Runner {
                     .await;
                 }
             }
+            PumpDecision::RequeueIncomplete { id } => {
+                if let Some(entry) = self.queue_entry(id).await {
+                    {
+                        let mut q = self.queue.lock().await;
+                        if let Some(e) = q.iter_mut().find(|e| e.id == id) {
+                            let has_queued = e.episode_items.iter().any(|i| i.status == "queued");
+                            e.status = if has_queued {
+                                "queued".to_string()
+                            } else {
+                                "paused".to_string()
+                            };
+                            e.error.clear();
+                        }
+                    }
+                    self.queue_persist().await;
+                    self.add_log(
+                        "info",
+                        &format!(
+                            "Queue: '{}' finished active episodes (remaining are paused). Moving to next queued anime.",
+                            entry.title
+                        ),
+                    )
+                    .await;
+                }
+            }
             PumpDecision::DropDone { id } => {
                 let title = {
                     let mut q = self.queue.lock().await;
@@ -1128,7 +1169,7 @@ impl Runner {
         ep_id: &str,
         status: &str,
     ) -> Result<(), String> {
-        let is_active_ep = {
+        let (is_active_ep, cur_ep) = {
             let mut q = self.queue.lock().await;
             let entry = q
                 .iter_mut()
@@ -1142,20 +1183,41 @@ impl Runner {
                     format!("Episode {} not found in queue entry {}.", ep_id, queue_id)
                 })?;
             item.status = status.to_string();
-            entry.status == "downloading"
+            let all_incomplete_paused = entry
+                .episode_items
+                .iter()
+                .filter(|i| i.status != "done")
+                .all(|i| i.status == "paused");
+            if all_incomplete_paused && entry.status != "downloading" {
+                entry.status = "paused".to_string();
+            } else if status == "queued" && entry.status != "downloading" {
+                entry.status = "queued".to_string();
+                entry.error.clear();
+            }
+            let is_active = entry.status == "downloading";
+            (is_active, ep_id.to_string())
         };
         self.queue_persist().await;
 
-        let cur_ep = {
+        let active_cur_ep = {
             let st = self.state.lock().await;
             st.episodes.current.clone()
         };
-        if is_active_ep {
-            if status == "queued" {
-                self.resume().await;
-            } else if status == "paused" && cur_ep.as_deref() == Some(ep_id) {
-                self.pause().await;
-            }
+
+        if is_active_ep && active_cur_ep.as_deref() == Some(&cur_ep) && status == "paused" {
+            // User paused the active episode: cancel this episode's download so the runner immediately starts the next queued episode!
+            self.cancel_current_ep();
+            self.add_log(
+                "info",
+                &format!("Paused episode {} — starting next queued episode.", cur_ep),
+            )
+            .await;
+        }
+
+        if status == "queued" {
+            // Unpausing an episode indicates intent to resume downloading
+            self.queue_hold.store(false, Ordering::Relaxed);
+            self.queue_failures.store(0, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1169,26 +1231,37 @@ impl Runner {
                 .find(|e| e.id == queue_id)
                 .ok_or_else(|| format!("Queue entry {} not found.", queue_id))?;
             for item in &mut entry.episode_items {
-                if item.status != "done" && item.status != "failed" {
+                if item.status != "done" {
                     item.status = status.to_string();
+                    if status == "queued" {
+                        item.error.clear();
+                    }
+                }
+            }
+            if entry.status != "downloading" {
+                entry.status = status.to_string();
+                if status == "queued" {
+                    entry.error.clear();
                 }
             }
             entry.status == "downloading"
         };
         self.queue_persist().await;
-        if is_active {
-            if status == "paused" {
-                self.pause().await;
-            } else if status == "queued" {
-                self.resume().await;
-            }
+
+        if is_active && status == "paused" {
+            // Cancel active episode so group wraps up and next queued anime starts
+            self.cancel_current_ep();
+            self.add_log("info", "Anime paused — starting next queued anime.").await;
+        } else if status == "queued" {
+            self.queue_hold.store(false, Ordering::Relaxed);
+            self.queue_failures.store(0, Ordering::Relaxed);
         }
         Ok(())
     }
 
     /// Remove a specific episode from a queue entry.
     pub async fn queue_ep_remove(&self, queue_id: u64, ep_id: &str) -> Result<(), String> {
-        {
+        let is_active_ep = {
             let mut q = self.queue.lock().await;
             let entry = q
                 .iter_mut()
@@ -1202,12 +1275,28 @@ impl Runner {
                     ep_id, queue_id
                 ));
             }
-        }
+            entry.status == "downloading"
+        };
         self.queue_persist().await;
+
+        let cur_ep = {
+            let st = self.state.lock().await;
+            st.episodes.current.clone()
+        };
+
+        if is_active_ep && cur_ep.as_deref() == Some(ep_id) {
+            // User removed the currently downloading episode: cancel it so runner proceeds to next episode!
+            self.cancel_current_ep();
+            self.add_log(
+                "info",
+                &format!("Removed active episode {} — starting next queued episode.", ep_id),
+            )
+            .await;
+        }
         Ok(())
     }
 
-    /// Move episode up in its group's priority (swap with the previous item).
+    /// Move episode up in its group's priority (swap with the previous non-done item).
     pub async fn queue_ep_move_up(&self, queue_id: u64, ep_id: &str) -> Result<(), String> {
         {
             let mut q = self.queue.lock().await;
@@ -1225,7 +1314,21 @@ impl Runner {
             if pos == 0 {
                 return Err(format!("Episode {} is already at the top.", ep_id));
             }
-            entry.episode_items.swap(pos - 1, pos);
+            let mut target_pos = None;
+            for i in (0..pos).rev() {
+                if entry.episode_items[i].status != "done" {
+                    target_pos = Some(i);
+                    break;
+                }
+            }
+            if let Some(prev) = target_pos {
+                entry.episode_items.swap(prev, pos);
+            } else {
+                return Err(format!(
+                    "Episode {} is already at the highest active priority.",
+                    ep_id
+                ));
+            }
         }
         self.queue_persist().await;
         Ok(())
@@ -1240,6 +1343,11 @@ enum PumpDecision {
     HoldAfterStop,
     /// A queue-launched job was manually stopped: back to the front, hold.
     Requeue {
+        id: u64,
+    },
+    /// A queue-launched job finished its unpaused episodes while remaining are paused:
+    /// requeue without hold so the next queued anime can start immediately.
+    RequeueIncomplete {
         id: u64,
     },
     /// A queue-launched job succeeded: drop it and proceed.
@@ -1279,7 +1387,7 @@ fn pump_decision(
             if exit_code == Some(0) {
                 let has_incomplete = entry.episode_items.iter().any(|i| i.status != "done");
                 if has_incomplete {
-                    return PumpDecision::Requeue { id: entry.id };
+                    return PumpDecision::RequeueIncomplete { id: entry.id };
                 }
                 return PumpDecision::DropDone { id: entry.id };
             }
@@ -1559,8 +1667,11 @@ impl Drop for RunGuard {
 struct RunnerHelper {
     state: Arc<Mutex<JobState>>,
     queue: Arc<Mutex<Vec<QueueEntry>>>,
+    queue_hold: Arc<AtomicBool>,
+    queue_next_id: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
+    ep_cancel: Arc<AtomicBool>,
     pause_notify: Arc<tokio::sync::Notify>,
     seq: Arc<AtomicU64>,
     event_tx: broadcast::Sender<String>,
@@ -1568,6 +1679,18 @@ struct RunnerHelper {
 }
 
 impl RunnerHelper {
+    async fn queue_persist(&self) {
+        let entries = self.queue.lock().await.clone();
+        let file = QueueFile {
+            version: 1,
+            hold: self.queue_hold.load(Ordering::Relaxed),
+            next_id: self.queue_next_id.load(Ordering::Relaxed),
+            entries,
+        };
+        if let Err(e) = save_queue_file(&queue_file_path(), &file) {
+            eprintln!("[Queue] Failed to save queue.json: {}", e);
+        }
+    }
     async fn log(&self, level: &str, text: &str) {
         let next_seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let entry = LogEntry {
@@ -1819,9 +1942,21 @@ impl RunnerHelper {
                 continue;
             }
 
+            self.ep_cancel.store(false, Ordering::Relaxed);
+
             {
                 let mut st = self.state.lock().await;
                 st.episodes.current = Some(ep_num.clone());
+            }
+
+            {
+                let mut q = self.queue.lock().await;
+                if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                    if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
+                        item.status = "downloading".to_string();
+                        item.percent = 0.0;
+                    }
+                }
             }
 
             self.log("info", &format!("Processing Episode {}...", ep_num))
@@ -1872,6 +2007,16 @@ impl RunnerHelper {
                     )
                     .await;
                     failures += 1;
+                    {
+                        let mut q = self.queue.lock().await;
+                        if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                            if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
+                                item.status = "failed".to_string();
+                                item.error = "Not found in release list".to_string();
+                            }
+                        }
+                    }
+                    self.queue_persist().await;
                     continue;
                 }
             };
@@ -1886,6 +2031,16 @@ impl RunnerHelper {
                     )
                     .await;
                     failures += 1;
+                    {
+                        let mut q = self.queue.lock().await;
+                        if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                            if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
+                                item.status = "failed".to_string();
+                                item.error = e.clone();
+                            }
+                        }
+                    }
+                    self.queue_persist().await;
                     continue;
                 }
             };
@@ -1898,6 +2053,16 @@ impl RunnerHelper {
                 )
                 .await;
                 failures += 1;
+                {
+                    let mut q = self.queue.lock().await;
+                    if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                        if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
+                            item.status = "failed".to_string();
+                            item.error = "No playable source found".to_string();
+                        }
+                    }
+                }
+                self.queue_persist().await;
                 continue;
             }
 
@@ -1950,6 +2115,16 @@ impl RunnerHelper {
                     )
                     .await;
                     failures += 1;
+                    {
+                        let mut q = self.queue.lock().await;
+                        if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                            if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
+                                item.status = "failed".to_string();
+                                item.error = "Stream resolver did not find playlist".to_string();
+                            }
+                        }
+                    }
+                    self.queue_persist().await;
                     continue;
                 }
             };
@@ -1981,7 +2156,17 @@ impl RunnerHelper {
                 )
                 .await;
                 let mut st = self.state.lock().await;
-                st.episodes.completed.push(ep_num);
+                st.episodes.completed.push(ep_num.clone());
+                {
+                    let mut q = self.queue.lock().await;
+                    if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                        if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
+                            item.status = "done".to_string();
+                            item.percent = 100.0;
+                        }
+                    }
+                }
+                self.queue_persist().await;
                 continue;
             }
 
@@ -2000,8 +2185,21 @@ impl RunnerHelper {
             )
             .await;
 
+            let this_ep_stop = Arc::new(AtomicBool::new(false));
+            let watcher_stop = self.stop.clone();
+            let watcher_ep_cancel = self.ep_cancel.clone();
+            let stop_flag_inner = this_ep_stop.clone();
+            let watcher = tokio::spawn(async move {
+                while !stop_flag_inner.load(Ordering::Relaxed) {
+                    if watcher_stop.load(Ordering::Relaxed) || watcher_ep_cancel.load(Ordering::Relaxed) {
+                        stop_flag_inner.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+
             let state_for_cb = self.state.clone();
-            let stop_for_dl = self.stop.clone();
             let pause_for_dl = self.pause.clone();
             let pause_notify_for_dl = self.pause_notify.clone();
 
@@ -2012,7 +2210,7 @@ impl RunnerHelper {
                     dest_path: final_file.clone(),
                     replace_existing: replace,
                     concurrency: fragments,
-                    stop_signal: stop_for_dl,
+                    stop_signal: this_ep_stop.clone(),
                     pause_signal: pause_for_dl,
                     pause_notify: pause_notify_for_dl,
                     progress_cb: move |update: ProgressUpdate| {
@@ -2028,6 +2226,37 @@ impl RunnerHelper {
                     },
                 })
                 .await;
+
+            watcher.abort();
+
+            // Check if user paused or removed this episode during download
+            if self.ep_cancel.load(Ordering::Relaxed) && !self.stop.load(Ordering::Relaxed) {
+                self.ep_cancel.store(false, Ordering::Relaxed);
+                self.log(
+                    "info",
+                    &format!("Episode {} paused — starting next queued episode.", ep_num),
+                )
+                .await;
+                {
+                    let mut st = self.state.lock().await;
+                    st.episodes.current = None;
+                    st.progress = ProgressState::default();
+                }
+                {
+                    let mut q = self.queue.lock().await;
+                    if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
+                        if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
+                            if item.status != "done" && item.status != "failed" {
+                                item.status = "paused".to_string();
+                                item.speed.clear();
+                                item.eta.clear();
+                            }
+                        }
+                    }
+                }
+                self.queue_persist().await;
+                continue;
+            }
 
             if let Err(ref e) = dl_res {
                 let err_lower = e.to_lowercase();
@@ -2056,7 +2285,7 @@ impl RunnerHelper {
                             dest_path: fallback_file.clone(),
                             replace_existing: replace,
                             concurrency: fragments,
-                            stop_signal: self.stop.clone(),
+                            stop_signal: this_ep_stop.clone(),
                             pause_signal: self.pause.clone(),
                             pause_notify: self.pause_notify.clone(),
                             progress_cb: move |update: ProgressUpdate| {
@@ -2075,7 +2304,7 @@ impl RunnerHelper {
                     if dl_res.is_ok() {
                         anime_dir = app_ext_dir.clone();
                     }
-                } else if !self.stop.load(Ordering::Relaxed) {
+                } else if !self.stop.load(Ordering::Relaxed) && !self.ep_cancel.load(Ordering::Relaxed) {
                     // Automatic retry with halved concurrency resuming cached fragments
                     self.log(
                         "warn",
@@ -2095,7 +2324,7 @@ impl RunnerHelper {
                             dest_path: final_file.clone(),
                             replace_existing: false, // Resume cached fragments!
                             concurrency: retry_concurrency,
-                            stop_signal: self.stop.clone(),
+                            stop_signal: this_ep_stop.clone(),
                             pause_signal: self.pause.clone(),
                             pause_notify: self.pause_notify.clone(),
                             progress_cb: move |update: ProgressUpdate| {
@@ -2134,11 +2363,17 @@ impl RunnerHelper {
                             {
                                 item.status = "done".to_string();
                                 item.percent = 100.0;
+                                item.speed.clear();
+                                item.eta.clear();
                             }
                         }
                     }
+                    self.queue_persist().await;
                 }
                 Err(e) => {
+                    if self.ep_cancel.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     self.log(
                         "error",
                         &format!("Episode {} download failed: {}", ep_num, e),
@@ -2158,9 +2393,12 @@ impl RunnerHelper {
                             {
                                 item.status = "failed".to_string();
                                 item.error = e.clone();
+                                item.speed.clear();
+                                item.eta.clear();
                             }
                         }
                     }
+                    self.queue_persist().await;
                 }
             }
         }
@@ -2168,7 +2406,15 @@ impl RunnerHelper {
         let mut st = self.state.lock().await;
         st.running = false;
         st.episodes.current = None;
-        st.exit_code = Some(if failures > 0 { 1 } else { 0 });
+        st.progress = ProgressState::default();
+        if self.stop.load(Ordering::Relaxed) {
+            st.stopped = true;
+            st.exit_code = Some(1);
+        } else if failures > 0 && st.episodes.completed.is_empty() {
+            st.exit_code = Some(1);
+        } else {
+            st.exit_code = Some(0);
+        }
         st.finished_at = Some(chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
 
         if failures > 0 {
@@ -2603,7 +2849,7 @@ mod tests {
         ];
         assert_eq!(
             pump_decision(false, false, Some(0), "a", false, &[entry1.clone()]),
-            PumpDecision::Requeue { id: 1 }
+            PumpDecision::RequeueIncomplete { id: 1 }
         );
 
         // 2. Skip entry if all of its remaining episodes are paused
@@ -2847,6 +3093,60 @@ mod tests {
             .episode_items
             .iter()
             .all(|i| i.status == "queued"));
+
+        release_data_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pause_active_episode_signals_cancel_and_keeps_queue_active() {
+        let (_env_guard, dir) = with_data_dir("pause_active");
+        let runner = Runner::new();
+        runner
+            .queue_add(&serde_json::json!({
+                "slug": "onepiece-1",
+                "title": "One Piece",
+                "episodes": "1,2,3"
+            }))
+            .await
+            .unwrap();
+
+        let snap = runner.snapshot(false).await;
+        let qid = snap.queue[0].id;
+
+        // Simulate active download on episode 1
+        {
+            let mut q = runner.queue.lock().await;
+            q[0].status = "downloading".to_string();
+            q[0].episode_items[0].status = "downloading".to_string();
+            let mut st = runner.state.lock().await;
+            st.running = true;
+            st.anime.slug = "onepiece-1".to_string();
+            st.episodes.current = Some("1".to_string());
+        }
+
+        // Pause the active episode 1
+        runner.queue_ep_set_status(qid, "1", "paused").await.unwrap();
+
+        // Check ep_cancel_signal is triggered to stop episode 1 without freezing runner
+        assert!(runner.ep_cancel_signal.load(Ordering::Relaxed));
+        // Global queue hold must remain FALSE so episode 2 can download
+        assert!(!runner.queue_hold.load(Ordering::Relaxed));
+
+        let snap = runner.snapshot(false).await;
+        assert_eq!(snap.queue[0].episode_items[0].status, "paused");
+        assert_eq!(snap.queue[0].episode_items[1].status, "queued");
+
+        // Now test RequeueIncomplete when job completes unpaused episodes:
+        let mut entry1 = snap.queue[0].clone();
+        entry1.episode_items[0].status = "paused".to_string();
+        entry1.episode_items[1].status = "done".to_string();
+        entry1.episode_items[2].status = "done".to_string();
+
+        let entry2 = queue_entry(2, "other-anime", "queued");
+
+        let decision = pump_decision(false, false, Some(0), "onepiece-1", false, &[entry1, entry2]);
+        // Must requeue without hold
+        assert_eq!(decision, PumpDecision::RequeueIncomplete { id: qid });
 
         release_data_dir(&dir);
     }
