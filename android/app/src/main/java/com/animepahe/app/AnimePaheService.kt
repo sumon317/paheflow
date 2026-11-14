@@ -313,12 +313,15 @@ class AnimePaheService : Service() {
                     val queueArr = job.optJSONArray("queue")
 
                     var queuedCount = 0
+                    var pausedCount = 0
                     if (queueArr != null) {
                         for (i in 0 until queueArr.length()) {
                             val entry = queueArr.optJSONObject(i) ?: continue
                             val st = entry.optCleanString("status")
                             if (st == "queued" || st == "downloading") {
                                 queuedCount++
+                            } else if (st == "paused") {
+                                pausedCount++
                             }
                         }
                     }
@@ -389,6 +392,14 @@ class AnimePaheService : Service() {
                             }
                             updateNotification("PaheFlow • $queuedCount queued", statusText, 0, false)
                             nextDelayMs = if (queueHold) 3500L else 1500L
+                        } else if (pausedCount > 0) {
+                            updateNotification(
+                                "PaheFlow • $pausedCount paused",
+                                "Downloads paused • Tap to open",
+                                0,
+                                false
+                            )
+                            nextDelayMs = 3500L
                         } else {
                             updateNotification("PaheFlow", "Idle • Tap to open", 0, false)
                             nextDelayMs = 3500L

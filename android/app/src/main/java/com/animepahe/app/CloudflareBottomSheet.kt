@@ -134,7 +134,15 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
                     val fallback = Intent(Intent.ACTION_VIEW, Uri.parse("https://animepahe.pw/")).apply {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
-                    startActivity(fallback)
+                    try {
+                        startActivity(fallback)
+                    } catch (_: Exception) {
+                        Toast.makeText(
+                            requireContext(),
+                            "No browser app found to open AnimePahe",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 }
             }
         }

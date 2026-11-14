@@ -4,15 +4,18 @@ use regex::Regex;
 /// eval(function(p,a,c,k,e,d){...}('payload', base, count, 'keywords'.split('|'), 0, {}))
 pub fn unpack_dean_edwards(packed_js: &str) -> Option<String> {
     let re = Regex::new(
-        r#"(?s)\}\s*\(\s*['"](?P<payload>.*?)['"]\s*,\s*(?P<radix>\d+)\s*,\s*(?P<count>\d+)\s*,\s*['"](?P<kw>.*?)['"]\s*\.split\s*\(\s*['"]\|['"]\s*\)"#,
+        r#"(?s)\}\s*\(\s*(?:'(?P<payload_sq>(?:\\.|[^'\\])*)'|"(?P<payload_dq>(?:\\.|[^"\\])*)")\s*,\s*(?P<radix>\d+)\s*,\s*(?P<count>\d+)\s*,\s*(?:'(?P<kw_sq>(?:\\.|[^'\\])*)'|"(?P<kw_dq>(?:\\.|[^"\\])*)")\s*\.split\s*\(\s*['"]\|['"]\s*\)"#,
     )
     .ok()?;
 
     let caps = re.captures(packed_js)?;
-    let payload = caps.name("payload")?.as_str();
+    let payload = caps
+        .name("payload_sq")
+        .or_else(|| caps.name("payload_dq"))?
+        .as_str();
     let radix: u32 = caps.name("radix")?.as_str().parse().ok()?;
     let count: usize = caps.name("count")?.as_str().parse().ok()?;
-    let keywords_raw = caps.name("kw")?.as_str();
+    let keywords_raw = caps.name("kw_sq").or_else(|| caps.name("kw_dq"))?.as_str();
     let keywords: Vec<&str> = keywords_raw.split('|').collect();
 
     let mut result = String::with_capacity(payload.len() * 2);
@@ -92,21 +95,22 @@ fn parse_base(s: &str, radix: u32) -> Option<usize> {
 
 /// Extracts the direct .m3u8 playlist URL from Kwik HTML page content
 pub fn extract_m3u8_from_kwik(html: &str) -> Option<String> {
-    // 1. Match each eval(function(p,a,c,k,e,d)...) block individually
-    let eval_re = Regex::new(
-        r#"(?s)eval\s*\(\s*function\s*\([a-z0-9,\s]+\).*?\.split\s*\(\s*['"]\|['"]\s*\)\s*,\s*0\s*,\s*\{\}\s*\)\s*\)"#,
-    )
-    .ok()?;
-
-    for m in eval_re.find_iter(html) {
-        if let Some(unpacked) = unpack_dean_edwards(m.as_str()) {
-            if let Some(url) = find_m3u8(&unpacked) {
-                return Some(url);
+    // Locate each `eval(function(...)` start boundary individually so an earlier
+    // non-packer `eval(...)` cannot span across into a later Dean Edwards block.
+    if let Ok(eval_start_re) = Regex::new(r#"eval\s*\(\s*function\s*\("#) {
+        let starts: Vec<usize> = eval_start_re.find_iter(html).map(|m| m.start()).collect();
+        for (idx, &start) in starts.iter().enumerate() {
+            let end = starts.get(idx + 1).copied().unwrap_or(html.len());
+            let slice = &html[start..end];
+            if let Some(unpacked) = unpack_dean_edwards(slice) {
+                if let Some(url) = find_m3u8(&unpacked) {
+                    return Some(url);
+                }
             }
         }
     }
 
-    // 2. Direct fallback
+    // Direct fallback
     find_m3u8(html)
 }
 
@@ -127,6 +131,16 @@ mod tests {
         assert!(unpacked.contains("https://example.com/playlist.m3u8"));
         let url = find_m3u8(&unpacked).unwrap();
         assert_eq!(url, "https://example.com/playlist.m3u8");
+    }
+
+    #[test]
+    fn test_dean_edwards_with_escaped_quotes_and_decoy_eval() {
+        let html = r#"
+            <script>eval(function(a){return a}('decoy'))</script>
+            <script>eval(function(p,a,c,k,e,d){return p}('const note=\'ok\';0 1="2";',10,3,'const|source|https://cdn.example.com/stream/uwu.m3u8'.split('|'),0,{}))</script>
+        "#;
+        let url = extract_m3u8_from_kwik(html).unwrap();
+        assert_eq!(url, "https://cdn.example.com/stream/uwu.m3u8");
     }
 
     #[test]

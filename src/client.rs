@@ -12,6 +12,64 @@ pub const MIN_INTERVAL_MS: u64 = 350;
 pub const TIMEOUT_SECS: u64 = 30;
 pub const RATE_LIMIT_MARKER: &str = "error code: 1015";
 
+const ANIMEPAHE_DOMAINS: &[&str] = &[
+    "animepahe.pw",
+    "animepahe.com",
+    "animepahe.org",
+    "animepahe.ru",
+    "animepahe.si",
+];
+
+pub fn is_animepahe_url(raw_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    ANIMEPAHE_DOMAINS
+        .iter()
+        .any(|d| lower == *d || lower.ends_with(&format!(".{}", d)))
+}
+
+#[cfg(any(not(target_os = "android"), test))]
+fn is_rate_limit_text(lower_text: &str) -> bool {
+    lower_text.contains(RATE_LIMIT_MARKER)
+        || lower_text.contains("too many requests")
+        || lower_text.contains("rate limit")
+        || lower_text.contains("error 1015")
+        || lower_text.contains("returned error: 429")
+        || lower_text.contains("http/1.1 429")
+        || lower_text.contains("http/2 429")
+        || lower_text.contains("http/3 429")
+        || lower_text.contains("status code 429")
+}
+
+fn is_cloudflare_challenge_body(is_success_status: Option<bool>, lower_body: &str) -> bool {
+    let explicit_marker = lower_body.contains("<title>just a moment")
+        || lower_body.contains("cf-browser-verification")
+        || lower_body.contains("_cf_chl_opt")
+        || lower_body.contains("/cdn-cgi/challenge-platform");
+    if explicit_marker {
+        return true;
+    }
+    is_success_status == Some(false) && lower_body.contains("just a moment...")
+}
+
+fn extract_chrome_major(ua: &str) -> Option<&str> {
+    let idx = ua.find("Chrome/").or_else(|| ua.find("Chromium/"))?;
+    let after = &ua[idx..];
+    let slash = after.find('/')? + 1;
+    let ver = &after[slash..];
+    let major = ver.split(['.', ' ']).next()?;
+    if !major.is_empty() && major.chars().all(|c| c.is_ascii_digit()) {
+        Some(major)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpClient {
     last_request: Arc<AtomicU64>,
@@ -29,8 +87,9 @@ impl HttpClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .dns_resolver(Arc::new(crate::dns::SmartDnsResolver::new()))
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .read_timeout(Duration::from_secs(25))
+            .connect_timeout(Duration::from_secs(12))
             .build()
             .unwrap_or_default();
 
@@ -119,7 +178,7 @@ impl HttpClient {
         {
             let bin = Self::find_impersonate_binary();
             let bin_str = bin.to_string_lossy().to_string();
-            let is_animepahe = url.contains("animepahe.");
+            let is_animepahe = is_animepahe_url(url);
 
             let mut last_error = String::from("Request to animepahe failed.");
 
@@ -163,11 +222,7 @@ impl HttpClient {
                         let combined = format!("{}\n{}", stdout_str, stderr_str);
                         let lower_combined = combined.to_lowercase();
 
-                        let is_rate_limit = combined.contains(RATE_LIMIT_MARKER)
-                            || lower_combined.contains("too many requests")
-                            || lower_combined.contains("rate limit")
-                            || lower_combined.contains("error 1015")
-                            || lower_combined.contains("429");
+                        let is_rate_limit = is_rate_limit_text(&lower_combined);
 
                         if is_rate_limit {
                             let backoff_ms = (1200 * (1 << attempt)).min(16000) + (attempt * 150);
@@ -184,9 +239,10 @@ impl HttpClient {
                             continue;
                         }
 
-                        if lower_combined.contains("just a moment...")
-                            || lower_combined.contains("cf-browser-verification")
-                        {
+                        if is_cloudflare_challenge_body(
+                            Some(output.status.success()),
+                            &lower_combined,
+                        ) {
                             return Err(String::from(
                                 "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings.",
                             ));
@@ -232,7 +288,7 @@ impl HttpClient {
         referer: Option<&str>,
         cfg: &AppConfig,
     ) -> Result<String, String> {
-        let is_animepahe = url.contains("animepahe.");
+        let is_animepahe = is_animepahe_url(url);
         let mut last_error = String::from("Request to animepahe failed.");
 
         for attempt in 1..=5 {
@@ -246,12 +302,30 @@ impl HttpClient {
                 "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
             };
             req = req.header(reqwest::header::USER_AGENT, ua);
-            req = req.header(
-                "sec-ch-ua",
-                r#""Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133""#,
-            );
-            req = req.header("sec-ch-ua-mobile", "?1");
-            req = req.header("sec-ch-ua-platform", r#""Android""#);
+            if let Some(major) = extract_chrome_major(ua) {
+                let sec_ch_ua = format!(
+                    r#""Not(A:Brand";v="99", "Google Chrome";v="{0}", "Chromium";v="{0}""#,
+                    major
+                );
+                let is_mobile = if ua.contains("Mobile") { "?1" } else { "?0" };
+                let platform = if ua.contains("Android") {
+                    r#""Android""#
+                } else if ua.contains("Windows") {
+                    r#""Windows""#
+                } else if ua.contains("Mac OS") {
+                    r#""macOS""#
+                } else {
+                    r#""Linux""#
+                };
+                req = req.header("sec-ch-ua", sec_ch_ua);
+                req = req.header("sec-ch-ua-mobile", is_mobile);
+                req = req.header("sec-ch-ua-platform", platform);
+            }
+            let fetch_site = if is_animepahe {
+                "same-origin"
+            } else {
+                "cross-site"
+            };
             if url.contains("/api") {
                 req = req.header(
                     reqwest::header::ACCEPT,
@@ -260,7 +334,7 @@ impl HttpClient {
                 req = req.header("X-Requested-With", "XMLHttpRequest");
                 req = req.header("sec-fetch-dest", "empty");
                 req = req.header("sec-fetch-mode", "cors");
-                req = req.header("sec-fetch-site", "same-origin");
+                req = req.header("sec-fetch-site", fetch_site);
             } else {
                 req = req.header(
                     reqwest::header::ACCEPT,
@@ -268,7 +342,7 @@ impl HttpClient {
                 );
                 req = req.header("sec-fetch-dest", "document");
                 req = req.header("sec-fetch-mode", "navigate");
-                req = req.header("sec-fetch-site", "same-origin");
+                req = req.header("sec-fetch-site", fetch_site);
             }
             req = req.header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
 
@@ -338,9 +412,7 @@ impl HttpClient {
                         continue;
                     }
 
-                    if lower.contains("just a moment...")
-                        || lower.contains("cf-browser-verification")
-                    {
+                    if is_cloudflare_challenge_body(Some(status.is_success()), &lower) {
                         return Err(String::from(
                             "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings.",
                         ));
@@ -403,7 +475,7 @@ impl HttpClient {
         referer: Option<&str>,
         cfg: &AppConfig,
     ) -> Result<(Vec<u8>, String), String> {
-        let is_animepahe = url.contains("animepahe.");
+        let is_animepahe = is_animepahe_url(url);
         let mut last_error = String::from("Failed to download image.");
 
         for attempt in 1..=3 {
@@ -467,5 +539,60 @@ impl HttpClient {
         }
 
         Err(last_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animepahe_url_checks_hostname_only() {
+        assert!(is_animepahe_url("https://animepahe.pw/api?m=search&q=test"));
+        assert!(is_animepahe_url("https://i.animepahe.com/posters/1.jpg"));
+        assert!(is_animepahe_url("https://animepahe.si/anime/abc"));
+        assert!(!is_animepahe_url("https://kwik.cx/e/123?ref=animepahe.pw"));
+        assert!(!is_animepahe_url("https://evil-animepahe.pw/api"));
+        assert!(!is_animepahe_url("not-a-url"));
+    }
+
+    #[test]
+    fn rate_limit_detection_ignores_bare_429_numbers() {
+        assert!(!is_rate_limit_text("episode 429 released (429 mb)"));
+        assert!(is_rate_limit_text("http/2 429 \n too many requests"));
+        assert!(is_rate_limit_text(
+            "curl: (22) the requested url returned error: 429"
+        ));
+        assert!(is_rate_limit_text("cloudflare error code: 1015"));
+    }
+
+    #[test]
+    fn cloudflare_challenge_avoids_false_positives_on_200_ok() {
+        assert!(!is_cloudflare_challenge_body(
+            Some(true),
+            r#"{"title":"just a moment... in time"}"#
+        ));
+        assert!(is_cloudflare_challenge_body(
+            Some(false),
+            "just a moment... please wait"
+        ));
+        assert!(is_cloudflare_challenge_body(
+            Some(true),
+            "<html><head><title>Just a moment...</title></head><body>_cf_chl_opt</body></html>"
+        ));
+    }
+
+    #[test]
+    fn chrome_major_version_extracted_only_for_chromium_uas() {
+        assert_eq!(
+            extract_chrome_major("Mozilla/5.0 Chrome/134.0.0.0 Mobile Safari/537.36"),
+            Some("134")
+        );
+        assert_eq!(
+            extract_chrome_major(
+                "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0"
+            ),
+            None
+        );
     }
 }

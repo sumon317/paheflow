@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 pub struct ProgressUpdate {
     pub percent: f64,
@@ -45,7 +47,9 @@ where
     pub referer: Option<String>,
     /// Final output path (e.g. `<anime_dir>/1.mp4`).
     pub dest_path: PathBuf,
-    /// When `true`, download to `<dest>.new` and atomically rename on success.
+    /// Optional stable key for the fragment cache directory (so storage fallbacks reuse cached fragments).
+    pub cache_key: Option<String>,
+    /// When `true`, replace existing destination file on completion.
     pub replace_existing: bool,
     /// Maximum concurrent fragment downloads (clamped to 1–64).
     pub concurrency: usize,
@@ -53,10 +57,43 @@ where
     pub stop_signal: Arc<AtomicBool>,
     /// Shared pause flag; set to `true` to pause downloading.
     pub pause_signal: Arc<AtomicBool>,
-    /// Notify handle to wake up workers when resumed.
+    /// Notify handle to wake up workers when resumed or cancelled.
     pub pause_notify: Arc<tokio::sync::Notify>,
     /// Called after each fragment completes with cumulative progress metrics.
     pub progress_cb: F,
+}
+
+async fn wait_for_stop(stop: &AtomicBool, notify: Option<&tokio::sync::Notify>) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match notify {
+            Some(n) => {
+                tokio::select! {
+                    _ = n.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+            None => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+async fn cancellable_sleep(
+    dur: Duration,
+    stop: &AtomicBool,
+    notify: Option<&tokio::sync::Notify>,
+) -> bool {
+    if stop.load(Ordering::Relaxed) {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => stop.load(Ordering::Relaxed),
+        _ = wait_for_stop(stop, notify) => true,
+    }
 }
 
 fn format_reqwest_err(e: &reqwest::Error) -> String {
@@ -91,8 +128,9 @@ impl HlsDownloader {
         };
         let client = reqwest::Client::builder()
             .dns_resolver(Arc::new(crate::dns::SmartDnsResolver::new()))
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .read_timeout(Duration::from_secs(25))
+            .connect_timeout(Duration::from_secs(15))
             .user_agent(ua)
             .tcp_keepalive(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(60))
@@ -107,10 +145,25 @@ impl HlsDownloader {
         m3u8_url: &str,
         referer: Option<&str>,
     ) -> Result<Vec<SegmentInfo>, String> {
+        self.parse_playlist_cancellable(m3u8_url, referer, None)
+            .await
+    }
+
+    async fn parse_playlist_cancellable(
+        &self,
+        m3u8_url: &str,
+        referer: Option<&str>,
+        cancel: Option<(&AtomicBool, &tokio::sync::Notify)>,
+    ) -> Result<Vec<SegmentInfo>, String> {
         let mut last_err = String::new();
         let mut body = String::new();
 
         for attempt in 1..=4 {
+            if let Some((stop, _)) = cancel {
+                if stop.load(Ordering::Relaxed) {
+                    return Err("Cancelled by user".to_string());
+                }
+            }
             let mut req = self.client.get(m3u8_url);
             if let Some(ref_str) = referer {
                 req = req.header("Referer", ref_str);
@@ -118,15 +171,63 @@ impl HlsDownloader {
             req = req.header("Accept", "*/*");
             req = req.header("Accept-Language", "en-US,en;q=0.9");
 
-            match req.send().await {
+            let send_res = if let Some((stop, notify)) = cancel {
+                tokio::select! {
+                    r = req.send() => r,
+                    _ = wait_for_stop(stop, Some(notify)) => {
+                        return Err("Cancelled by user".to_string());
+                    }
+                }
+            } else {
+                req.send().await
+            };
+
+            let mut retry_delay = Duration::from_millis(500 * attempt as u64);
+
+            match send_res {
                 Ok(res) => {
-                    if !res.status().is_success() {
-                        last_err = format!("m3u8 request failed with HTTP {}", res.status());
+                    let status = res.status();
+                    if !status.is_success() {
+                        last_err = format!("m3u8 request failed with HTTP {}", status);
+                        if status == reqwest::StatusCode::NOT_FOUND
+                            || status == reqwest::StatusCode::GONE
+                        {
+                            return Err(last_err);
+                        }
+                        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            let ra = res
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or(2);
+                            retry_delay = Duration::from_secs(ra.clamp(1, 10));
+                        } else if status == reqwest::StatusCode::FORBIDDEN && attempt >= 2 {
+                            return Err(last_err);
+                        }
                     } else {
-                        match res.text().await {
+                        let text_res = if let Some((stop, notify)) = cancel {
+                            tokio::select! {
+                                t = res.text() => t,
+                                _ = wait_for_stop(stop, Some(notify)) => {
+                                    return Err("Cancelled by user".to_string());
+                                }
+                            }
+                        } else {
+                            res.text().await
+                        };
+                        match text_res {
                             Ok(b) => {
-                                body = b;
-                                break;
+                                let lower = b.to_ascii_lowercase();
+                                if !b.contains("#EXTM3U")
+                                    && (lower.contains("<html") || lower.contains("<!doctype"))
+                                {
+                                    last_err = "m3u8 request returned HTML instead of a playlist"
+                                        .to_string();
+                                } else {
+                                    body = b;
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 last_err =
@@ -140,7 +241,13 @@ impl HlsDownloader {
                 }
             }
             if attempt < 4 {
-                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                if let Some((stop, notify)) = cancel {
+                    if cancellable_sleep(retry_delay, stop, Some(notify)).await {
+                        return Err("Cancelled by user".to_string());
+                    }
+                } else {
+                    tokio::time::sleep(retry_delay).await;
+                }
             }
         }
 
@@ -195,7 +302,7 @@ impl HlsDownloader {
                 }
             }
             if let Some((_, _, best_url)) = best {
-                return Box::pin(self.parse_playlist(&best_url, referer)).await;
+                return Box::pin(self.parse_playlist_cancellable(&best_url, referer, cancel)).await;
             }
         }
 
@@ -213,6 +320,7 @@ impl HlsDownloader {
             m3u8_url,
             referer,
             dest_path,
+            cache_key,
             replace_existing,
             concurrency,
             stop_signal,
@@ -230,13 +338,21 @@ impl HlsDownloader {
             return Ok(());
         }
 
+        if stop_signal.load(Ordering::Relaxed) {
+            return Err("Cancelled by user".to_string());
+        }
+
         // Store intermediate fragments and temporary assembly in the application cache.
         // On Android, this avoids writing hundreds of tiny chunks and dot/temp files
         // through the MediaProvider FUSE layer in public storage (e.g. Download/PaheFlow),
         // which triggers "Operation not permitted" (EPERM / os error 1).
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        final_mp4.hash(&mut hasher);
+        if let Some(ref key) = cache_key {
+            key.hash(&mut hasher);
+        } else {
+            final_mp4.hash(&mut hasher);
+        }
         let stream_hash = format!("{:016x}", hasher.finish());
 
         let cache_frag_root = crate::config::cache_dir().join("fragments");
@@ -251,7 +367,9 @@ impl HlsDownloader {
             )
         })?;
 
-        let segments = self.parse_playlist(m3u8_url, referer).await?;
+        let segments = self
+            .parse_playlist_cancellable(m3u8_url, referer, Some((&stop_signal, &pause_notify)))
+            .await?;
         let total_segments = segments.len();
 
         if stop_signal.load(Ordering::Relaxed) {
@@ -282,21 +400,43 @@ impl HlsDownloader {
                     req = req.header("Referer", r);
                 }
                 req = req.header("Accept", "*/*");
-                match req.send().await {
+                let send_res = tokio::select! {
+                    r = req.send() => r,
+                    _ = wait_for_stop(&stop_signal, Some(&pause_notify)) => {
+                        return Err("Cancelled by user".to_string());
+                    }
+                };
+                let mut retry_delay = Duration::from_millis(500 * attempt as u64);
+                match send_res {
                     Ok(res) => {
-                        if !res.status().is_success() {
-                            last_err = format!("Key request failed with HTTP {}", res.status());
+                        let status = res.status();
+                        if !status.is_success() {
+                            last_err = format!("Key request failed with HTTP {}", status);
+                            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                retry_delay = Duration::from_secs(2);
+                            } else if status == reqwest::StatusCode::NOT_FOUND
+                                || status == reqwest::StatusCode::GONE
+                            {
+                                return Err(last_err);
+                            }
                         } else {
-                            match res.bytes().await {
+                            let bytes_res = tokio::select! {
+                                b = res.bytes() => b,
+                                _ = wait_for_stop(&stop_signal, Some(&pause_notify)) => {
+                                    return Err("Cancelled by user".to_string());
+                                }
+                            };
+                            match bytes_res {
                                 Ok(bytes) => {
                                     if bytes.len() != 16 {
-                                        return Err(format!(
+                                        last_err = format!(
                                             "Invalid AES key length (expected 16 bytes, got {})",
                                             bytes.len()
-                                        ));
+                                        );
+                                    } else {
+                                        key_bytes = Some(bytes.to_vec());
+                                        break;
                                     }
-                                    key_bytes = Some(bytes.to_vec());
-                                    break;
                                 }
                                 Err(e) => {
                                     last_err = format!(
@@ -315,29 +455,39 @@ impl HlsDownloader {
                         );
                     }
                 }
-                if attempt < 6 {
-                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                if attempt < 6
+                    && cancellable_sleep(retry_delay, &stop_signal, Some(&pause_notify)).await
+                {
+                    return Err("Cancelled by user".to_string());
                 }
             }
             let bytes = key_bytes.ok_or(last_err)?;
             keys_map.insert(key_url, Arc::new(bytes));
         }
 
-        let semaphore = Arc::new(Semaphore::new(concurrency.clamp(1, 64)));
-        let completed_segments = Arc::new(AtomicUsize::new(0));
-        let downloaded_bytes = Arc::new(AtomicU64::new(0));
-        let start_time = Instant::now();
-
-        // Prepare temporary directory for fragments in cache
-        if replace_existing {
-            // A replacement must never reuse fragments from a failed earlier
-            // attempt; start from a clean slate.
+        // Preserve cached fragments across pause/resume and retries even when
+        // `replace_existing` is true, as long as the stream signature matches.
+        // Only wipe if the stream switched (e.g. different quality/track) or
+        // an un-tagged legacy cache exists with `replace_existing`.
+        let m3u8_path_sig = url::Url::parse(m3u8_url)
+            .map(|u| u.path().to_string())
+            .unwrap_or_else(|_| m3u8_url.to_string());
+        let expected_meta = format!("{}|{}", m3u8_path_sig, total_segments);
+        let meta_path = temp_dir.join(".stream_meta");
+        let existing_meta = fs::read_to_string(&meta_path).ok();
+        let cache_compatible = match existing_meta.as_deref() {
+            Some(m) => m.trim() == expected_meta,
+            None => !replace_existing,
+        };
+        if !cache_compatible {
             let _ = fs::remove_dir_all(&temp_dir);
             let _ = fs::remove_file(&temp_ts);
             let _ = fs::remove_file(&target_file);
         }
         fs::create_dir_all(&temp_dir)
             .map_err(|e| format!("Failed to create fragments directory {:?}: {}", temp_dir, e))?;
+        let _ = fs::write(&meta_path, &expected_meta);
+
         // Remove partial fragment writes left behind by a previous crash.
         // Complete `.ts` fragments are intentionally reused to resume.
         if let Ok(entries) = fs::read_dir(&temp_dir) {
@@ -348,10 +498,51 @@ impl HlsDownloader {
             }
         }
 
-        let mut tasks = Vec::with_capacity(total_segments);
+        let mut preexisting_count = 0usize;
+        let mut preexisting_bytes = 0u64;
+        let mut missing_segments = Vec::new();
+        for (idx, seg) in segments.into_iter().enumerate() {
+            let seg_path = temp_dir.join(format!("{:06}.ts", idx));
+            let valid_existing = fs::metadata(&seg_path)
+                .map(|m| if m.len() > 0 { Some(m.len()) } else { None })
+                .ok()
+                .flatten();
+            if let Some(len) = valid_existing {
+                preexisting_count += 1;
+                preexisting_bytes += len;
+            } else {
+                missing_segments.push((idx, seg, seg_path));
+            }
+        }
+
+        let file_name = dest_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let progress_cb = Arc::new(progress_cb);
 
-        for (idx, seg) in segments.into_iter().enumerate() {
+        if preexisting_count > 0 {
+            let pct = (preexisting_count as f64 / total_segments as f64) * 100.0;
+            let size_str = format!("{:.1} MiB", preexisting_bytes as f64 / 1_048_576.0);
+            progress_cb(ProgressUpdate {
+                percent: pct,
+                size_str,
+                speed_str: "Resuming...".to_string(),
+                eta_str: "--:--".to_string(),
+                file_name: file_name.clone(),
+            });
+        }
+
+        let semaphore = Arc::new(Semaphore::new(concurrency.clamp(1, 64)));
+        let completed_segments = Arc::new(AtomicUsize::new(preexisting_count));
+        let total_bytes_acc = Arc::new(AtomicU64::new(preexisting_bytes));
+        let session_bytes_acc = Arc::new(AtomicU64::new(0));
+        let start_time = Instant::now();
+
+        let mut join_set = JoinSet::new();
+
+        for (idx, seg, seg_path) in missing_segments {
             let sem = semaphore.clone();
             let seg_url = seg.url;
             let seg_key_bytes = seg.key_url.as_ref().and_then(|k| keys_map.get(k).cloned());
@@ -359,80 +550,38 @@ impl HlsDownloader {
             let referer_str = referer.map(|s| s.to_string());
             let client = self.client.clone();
             let completed = completed_segments.clone();
-            let bytes_acc = downloaded_bytes.clone();
+            let total_acc = total_bytes_acc.clone();
+            let session_acc = session_bytes_acc.clone();
             let stop = stop_signal.clone();
             let pause = pause_signal.clone();
             let p_notify = pause_notify.clone();
-            let seg_path = temp_dir.join(format!("{:06}.ts", idx));
             let cb = progress_cb.clone();
-            let file_name = dest_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let fname = file_name.clone();
 
-            tasks.push(tokio::spawn(async move {
+            join_set.spawn(async move {
                 let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
 
                 while pause.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-                    p_notify.notified().await;
+                    tokio::select! {
+                        _ = p_notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                    }
                 }
 
                 if stop.load(Ordering::Relaxed) {
                     return Err("Cancelled by user".to_string());
                 }
 
-                // If already downloaded and valid from a resumed session, skip re-download
-                if seg_path.exists() {
-                    if let Ok(meta) = fs::metadata(&seg_path) {
-                        if meta.len() > 0 {
-                            bytes_acc.fetch_add(meta.len(), Ordering::Relaxed);
-                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                            let elapsed_secs = start_time.elapsed().as_secs_f64().max(0.1);
-                            let total_bytes = bytes_acc.load(Ordering::Relaxed);
-                            let speed_bps = total_bytes as f64 / elapsed_secs;
-                            let pct = (done as f64 / total_segments as f64) * 100.0;
-                            let est_total_bytes =
-                                (total_bytes as f64 / done as f64) * total_segments as f64;
-                            let rem_bytes = (est_total_bytes - total_bytes as f64).max(0.0);
-                            let eta_secs = if speed_bps > 0.0 {
-                                rem_bytes / speed_bps
-                            } else {
-                                0.0
-                            };
-                            let eta_str = if eta_secs > 0.0 && eta_secs < 86400.0 {
-                                format!(
-                                    "{:02}:{:02}",
-                                    (eta_secs as u64) / 60,
-                                    (eta_secs as u64) % 60
-                                )
-                            } else {
-                                "--:--".to_string()
-                            };
-                            let speed_str = if speed_bps > 1_048_576.0 {
-                                format!("{:.2} MiB/s", speed_bps / 1_048_576.0)
-                            } else {
-                                format!("{:.1} KiB/s", speed_bps / 1024.0)
-                            };
-                            let size_str = format!("{:.1} MiB", total_bytes as f64 / 1_048_576.0);
-                            cb(ProgressUpdate {
-                                percent: pct,
-                                size_str,
-                                speed_str,
-                                eta_str,
-                                file_name,
-                            });
-                            return Ok::<(), String>(());
-                        }
-                    }
-                }
-
-                // Download segment with up to 8 retries
-                let mut data = None;
+                // Download + decrypt segment with up to 8 retries so transient CDN
+                // truncations or decryption failures recover cleanly.
+                let mut payload_opt = None;
                 let mut last_err = String::from("No response");
                 for attempt in 1..=8 {
                     while pause.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-                        p_notify.notified().await;
+                        tokio::select! {
+                            _ = p_notify.notified() => {}
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                        }
                     }
                     if stop.load(Ordering::Relaxed) {
                         return Err("Cancelled by user".to_string());
@@ -442,43 +591,94 @@ impl HlsDownloader {
                         req = req.header("Referer", r);
                     }
                     req = req.header("Accept", "*/*");
-                    match req.send().await {
+
+                    let send_res = tokio::select! {
+                        r = req.send() => r,
+                        _ = wait_for_stop(&stop, Some(&p_notify)) => {
+                            return Err("Cancelled by user".to_string());
+                        }
+                    };
+
+                    let mut retry_delay = Duration::from_millis(
+                        (400 * (1u64 << (attempt - 1).min(4))).min(8000)
+                            + fastrand::u64(50..250),
+                    );
+
+                    match send_res {
                         Ok(res) => {
                             let status = res.status();
                             if status.is_success() {
-                                match res.bytes().await {
+                                let bytes_res = tokio::select! {
+                                    b = res.bytes() => b,
+                                    _ = wait_for_stop(&stop, Some(&p_notify)) => {
+                                        return Err("Cancelled by user".to_string());
+                                    }
+                                };
+                                match bytes_res {
                                     Ok(bytes) => {
-                                        data = Some(bytes);
-                                        break;
+                                        if bytes.is_empty() {
+                                            last_err = "Empty fragment response".to_string();
+                                        } else if let (Some(ref key), Some(ref iv)) =
+                                            (&seg_key_bytes, &seg_iv)
+                                        {
+                                            match decrypt_aes128_cbc(&bytes, key, iv) {
+                                                Ok(dec) => {
+                                                    payload_opt = Some(dec);
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    last_err = format!(
+                                                        "Decrypt failed (corrupt/truncated fragment): {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            payload_opt = Some(bytes.to_vec());
+                                            break;
+                                        }
                                     }
                                     Err(e) => {
                                         last_err = format!(
                                             "Failed to read fragment body: {}",
                                             format_reqwest_err(&e)
-                                        )
+                                        );
                                     }
                                 }
                             } else {
                                 last_err = format!("HTTP {}", status);
+                                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                    let ra = res
+                                        .headers()
+                                        .get(reqwest::header::RETRY_AFTER)
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|s| s.parse::<u64>().ok())
+                                        .unwrap_or(2);
+                                    retry_delay = Duration::from_secs(ra.clamp(1, 10));
+                                } else if (status == reqwest::StatusCode::FORBIDDEN
+                                    || status == reqwest::StatusCode::NOT_FOUND
+                                    || status == reqwest::StatusCode::GONE)
+                                    && attempt >= 2
+                                {
+                                    break;
+                                }
                             }
                         }
                         Err(e) => {
-                            last_err = format!("Connection error: {}", format_reqwest_err(&e))
+                            last_err = format!("Connection error: {}", format_reqwest_err(&e));
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(attempt * 400)).await;
+
+                    if attempt < 8
+                        && cancellable_sleep(retry_delay, &stop, Some(&p_notify)).await
+                    {
+                        return Err("Cancelled by user".to_string());
+                    }
                 }
 
-                let bytes = data.ok_or_else(|| {
+                let payload = payload_opt.ok_or_else(|| {
                     format!("Fragment {} failed after retries: {}", idx, last_err)
                 })?;
-
-                // Decrypt segment if an AES-128 key is present
-                let payload = if let (Some(key), Some(iv)) = (seg_key_bytes, seg_iv) {
-                    decrypt_aes128_cbc(&bytes, &key, &iv)?
-                } else {
-                    bytes.to_vec()
-                };
 
                 let byte_len = payload.len() as u64;
                 let tmp_seg = seg_path.with_extension("ts.tmp");
@@ -492,21 +692,22 @@ impl HlsDownloader {
                     let _ = fs::remove_file(&tmp_seg);
                 }
 
-                bytes_acc.fetch_add(byte_len, Ordering::Relaxed);
+                let total_bytes = total_acc.fetch_add(byte_len, Ordering::Relaxed) + byte_len;
+                let session_bytes = session_acc.fetch_add(byte_len, Ordering::Relaxed) + byte_len;
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
 
-                // Update progress metrics
+                // Update progress metrics using session bytes for accurate speed/ETA
                 let elapsed_secs = start_time.elapsed().as_secs_f64().max(0.1);
-                let total_bytes = bytes_acc.load(Ordering::Relaxed);
-                let speed_bps = total_bytes as f64 / elapsed_secs;
+                let speed_bps = session_bytes as f64 / elapsed_secs;
                 let pct = (done as f64 / total_segments as f64) * 100.0;
 
-                let est_total_bytes = if done > 0 {
-                    (total_bytes as f64 / done as f64) * total_segments as f64
+                let avg_seg_bytes = if done > 0 {
+                    total_bytes as f64 / done as f64
                 } else {
                     0.0
                 };
-                let rem_bytes = (est_total_bytes - total_bytes as f64).max(0.0);
+                let rem_segs = total_segments.saturating_sub(done) as f64;
+                let rem_bytes = (avg_seg_bytes * rem_segs).max(0.0);
                 let eta_secs = if speed_bps > 0.0 {
                     rem_bytes / speed_bps
                 } else {
@@ -534,86 +735,83 @@ impl HlsDownloader {
                     size_str,
                     speed_str,
                     eta_str,
-                    file_name,
+                    file_name: fname,
                 });
 
                 Ok::<(), String>(())
-            }));
+            });
         }
 
-        // Wait for all fragments to finish. Abort the remaining tasks as soon
-        // as one fails or stop_signal is triggered so a failed/paused/stopped
-        // job does not keep consuming bandwidth or wait on slow sockets.
-        let mut pending = tasks.into_iter();
-        let mut failure = None;
-        for task in pending.by_ref() {
-            tokio::pin!(task);
-            loop {
-                if stop_signal.load(Ordering::Relaxed) {
-                    task.abort();
-                    failure = Some("Cancelled by user".to_string());
-                    break;
-                }
-                tokio::select! {
-                    res = &mut task => {
-                        match res {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                failure = Some(e);
-                            }
-                            Err(e) => {
-                                failure = Some(format!("Task error: {}", e));
-                            }
+        // Wait for all remaining fragments; abort all tasks immediately on
+        // stop_signal or first permanent failure.
+        loop {
+            if stop_signal.load(Ordering::Relaxed) {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                return Err("Cancelled by user".to_string());
+            }
+            tokio::select! {
+                res = join_set.join_next() => {
+                    match res {
+                        Some(Ok(Ok(()))) => {}
+                        Some(Ok(Err(e))) => {
+                            join_set.abort_all();
+                            while join_set.join_next().await.is_some() {}
+                            return Err(e);
                         }
-                        break;
+                        Some(Err(e)) => {
+                            join_set.abort_all();
+                            while join_set.join_next().await.is_some() {}
+                            return Err(format!("Task error: {}", e));
+                        }
+                        None => break,
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+                _ = wait_for_stop(&stop_signal, Some(&pause_notify)) => {
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    return Err("Cancelled by user".to_string());
                 }
             }
-            if failure.is_some() {
-                break;
-            }
-        }
-        if let Some(e) = failure {
-            for task in pending {
-                task.abort();
-            }
-            return Err(e);
         }
 
         while pause_signal.load(Ordering::Relaxed) && !stop_signal.load(Ordering::Relaxed) {
-            pause_notify.notified().await;
+            tokio::select! {
+                _ = pause_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
         }
 
         if stop_signal.load(Ordering::Relaxed) {
             return Err("Cancelled by user".to_string());
         }
 
-        // Assemble fragments into temp_ts
-        if temp_ts.exists() {
-            let _ = fs::remove_file(&temp_ts);
+        // Assemble fragments into temp_ts off the async runtime (preserving temp_dir if cancelled mid-assembly)
+        {
+            let temp_ts_blk = temp_ts.clone();
+            let temp_dir_blk = temp_dir.clone();
+            let stop_blk = stop_signal.clone();
+            tokio::task::spawn_blocking(move || {
+                assemble_segments(&temp_dir_blk, &temp_ts_blk, total_segments, &stop_blk)
+            })
+            .await
+            .map_err(|e| format!("Stream assembly task failed: {}", e))??;
         }
-        let mut out_file = File::create(&temp_ts).map_err(|e| {
-            format!(
-                "Failed to create temporary stream file {:?}: {}",
-                temp_ts, e
-            )
-        })?;
-        for idx in 0..total_segments {
-            let seg_path = temp_dir.join(format!("{:06}.ts", idx));
-            let bytes = fs::read(&seg_path)
-                .map_err(|e| format!("Missing fragment {:06}.ts: {}", idx, e))?;
-            out_file
-                .write_all(&bytes)
-                .map_err(|e| format!("Failed writing assembled stream to {:?}: {}", temp_ts, e))?;
-        }
-        drop(out_file);
 
-        // Remux with ffmpeg into target_file, or fall back to stream copy if ffmpeg is unavailable
+        if stop_signal.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&temp_ts);
+            return Err("Cancelled by user".to_string());
+        }
+
+        // Remux with ffmpeg into target_file, or fall back to stream copy if ffmpeg is unavailable.
+        // `.kill_on_drop(true)` ensures cancelling mid-remux terminates ffmpeg immediately.
         let ffmpeg_bin =
             std::env::var("ANIMEPAHE_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
         let mut ffmpeg = Command::new(&ffmpeg_bin);
         ffmpeg
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .arg("-y")
             .arg("-i")
             .arg(&temp_ts)
@@ -627,15 +825,31 @@ impl HlsDownloader {
             .arg("mp4")
             .arg(&target_file);
 
-        let remux_success = match ffmpeg.output().await {
-            Ok(output) if output.status.success() => true,
-            Ok(output) => {
-                let err = String::from_utf8_lossy(&output.stderr);
-                eprintln!(
-                    "[HLS] ffmpeg exited with error: {}, falling back to assembled stream",
-                    err
-                );
-                false
+        let remux_success = match ffmpeg.spawn() {
+            Ok(child) => {
+                let wait_fut = child.wait_with_output();
+                tokio::select! {
+                    out = wait_fut => match out {
+                        Ok(output) if output.status.success() => true,
+                        Ok(output) => {
+                            let err = String::from_utf8_lossy(&output.stderr);
+                            eprintln!(
+                                "[HLS] ffmpeg exited with error: {}, falling back to assembled stream",
+                                err
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            eprintln!("[HLS] ffmpeg wait error ({}), falling back", e);
+                            false
+                        }
+                    },
+                    _ = wait_for_stop(&stop_signal, Some(&pause_notify)) => {
+                        let _ = fs::remove_file(&temp_ts);
+                        let _ = fs::remove_file(&target_file);
+                        return Err("Cancelled by user".to_string());
+                    }
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -646,16 +860,26 @@ impl HlsDownloader {
             }
         };
 
+        if stop_signal.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&temp_ts);
+            let _ = fs::remove_file(&target_file);
+            return Err("Cancelled by user".to_string());
+        }
+
         if remux_success {
             let _ = fs::remove_file(&temp_ts);
         } else {
             // Fallback: use the assembled MPEG transport stream directly
-            safe_replace_file(&temp_ts, &target_file)
-                .map_err(|e| format!("Stream assembly fallback failed: {}", e))?;
+            let src_blk = temp_ts.clone();
+            let dst_blk = target_file.clone();
+            let stop_blk = stop_signal.clone();
+            tokio::task::spawn_blocking(move || {
+                safe_replace_file_cancellable(&src_blk, &dst_blk, &stop_blk)
+            })
+            .await
+            .map_err(|e| format!("Stream assembly fallback task failed: {}", e))?
+            .map_err(|e| format!("Stream assembly fallback failed: {}", e))?;
         }
-
-        let _ = fs::remove_dir_all(&temp_dir);
-        let _ = fs::remove_file(&temp_ts);
 
         // Ensure final destination directory exists before swapping
         if let Some(parent) = final_mp4.parent() {
@@ -665,28 +889,147 @@ impl HlsDownloader {
 
         // Only swap in the finished file after stream assembly succeeds. A failed or
         // interrupted attempt therefore cannot masquerade as a completed
-        // episode on the next run.
-        safe_replace_file(&target_file, &final_mp4)
+        // episode on the next run. Keep temp_dir until final move succeeds so
+        // storage fallbacks can reuse cached fragments without re-downloading.
+        {
+            let src_blk = target_file.clone();
+            let dst_blk = final_mp4.clone();
+            let stop_blk = stop_signal.clone();
+            tokio::task::spawn_blocking(move || {
+                safe_replace_file_cancellable(&src_blk, &dst_blk, &stop_blk)
+            })
+            .await
+            .map_err(|e| format!("Replacing output file task failed: {}", e))?
             .map_err(|e| format!("Replacing output file failed: {}", e))?;
+        }
 
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_file(&temp_ts);
         let _ = fs::remove_file(&target_file);
 
         Ok(())
     }
 }
 
-fn safe_replace_file(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
-    if dst.exists() {
-        let _ = fs::remove_file(dst);
+fn assemble_segments(
+    temp_dir: &Path,
+    temp_ts: &Path,
+    total_segments: usize,
+    stop_signal: &AtomicBool,
+) -> Result<(), String> {
+    if temp_ts.exists() {
+        let _ = fs::remove_file(temp_ts);
     }
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dst)?;
-            let _ = fs::remove_file(src);
-            Ok(())
+    let out = File::create(temp_ts).map_err(|e| {
+        format!(
+            "Failed to create temporary stream file {:?}: {}",
+            temp_ts, e
+        )
+    })?;
+    let mut writer = BufWriter::with_capacity(128 * 1024, out);
+    let mut buf = [0u8; 64 * 1024];
+
+    for idx in 0..total_segments {
+        if stop_signal.load(Ordering::Relaxed) {
+            drop(writer);
+            let _ = fs::remove_file(temp_ts);
+            return Err("Cancelled by user".to_string());
+        }
+        let seg_path = temp_dir.join(format!("{:06}.ts", idx));
+        let mut seg_file =
+            File::open(&seg_path).map_err(|e| format!("Missing fragment {:06}.ts: {}", idx, e))?;
+        loop {
+            if stop_signal.load(Ordering::Relaxed) {
+                drop(writer);
+                let _ = fs::remove_file(temp_ts);
+                return Err("Cancelled by user".to_string());
+            }
+            let n = seg_file
+                .read(&mut buf)
+                .map_err(|e| format!("Failed reading fragment {:06}.ts: {}", idx, e))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| format!("Failed writing assembled stream to {:?}: {}", temp_ts, e))?;
         }
     }
+
+    writer
+        .flush()
+        .map_err(|e| format!("Failed flushing assembled stream to {:?}: {}", temp_ts, e))?;
+    Ok(())
+}
+
+fn safe_replace_file_cancellable(
+    src: &Path,
+    dst: &Path,
+    stop_signal: &AtomicBool,
+) -> Result<(), std::io::Error> {
+    if stop_signal.load(Ordering::Relaxed) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Cancelled by user",
+        ));
+    }
+
+    // Fast path: same filesystem atomic rename (overwrites dst atomically on POSIX)
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+
+    // Cross-filesystem path: write completely to a temporary sibling in dst's folder
+    // BEFORE touching any existing dst, so failures/cancellations never destroy dst.
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_name = format!(
+        ".paheflow_tmp_{}_{}",
+        dst.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+        fastrand::u64(..)
+    );
+    let tmp_dst = parent.join(tmp_name);
+
+    let copy_res = (|| -> Result<(), std::io::Error> {
+        let mut reader = File::open(src)?;
+        let mut writer = File::create(&tmp_dst)?;
+        let mut buf = [0u8; 128 * 1024];
+        loop {
+            if stop_signal.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Cancelled by user",
+                ));
+            }
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buf[..n])?;
+        }
+        writer.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = copy_res {
+        let _ = fs::remove_file(&tmp_dst);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp_dst, dst) {
+        if dst.exists() {
+            let _ = fs::remove_file(dst);
+            if let Err(e2) = fs::rename(&tmp_dst, dst) {
+                let _ = fs::remove_file(&tmp_dst);
+                return Err(e2);
+            }
+        } else {
+            let _ = fs::remove_file(&tmp_dst);
+            return Err(e);
+        }
+    }
+
+    let _ = fs::remove_file(src);
+    Ok(())
 }
 
 /// Decrypts an AES-128-CBC PKCS7-padded segment buffer.
@@ -1019,6 +1362,7 @@ seg2.ts
                 m3u8_url,
                 referer: None,
                 dest_path: dest.clone(),
+                cache_key: None,
                 replace_existing: true,
                 concurrency: 4,
                 stop_signal,
@@ -1035,6 +1379,250 @@ seg2.ts
     }
 
     #[tokio::test]
+    async fn test_pause_resume_preserves_fragments_even_with_replace_existing() {
+        use axum::{routing::get, Router};
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+
+        let key = [0x55u8; 16];
+        let iv1 = (1u128).to_be_bytes();
+        let iv2 = (2u128).to_be_bytes();
+        let pt = [0x47u8; 188];
+
+        let mut buf1 = [0u8; 256];
+        buf1[..pt.len()].copy_from_slice(&pt);
+        let ct1 = Aes128CbcEnc::new((&key).into(), (&iv1).into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf1, pt.len())
+            .unwrap()
+            .to_vec();
+
+        let mut buf2 = [0u8; 256];
+        buf2[..pt.len()].copy_from_slice(&pt);
+        let ct2 = Aes128CbcEnc::new((&key).into(), (&iv2).into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf2, pt.len())
+            .unwrap()
+            .to_vec();
+
+        let seg1_hits = Arc::new(AtomicUsize::new(0));
+        let seg2_hits = Arc::new(AtomicUsize::new(0));
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let pause_notify = Arc::new(tokio::sync::Notify::new());
+
+        let seg1_hits_srv = seg1_hits.clone();
+        let seg2_hits_srv = seg2_hits.clone();
+        let stop_on_seg2 = stop_signal.clone();
+        let notify_on_seg2 = pause_notify.clone();
+        let key_bytes = key.to_vec();
+
+        let app = Router::new()
+            .route(
+                "/stream/test-pause/uwu.m3u8",
+                get(|| async {
+                    "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:2.0,\nseg1.ts\n#EXTINF:2.0,\nseg2.ts\n#EXT-X-ENDLIST\n"
+                }),
+            )
+            .route("/stream/test-pause/key.bin", get(move || async move { key_bytes }))
+            .route(
+                "/stream/test-pause/seg1.ts",
+                get(move || async move {
+                    seg1_hits_srv.fetch_add(1, Ordering::Relaxed);
+                    ct1
+                }),
+            )
+            .route(
+                "/stream/test-pause/seg2.ts",
+                get(move || async move {
+                    let hit = seg2_hits_srv.fetch_add(1, Ordering::Relaxed) + 1;
+                    if hit == 1 {
+                        // Simulate user pressing pause while seg2 is downloading
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        stop_on_seg2.store(true, Ordering::Relaxed);
+                        notify_on_seg2.notify_waiters();
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    ct2
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let downloader = HlsDownloader::new(None);
+        let pause_signal = Arc::new(AtomicBool::new(false));
+        let dest = std::env::temp_dir().join(format!("paheflow_resume_{}.mp4", fastrand::u64(..)));
+        let cache_key = format!("test-pause-cache-{}", fastrand::u64(..));
+        let m3u8_url = format!("http://127.0.0.1:{}/stream/test-pause/uwu.m3u8", port);
+
+        // First attempt with concurrency=1 downloads seg1, then pauses mid-seg2
+        let res1 = downloader
+            .download_stream(DownloadConfig {
+                m3u8_url: m3u8_url.clone(),
+                referer: None,
+                dest_path: dest.clone(),
+                cache_key: Some(cache_key.clone()),
+                replace_existing: true,
+                concurrency: 1,
+                stop_signal: stop_signal.clone(),
+                pause_signal: pause_signal.clone(),
+                pause_notify: pause_notify.clone(),
+                progress_cb: |_| {},
+            })
+            .await;
+        assert!(res1.is_err());
+        assert_eq!(seg1_hits.load(Ordering::Relaxed), 1);
+
+        // Resume with replace_existing STILL true: seg1 MUST NOT be re-downloaded
+        stop_signal.store(false, Ordering::Relaxed);
+        let res2 = downloader
+            .download_stream(DownloadConfig {
+                m3u8_url,
+                referer: None,
+                dest_path: dest.clone(),
+                cache_key: Some(cache_key),
+                replace_existing: true,
+                concurrency: 1,
+                stop_signal,
+                pause_signal,
+                pause_notify,
+                progress_cb: |_| {},
+            })
+            .await;
+        assert!(res2.is_ok(), "Resume failed: {:?}", res2);
+        assert_eq!(
+            seg1_hits.load(Ordering::Relaxed),
+            1,
+            "Cached seg1.ts must be reused on resume even with replace_existing=true"
+        );
+        assert!(dest.exists());
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn test_stop_signal_aborts_slow_playlist_fetch_immediately() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route(
+            "/slow.m3u8",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "#EXTM3U\n"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let downloader = HlsDownloader::new(None);
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let pause_signal = Arc::new(AtomicBool::new(false));
+        let pause_notify = Arc::new(tokio::sync::Notify::new());
+        let dest = std::env::temp_dir().join(format!("paheflow_abort_{}.mp4", fastrand::u64(..)));
+
+        let stop_trig = stop_signal.clone();
+        let notify_trig = pause_notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            stop_trig.store(true, Ordering::Relaxed);
+            notify_trig.notify_waiters();
+        });
+
+        let started = Instant::now();
+        let res = downloader
+            .download_stream(DownloadConfig {
+                m3u8_url: format!("http://127.0.0.1:{}/slow.m3u8", port),
+                referer: None,
+                dest_path: dest,
+                cache_key: None,
+                replace_existing: false,
+                concurrency: 2,
+                stop_signal,
+                pause_signal,
+                pause_notify,
+                progress_cb: |_| {},
+            })
+            .await;
+
+        assert!(res.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "Slow playlist fetch took {:?} instead of cancelling immediately",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_encrypted_segment_retries_and_succeeds() {
+        use axum::{routing::get, Router};
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+
+        let key = [0x33u8; 16];
+        let iv1 = (1u128).to_be_bytes();
+        let pt = [0x47u8; 188];
+        let mut buf = [0u8; 256];
+        buf[..pt.len()].copy_from_slice(&pt);
+        let ct1 = Aes128CbcEnc::new((&key).into(), (&iv1).into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, pt.len())
+            .unwrap()
+            .to_vec();
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let key_bytes = key.to_vec();
+
+        let app = Router::new()
+            .route(
+                "/playlist.m3u8",
+                get(|| async {
+                    "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:2.0,\nseg1.ts\n#EXT-X-ENDLIST\n"
+                }),
+            )
+            .route("/key.bin", get(move || async move { key_bytes }))
+            .route(
+                "/seg1.ts",
+                get(move || async move {
+                    let n = hits_srv.fetch_add(1, Ordering::Relaxed);
+                    if n == 0 {
+                        // Return invalid non-multiple-of-16 truncated garbage on first try
+                        vec![0x01, 0x02, 0x03]
+                    } else {
+                        ct1
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let downloader = HlsDownloader::new(None);
+        let dest = std::env::temp_dir().join(format!("paheflow_corrupt_{}.mp4", fastrand::u64(..)));
+        let res = downloader
+            .download_stream(DownloadConfig {
+                m3u8_url: format!("http://127.0.0.1:{}/playlist.m3u8", port),
+                referer: None,
+                dest_path: dest.clone(),
+                cache_key: None,
+                replace_existing: true,
+                concurrency: 2,
+                stop_signal: Arc::new(AtomicBool::new(false)),
+                pause_signal: Arc::new(AtomicBool::new(false)),
+                pause_notify: Arc::new(tokio::sync::Notify::new()),
+                progress_cb: |_| {},
+            })
+            .await;
+
+        assert!(res.is_ok(), "Retry after corrupt segment failed: {:?}", res);
+        assert!(hits.load(Ordering::Relaxed) >= 2);
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
     #[ignore]
     async fn test_download_live_stream() {
         let downloader = HlsDownloader::new(None);
@@ -1046,6 +1634,7 @@ seg2.ts
             m3u8_url: "https://vault-12.owocdn.top/stream/12/12/b042d337707e776f90c2e43819650ec82dcf2ad87a18962bbd83ca03510ebbc8/uwu.m3u8".to_string(),
             referer: Some("https://kwik.cx/".to_string()),
             dest_path: dest.clone(),
+            cache_key: None,
             replace_existing: true,
             concurrency: 16,
             stop_signal,
@@ -1058,5 +1647,30 @@ seg2.ts
         println!("Result: {:?}", res);
         assert!(res.is_ok());
         assert!(dest.exists());
+    }
+
+    #[test]
+    fn test_safe_replace_preserves_existing_dst_on_error_or_cancel() {
+        let dir = std::env::temp_dir().join(format!("paheflow_safe_replace_{}", fastrand::u64(..)));
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("existing.mp4");
+        fs::write(&dst, b"precious-completed-episode").unwrap();
+
+        let missing_src = dir.join("does_not_exist.mp4");
+        let stop = AtomicBool::new(false);
+        assert!(safe_replace_file_cancellable(&missing_src, &dst, &stop).is_err());
+        assert_eq!(fs::read(&dst).unwrap(), b"precious-completed-episode");
+
+        let real_src = dir.join("new.mp4");
+        fs::write(&real_src, b"replacement").unwrap();
+        stop.store(true, Ordering::Relaxed);
+        assert!(safe_replace_file_cancellable(&real_src, &dst, &stop).is_err());
+        assert_eq!(fs::read(&dst).unwrap(), b"precious-completed-episode");
+
+        stop.store(false, Ordering::Relaxed);
+        safe_replace_file_cancellable(&real_src, &dst, &stop).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), b"replacement");
+        assert!(!real_src.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

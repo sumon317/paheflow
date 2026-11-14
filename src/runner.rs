@@ -146,6 +146,13 @@ pub fn load_queue_file(path: &Path) -> QueueFile {
         if entry.status == "downloading" {
             entry.status = "queued".to_string();
         }
+        for item in &mut entry.episode_items {
+            if item.status == "downloading" {
+                item.status = "queued".to_string();
+                item.speed.clear();
+                item.eta.clear();
+            }
+        }
     }
     if file.next_id <= file.entries.iter().map(|e| e.id).max().unwrap_or(0) {
         file.next_id = file.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
@@ -379,10 +386,16 @@ impl Runner {
                             && item.status != "failed"
                         {
                             item.status = "downloading".to_string();
-                            item.percent = st.progress.percent.unwrap_or(0.0);
+                            if let Some(pct) = st.progress.percent {
+                                item.percent = pct;
+                            }
                             item.speed = st.progress.speed.clone().unwrap_or_default();
                             item.eta = st.progress.eta.clone().unwrap_or_default();
-                            item.size = st.progress.size.clone().unwrap_or_default();
+                            if let Some(ref sz) = st.progress.size {
+                                if !sz.is_empty() {
+                                    item.size = sz.clone();
+                                }
+                            }
                         }
                     } else if entry.episodes == "*" {
                         let label = if let Ok(n) = cur_ep.parse::<u32>() {
@@ -536,9 +549,6 @@ impl Runner {
                 drop(st);
                 self.add_log("info", "Download resumed.").await;
                 return true;
-            }
-            if st.running {
-                return false;
             }
             st.anime.slug.clone()
         };
@@ -1203,12 +1213,80 @@ impl Runner {
     }
 
     /// Pause (`hold = true`) or resume the automatic queue pump.
+    /// When `hold = true`, any actively downloading job/episode is paused
+    /// immediately (keeping it `queued` with saved progress) instead of letting
+    /// the current episode finish first.
     pub async fn queue_set_hold(&self, hold: bool) {
         let previous = self.queue_hold.swap(hold, Ordering::Relaxed);
         if !hold && previous {
             // Explicit resume counts as fresh intent.
             self.queue_failures.store(0, Ordering::Relaxed);
         }
+
+        if hold {
+            let active_snapshot = {
+                let mut st = self.state.lock().await;
+                if st.running {
+                    let slug = st.anime.slug.clone();
+                    let cur_ep = st.episodes.current.clone();
+                    let cur_pct = st.progress.percent.unwrap_or(0.0);
+                    let cur_size = st.progress.size.clone().unwrap_or_default();
+
+                    self.job_pause_signal.store(true, Ordering::Relaxed);
+                    self.ep_cancel_signal.store(true, Ordering::Relaxed);
+                    self.pause_signal.store(false, Ordering::Relaxed);
+                    st.paused = false;
+                    st.episodes.current = None;
+                    st.progress = ProgressState::default();
+                    Some((slug, cur_ep, cur_pct, cur_size))
+                } else {
+                    None
+                }
+            };
+
+            if let Some((active_slug, cur_ep, cur_pct, cur_size)) = active_snapshot {
+                let mut q = self.queue.lock().await;
+                let idx = q
+                    .iter()
+                    .position(|e| e.slug == active_slug && e.status == "downloading")
+                    .or_else(|| q.iter().position(|e| e.slug == active_slug));
+                if let Some(idx) = idx {
+                    let entry = &mut q[idx];
+                    if entry.status == "downloading" {
+                        entry.status = "queued".to_string();
+                        entry.error.clear();
+                    }
+                    for item in &mut entry.episode_items {
+                        if item.status == "downloading" {
+                            item.status = "queued".to_string();
+                            item.speed.clear();
+                            item.eta.clear();
+                            if cur_ep.as_deref() == Some(item.ep_id.as_str()) {
+                                if cur_pct > item.percent {
+                                    item.percent = cur_pct;
+                                }
+                                if !cur_size.is_empty() {
+                                    item.size = cur_size.clone();
+                                }
+                            }
+                        } else if cur_ep.as_deref() == Some(item.ep_id.as_str())
+                            && item.status == "queued"
+                        {
+                            if cur_pct > item.percent {
+                                item.percent = cur_pct;
+                            }
+                            if !cur_size.is_empty() {
+                                item.size = cur_size.clone();
+                            }
+                            item.speed.clear();
+                            item.eta.clear();
+                        }
+                    }
+                }
+            }
+            self.pause_notify.notify_waiters();
+        }
+
         self.queue_persist().await;
         if !hold {
             self.pump_notify.notify_one();
@@ -1217,7 +1295,7 @@ impl Runner {
             self.add_log(
                 "info",
                 if hold {
-                    "Download queue paused."
+                    "Downloads paused."
                 } else {
                     "Download queue resumed."
                 },
@@ -2185,6 +2263,56 @@ impl RunnerHelper {
             .send(serde_json::to_string(&entry).unwrap_or_default());
     }
 
+    async fn wait_job_cancelled(&self) {
+        loop {
+            if self.stop.load(Ordering::Relaxed) || self.job_pause.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::select! {
+                _ = self.pause_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    async fn wait_ep_cancelled(&self) {
+        loop {
+            if self.stop.load(Ordering::Relaxed)
+                || self.job_pause.load(Ordering::Relaxed)
+                || self.ep_cancel.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            tokio::select! {
+                _ = self.pause_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    fn spawn_ep_stop_watcher(&self, this_ep_stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+        let watcher_stop = self.stop.clone();
+        let watcher_ep_cancel = self.ep_cancel.clone();
+        let watcher_job_pause = self.job_pause.clone();
+        let notify = self.pause_notify.clone();
+        tokio::spawn(async move {
+            while !this_ep_stop.load(Ordering::Relaxed) {
+                if watcher_stop.load(Ordering::Relaxed)
+                    || watcher_ep_cancel.load(Ordering::Relaxed)
+                    || watcher_job_pause.load(Ordering::Relaxed)
+                {
+                    this_ep_stop.store(true, Ordering::Relaxed);
+                    notify.notify_waiters();
+                    break;
+                }
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        })
+    }
+
     async fn handle_ep_paused(&self, slug: &str, ep_num: &str) {
         let (cur_pct, cur_size) = {
             let mut st = self.state.lock().await;
@@ -2200,8 +2328,10 @@ impl RunnerHelper {
             let mut q = self.queue.lock().await;
             if let Some(entry) = q.iter_mut().find(|e| e.slug == slug) {
                 if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num) {
-                    if item.status != "done" && item.status != "failed" {
+                    if item.status == "downloading" {
                         item.status = "paused".to_string();
+                    }
+                    if item.status == "paused" || item.status == "queued" {
                         if cur_pct > item.percent {
                             item.percent = cur_pct;
                         }
@@ -2252,7 +2382,10 @@ impl RunnerHelper {
             if self.stop.load(Ordering::Relaxed) || self.job_pause.load(Ordering::Relaxed) {
                 Err("Cancelled".to_string())
             } else {
-                api::release_with_status(&client, &actual_slug, &cfg).await
+                tokio::select! {
+                    res = api::release_with_status(&client, &actual_slug, &cfg) => res,
+                    _ = self.wait_job_cancelled() => Err("Cancelled".to_string()),
+                }
             };
         let needs_heal = match &releases_res {
             Err(e) => api::is_rotated_or_missing_error(e),
@@ -2262,9 +2395,11 @@ impl RunnerHelper {
             && !self.stop.load(Ordering::Relaxed)
             && !self.job_pause.load(Ordering::Relaxed)
         {
-            if let Some(new_slug) =
-                api::resolve_active_slug(&client, &actual_slug, Some(&anime_title), &cfg).await
-            {
+            let healed_slug = tokio::select! {
+                s = api::resolve_active_slug(&client, &actual_slug, Some(&anime_title), &cfg) => s,
+                _ = self.wait_job_cancelled() => None,
+            };
+            if let Some(new_slug) = healed_slug {
                 self.log(
                     "info",
                     &format!(
@@ -2287,7 +2422,10 @@ impl RunnerHelper {
                     }
                 }
                 self.queue_persist().await;
-                releases_res = api::release_with_status(&client, &actual_slug, &cfg).await;
+                releases_res = tokio::select! {
+                    res = api::release_with_status(&client, &actual_slug, &cfg) => res,
+                    _ = self.wait_job_cancelled() => Err("Cancelled".to_string()),
+                };
             }
         }
 
@@ -2450,7 +2588,10 @@ impl RunnerHelper {
                     && !self.stop.load(Ordering::Relaxed)
                     && !self.job_pause.load(Ordering::Relaxed)
                 {
-                    self.pause_notify.notified().await;
+                    tokio::select! {
+                        _ = self.pause_notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                    }
                 }
 
                 if self.stop.load(Ordering::Relaxed) {
@@ -2473,7 +2614,7 @@ impl RunnerHelper {
                             self.ep_cancel.store(false, Ordering::Relaxed);
                             item.status = "downloading".to_string();
                             item.error.clear();
-                            Some(item.ep_id.clone())
+                            Some((item.ep_id.clone(), item.percent, item.size.clone()))
                         } else {
                             None
                         }
@@ -2482,7 +2623,7 @@ impl RunnerHelper {
                     }
                 };
 
-                let ep_num = match next_ep {
+                let (ep_num, prev_pct, prev_size) = match next_ep {
                     Some(ep) => ep,
                     None => {
                         break;
@@ -2492,7 +2633,15 @@ impl RunnerHelper {
                 {
                     let mut st = self.state.lock().await;
                     st.episodes.current = Some(ep_num.clone());
-                    st.progress = ProgressState::default();
+                    st.progress = ProgressState {
+                        percent: if prev_pct > 0.0 { Some(prev_pct) } else { None },
+                        size: if prev_size.is_empty() {
+                            None
+                        } else {
+                            Some(prev_size)
+                        },
+                        ..ProgressState::default()
+                    };
                 }
 
                 self.log("info", &format!("Processing Episode {}...", ep_num))
@@ -2549,9 +2698,12 @@ impl RunnerHelper {
                     }
                 };
 
-                // Fetch play sources
-                let sources = match api::play_sources(&client, &actual_slug, ep_session, &cfg).await
-                {
+                // Fetch play sources (cancellable on pause/stop)
+                let sources_res = tokio::select! {
+                    res = api::play_sources(&client, &actual_slug, ep_session, &cfg) => res,
+                    _ = self.wait_ep_cancelled() => Err("Cancelled".to_string()),
+                };
+                let sources = match sources_res {
                     Ok(s) => s,
                     Err(e) => {
                         if self.stop.load(Ordering::Relaxed)
@@ -2648,19 +2800,26 @@ impl RunnerHelper {
                         {
                             break;
                         }
-                        match client
-                            .fetch(&src.url, Some("https://animepahe.pw/"), &cfg)
-                            .await
-                        {
+                        let fetch_res = tokio::select! {
+                            res = client.fetch(&src.url, Some("https://animepahe.pw/"), &cfg) => res,
+                            _ = self.wait_ep_cancelled() => Err("Cancelled".to_string()),
+                        };
+                        match fetch_res {
                             Ok(h) => {
                                 html_opt = Some(h);
                                 break;
                             }
                             Err(e) => {
+                                if self.stop.load(Ordering::Relaxed)
+                                    || self.job_pause.load(Ordering::Relaxed)
+                                    || self.ep_cancel.load(Ordering::Relaxed)
+                                {
+                                    break;
+                                }
                                 if attempt < 2 {
                                     tokio::select! {
                                         _ = tokio::time::sleep(Duration::from_millis(600)) => {}
-                                        _ = self.pause_notify.notified() => {}
+                                        _ = self.wait_ep_cancelled() => {}
                                     }
                                 } else if idx == candidate_sources.len() - 1 {
                                     self.log(
@@ -2804,34 +2963,22 @@ impl RunnerHelper {
                 )
                 .await;
 
+                let cache_key = format!("{}:{}:{}", actual_slug, ep_num, is_dub);
                 let this_ep_stop = Arc::new(AtomicBool::new(false));
-                let watcher_stop = self.stop.clone();
-                let watcher_ep_cancel = self.ep_cancel.clone();
-                let watcher_job_pause = self.job_pause.clone();
-                let stop_flag_inner = this_ep_stop.clone();
-                let watcher = tokio::spawn(async move {
-                    while !stop_flag_inner.load(Ordering::Relaxed) {
-                        if watcher_stop.load(Ordering::Relaxed)
-                            || watcher_ep_cancel.load(Ordering::Relaxed)
-                            || watcher_job_pause.load(Ordering::Relaxed)
-                        {
-                            stop_flag_inner.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                });
+                let watcher = self.spawn_ep_stop_watcher(this_ep_stop.clone());
 
                 let state_for_cb = self.state.clone();
                 let ep_id_cb = ep_num.clone();
                 let pause_for_dl = self.pause.clone();
                 let pause_notify_for_dl = self.pause_notify.clone();
+                let max_pct_bits = Arc::new(AtomicU64::new(0));
 
                 let mut dl_res = downloader
                     .download_stream(DownloadConfig {
                         m3u8_url: m3u8_url.clone(),
                         referer: Some("https://kwik.cx/".to_string()),
                         dest_path: final_file.clone(),
+                        cache_key: Some(cache_key.clone()),
                         replace_existing: replace,
                         concurrency: fragments,
                         stop_signal: this_ep_stop.clone(),
@@ -2840,12 +2987,27 @@ impl RunnerHelper {
                         progress_cb: move |update: ProgressUpdate| {
                             let st_clone = state_for_cb.clone();
                             let ep_id_inner = ep_id_cb.clone();
+                            let max_bits = max_pct_bits.clone();
+                            let new_pct = update.percent;
+                            let mut prev_bits = max_bits.load(Ordering::Relaxed);
+                            while new_pct > f64::from_bits(prev_bits) {
+                                match max_bits.compare_exchange_weak(
+                                    prev_bits,
+                                    new_pct.to_bits(),
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(b) => prev_bits = b,
+                                }
+                            }
+                            let monotonic_pct = f64::from_bits(max_bits.load(Ordering::Relaxed));
                             tokio::spawn(async move {
                                 let mut st = st_clone.lock().await;
                                 if st.running
                                     && st.episodes.current.as_deref() == Some(ep_id_inner.as_str())
                                 {
-                                    st.progress.percent = Some(update.percent);
+                                    st.progress.percent = Some(monotonic_pct);
                                     st.progress.size = Some(update.size_str);
                                     st.progress.speed = Some(update.speed_str);
                                     st.progress.eta = Some(update.eta_str);
@@ -2896,27 +3058,14 @@ impl RunnerHelper {
                         let fallback_file = app_ext_dir.join(&filename);
                         let state_for_retry = self.state.clone();
                         let ep_id_cb = ep_num.clone();
-                        let watcher_stop = self.stop.clone();
-                        let watcher_ep_cancel = self.ep_cancel.clone();
-                        let watcher_job_pause = self.job_pause.clone();
-                        let stop_flag_inner = this_ep_stop.clone();
-                        let retry_watcher = tokio::spawn(async move {
-                            while !stop_flag_inner.load(Ordering::Relaxed) {
-                                if watcher_stop.load(Ordering::Relaxed)
-                                    || watcher_ep_cancel.load(Ordering::Relaxed)
-                                    || watcher_job_pause.load(Ordering::Relaxed)
-                                {
-                                    stop_flag_inner.store(true, Ordering::Relaxed);
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
-                        });
+                        let max_pct_bits = Arc::new(AtomicU64::new(0));
+                        let retry_watcher = self.spawn_ep_stop_watcher(this_ep_stop.clone());
                         dl_res = downloader
                             .download_stream(DownloadConfig {
                                 m3u8_url: m3u8_url.clone(),
                                 referer: Some("https://kwik.cx/".to_string()),
                                 dest_path: fallback_file.clone(),
+                                cache_key: Some(cache_key.clone()),
                                 replace_existing: replace,
                                 concurrency: fragments,
                                 stop_signal: this_ep_stop.clone(),
@@ -2925,13 +3074,29 @@ impl RunnerHelper {
                                 progress_cb: move |update: ProgressUpdate| {
                                     let st_clone = state_for_retry.clone();
                                     let ep_id_inner = ep_id_cb.clone();
+                                    let max_bits = max_pct_bits.clone();
+                                    let new_pct = update.percent;
+                                    let mut prev_bits = max_bits.load(Ordering::Relaxed);
+                                    while new_pct > f64::from_bits(prev_bits) {
+                                        match max_bits.compare_exchange_weak(
+                                            prev_bits,
+                                            new_pct.to_bits(),
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        ) {
+                                            Ok(_) => break,
+                                            Err(b) => prev_bits = b,
+                                        }
+                                    }
+                                    let monotonic_pct =
+                                        f64::from_bits(max_bits.load(Ordering::Relaxed));
                                     tokio::spawn(async move {
                                         let mut st = st_clone.lock().await;
                                         if st.running
                                             && st.episodes.current.as_deref()
                                                 == Some(ep_id_inner.as_str())
                                         {
-                                            st.progress.percent = Some(update.percent);
+                                            st.progress.percent = Some(monotonic_pct);
                                             st.progress.size = Some(update.size_str);
                                             st.progress.speed = Some(update.speed_str);
                                             st.progress.eta = Some(update.eta_str);
@@ -2949,7 +3114,8 @@ impl RunnerHelper {
                         && !self.ep_cancel.load(Ordering::Relaxed)
                         && !self.job_pause.load(Ordering::Relaxed)
                     {
-                        // Automatic retry with halved concurrency resuming cached fragments
+                        // Automatic retry: refresh stream URL (or try alternate compatible
+                        // mirror if needed) and resume cached fragments with halved concurrency.
                         self.log(
                             "warn",
                             &format!(
@@ -2960,7 +3126,7 @@ impl RunnerHelper {
                         .await;
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
-                            _ = self.pause_notify.notified() => {}
+                            _ = self.wait_ep_cancelled() => {}
                         }
                         if self.stop.load(Ordering::Relaxed) {
                             break;
@@ -2973,30 +3139,69 @@ impl RunnerHelper {
                             self.handle_ep_paused(&actual_slug, &ep_num).await;
                             continue;
                         }
+
+                        let mut retry_m3u8 = m3u8_url.clone();
+                        if let Some(ref src) = chosen_source {
+                            let refreshed = tokio::select! {
+                                res = client.fetch(&src.url, Some("https://animepahe.pw/"), &cfg) => res,
+                                _ = self.wait_ep_cancelled() => Err("Cancelled".to_string()),
+                            };
+                            let mut got_fresh = false;
+                            if let Ok(ref html) = refreshed {
+                                if let Some(fresh_m3u8) = kwik::extract_m3u8_from_kwik(html) {
+                                    retry_m3u8 = fresh_m3u8;
+                                    got_fresh = true;
+                                }
+                            }
+                            if !got_fresh
+                                && !self.stop.load(Ordering::Relaxed)
+                                && !self.ep_cancel.load(Ordering::Relaxed)
+                                && !self.job_pause.load(Ordering::Relaxed)
+                            {
+                                for alt in candidate_sources.iter().skip(1) {
+                                    if !resolution.trim().is_empty()
+                                        && alt.resolution != resolution.trim()
+                                    {
+                                        continue;
+                                    }
+                                    let alt_res = tokio::select! {
+                                        res = client.fetch(&alt.url, Some("https://animepahe.pw/"), &cfg) => res,
+                                        _ = self.wait_ep_cancelled() => Err("Cancelled".to_string()),
+                                    };
+                                    if let Ok(ref html) = alt_res {
+                                        if let Some(fresh_m3u8) = kwik::extract_m3u8_from_kwik(html)
+                                        {
+                                            retry_m3u8 = fresh_m3u8;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if self.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if self.job_pause.load(Ordering::Relaxed) {
+                            self.handle_ep_paused(&actual_slug, &ep_num).await;
+                            break;
+                        }
+                        if self.ep_cancel.swap(false, Ordering::Relaxed) {
+                            self.handle_ep_paused(&actual_slug, &ep_num).await;
+                            continue;
+                        }
+
                         let retry_concurrency = (fragments / 2).max(1);
                         let state_for_retry = self.state.clone();
                         let ep_id_cb = ep_num.clone();
-                        let watcher_stop = self.stop.clone();
-                        let watcher_ep_cancel = self.ep_cancel.clone();
-                        let watcher_job_pause = self.job_pause.clone();
-                        let stop_flag_inner = this_ep_stop.clone();
-                        let retry_watcher = tokio::spawn(async move {
-                            while !stop_flag_inner.load(Ordering::Relaxed) {
-                                if watcher_stop.load(Ordering::Relaxed)
-                                    || watcher_ep_cancel.load(Ordering::Relaxed)
-                                    || watcher_job_pause.load(Ordering::Relaxed)
-                                {
-                                    stop_flag_inner.store(true, Ordering::Relaxed);
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
-                        });
+                        let max_pct_bits = Arc::new(AtomicU64::new(0));
+                        let retry_watcher = self.spawn_ep_stop_watcher(this_ep_stop.clone());
                         dl_res = downloader
                             .download_stream(DownloadConfig {
-                                m3u8_url: m3u8_url.clone(),
+                                m3u8_url: retry_m3u8,
                                 referer: Some("https://kwik.cx/".to_string()),
                                 dest_path: final_file.clone(),
+                                cache_key: Some(cache_key.clone()),
                                 replace_existing: false, // Resume cached fragments!
                                 concurrency: retry_concurrency,
                                 stop_signal: this_ep_stop.clone(),
@@ -3005,13 +3210,29 @@ impl RunnerHelper {
                                 progress_cb: move |update: ProgressUpdate| {
                                     let st_clone = state_for_retry.clone();
                                     let ep_id_inner = ep_id_cb.clone();
+                                    let max_bits = max_pct_bits.clone();
+                                    let new_pct = update.percent;
+                                    let mut prev_bits = max_bits.load(Ordering::Relaxed);
+                                    while new_pct > f64::from_bits(prev_bits) {
+                                        match max_bits.compare_exchange_weak(
+                                            prev_bits,
+                                            new_pct.to_bits(),
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        ) {
+                                            Ok(_) => break,
+                                            Err(b) => prev_bits = b,
+                                        }
+                                    }
+                                    let monotonic_pct =
+                                        f64::from_bits(max_bits.load(Ordering::Relaxed));
                                     tokio::spawn(async move {
                                         let mut st = st_clone.lock().await;
                                         if st.running
                                             && st.episodes.current.as_deref()
                                                 == Some(ep_id_inner.as_str())
                                         {
-                                            st.progress.percent = Some(update.percent);
+                                            st.progress.percent = Some(monotonic_pct);
                                             st.progress.size = Some(update.size_str);
                                             st.progress.speed = Some(update.speed_str);
                                             st.progress.eta = Some(update.eta_str);
@@ -3106,11 +3327,12 @@ impl RunnerHelper {
                 let mut q = self.queue.lock().await;
                 if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
                     if entry.status == "downloading" {
-                        entry.status = "paused".to_string();
+                        let has_queued = entry.episode_items.iter().any(|i| i.status == "queued");
+                        entry.status = if has_queued { "queued" } else { "paused" }.to_string();
                         changed = true;
                     }
                     for item in &mut entry.episode_items {
-                        if item.status == "downloading" || item.status == "queued" {
+                        if item.status == "downloading" {
                             item.status = "paused".to_string();
                             item.speed.clear();
                             item.eta.clear();
@@ -3467,14 +3689,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("paheflow_queue_test_{}", fastrand::u64(..)));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("queue.json");
+        let mut downloading_entry = queue_entry(2, "b", "downloading");
+        downloading_entry.episode_items = vec![
+            EpisodeItem {
+                ep_id: "1".to_string(),
+                label: "EP 01".to_string(),
+                status: "done".to_string(),
+                percent: 100.0,
+                speed: String::new(),
+                eta: String::new(),
+                size: "120 MiB".to_string(),
+                error: String::new(),
+            },
+            EpisodeItem {
+                ep_id: "2".to_string(),
+                label: "EP 02".to_string(),
+                status: "downloading".to_string(),
+                percent: 45.0,
+                speed: "4.2 MiB/s".to_string(),
+                eta: "00:12".to_string(),
+                size: "54 MiB".to_string(),
+                error: String::new(),
+            },
+        ];
         let file = QueueFile {
             version: 1,
             hold: true,
             next_id: 3,
-            entries: vec![
-                queue_entry(1, "a", "queued"),
-                queue_entry(2, "b", "downloading"),
-            ],
+            entries: vec![queue_entry(1, "a", "queued"), downloading_entry],
         };
         save_queue_file(&path, &file).expect("save queue file");
 
@@ -3486,6 +3728,12 @@ mod tests {
         assert_eq!(loaded.entries[0].status, "queued");
         // A crash mid-download can never leave a wedged "downloading" mark.
         assert_eq!(loaded.entries[1].status, "queued");
+        assert_eq!(loaded.entries[1].episode_items[0].status, "done");
+        assert_eq!(loaded.entries[1].episode_items[1].status, "queued");
+        assert_eq!(loaded.entries[1].episode_items[1].percent, 45.0);
+        assert_eq!(loaded.entries[1].episode_items[1].size, "54 MiB");
+        assert!(loaded.entries[1].episode_items[1].speed.is_empty());
+        assert!(loaded.entries[1].episode_items[1].eta.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4177,6 +4425,118 @@ mod tests {
         assert_eq!(snap2.queue[0].episode_items[0].status, "done");
         assert_eq!(snap2.queue[0].episode_items[1].status, "queued");
         assert_eq!(snap2.queue[0].episode_items[2].status, "queued");
+
+        release_data_dir(&dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env-var guard intentionally spans the test
+    async fn test_queue_set_hold_pauses_active_job_and_keeps_queued_for_resume() {
+        let (_env_guard, dir) = with_data_dir("queue_hold_active");
+        let runner = Runner::new();
+
+        runner
+            .queue_add(&serde_json::json!({
+                "slug": "hold-show",
+                "title": "Hold Show",
+                "episodes": "1,2"
+            }))
+            .await
+            .unwrap();
+
+        {
+            let mut q = runner.queue.lock().await;
+            q[0].status = "downloading".to_string();
+            q[0].episode_items[0].status = "downloading".to_string();
+        }
+        {
+            let mut st = runner.state.lock().await;
+            st.running = true;
+            st.anime.slug = "hold-show".to_string();
+            st.episodes.current = Some("1".to_string());
+            st.progress.percent = Some(62.5);
+            st.progress.size = Some("60.0 MiB".to_string());
+        }
+
+        // Calling queue_set_hold(true) must immediately signal active job & episode to stop,
+        // revert active entry + episode back to queued, and preserve partial progress.
+        runner.queue_set_hold(true).await;
+
+        assert!(runner.queue_hold.load(Ordering::Relaxed));
+        assert!(runner.job_pause_signal.load(Ordering::Relaxed));
+        assert!(runner.ep_cancel_signal.load(Ordering::Relaxed));
+
+        let snap = runner.snapshot(false).await;
+        assert_eq!(snap.queue[0].status, "queued");
+        assert_eq!(snap.queue[0].episode_items[0].status, "queued");
+        assert!((snap.queue[0].episode_items[0].percent - 62.5).abs() < 0.01);
+        assert_eq!(snap.queue[0].episode_items[0].size, "60.0 MiB");
+        assert_eq!(snap.queue[0].episode_items[1].status, "queued");
+
+        // Resuming the queue clears queue_hold and allows the pump to start right from EP 1.
+        runner.queue_set_hold(false).await;
+        let snap2 = runner.snapshot(false).await;
+        assert!(!snap2.queue_hold);
+        assert_eq!(
+            pump_decision(false, false, Some(0), "hold-show", false, &snap2.queue),
+            PumpDecision::Start {
+                id: snap2.queue[0].id
+            }
+        );
+
+        release_data_dir(&dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env-var guard intentionally spans the test
+    async fn test_handle_ep_paused_does_not_clobber_resumed_queued_item() {
+        let (_env_guard, dir) = with_data_dir("handle_ep_paused_queued");
+        let runner = Runner::new();
+
+        runner
+            .queue_add(&serde_json::json!({
+                "slug": "race-show",
+                "title": "Race Show",
+                "episodes": "1"
+            }))
+            .await
+            .unwrap();
+
+        {
+            let mut st = runner.state.lock().await;
+            st.running = true;
+            st.anime.slug = "race-show".to_string();
+            st.episodes.current = Some("1".to_string());
+            st.progress.percent = Some(33.3);
+            st.progress.size = Some("30.0 MiB".to_string());
+        }
+
+        // Suppose user re-queued EP 1 (e.g., queue_set_hold or quick pause+resume)
+        // before the worker's handle_ep_paused runs.
+        let helper = RunnerHelper {
+            state: runner.state.clone(),
+            queue: runner.queue.clone(),
+            queue_hold: runner.queue_hold.clone(),
+            queue_next_id: runner.queue_next_id.clone(),
+            stop: runner.stop_signal.clone(),
+            pause: runner.pause_signal.clone(),
+            ep_cancel: runner.ep_cancel_signal.clone(),
+            job_pause: runner.job_pause_signal.clone(),
+            suppress_hold_on_stop: runner.suppress_hold_on_stop.clone(),
+            pause_notify: runner.pause_notify.clone(),
+            pump_notify: runner.pump_notify.clone(),
+            seq: runner.seq.clone(),
+            event_tx: runner.event_tx.clone(),
+            logs: runner.logs.clone(),
+        };
+
+        helper.handle_ep_paused("race-show", "1").await;
+
+        let snap = runner.snapshot(false).await;
+        // Status must remain "queued" while still capturing the latest percent/size.
+        assert_eq!(snap.queue[0].episode_items[0].status, "queued");
+        assert!((snap.queue[0].episode_items[0].percent - 33.3).abs() < 0.01);
+        assert_eq!(snap.queue[0].episode_items[0].size, "30.0 MiB");
 
         release_data_dir(&dir);
     }

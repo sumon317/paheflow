@@ -794,7 +794,7 @@ async fn get_thumbnail(
         _ => "image/jpeg",
     };
 
-    let thumb_dir = resource_dir().join("cache").join("thumbs");
+    let thumb_dir = crate::config::cache_dir().join("thumbs");
     let _ = fs::create_dir_all(&thumb_dir);
     let cache_file = thumb_dir.join(format!("{:016x}.{}", hash_val, ext));
 
@@ -1322,18 +1322,39 @@ async fn post_run(
             }
         }
     }
-    match state.runner.start(body, state.client.clone()).await {
+    match state.runner.start(body.clone(), state.client.clone()).await {
         Ok(job) => Ok(Json(serde_json::json!({ "ok": true, "job": job }))),
-        Err(e) => Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": e })),
-        )),
+        Err(e) => {
+            if e.to_lowercase().contains("already running") {
+                match state.runner.queue_add(&body).await {
+                    Ok((message, _)) => {
+                        let snap = state.runner.snapshot(false).await;
+                        return Ok(Json(serde_json::json!({
+                            "ok": true,
+                            "queued": true,
+                            "message": message,
+                            "job": snap,
+                        })));
+                    }
+                    Err(qe) => {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": qe })),
+                        ));
+                    }
+                }
+            }
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e })),
+            ))
+        }
     }
 }
 
 async fn queue_payload(state: &AppState) -> serde_json::Value {
     let snap = state.runner.snapshot(false).await;
-    serde_json::json!({ "queue": snap.queue, "queueHold": snap.queue_hold })
+    serde_json::json!({ "queue": snap.queue, "queueHold": snap.queue_hold, "job": snap })
 }
 
 async fn post_queue(

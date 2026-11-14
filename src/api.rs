@@ -215,8 +215,9 @@ fn options_cache_file(slug: &str, episode_num: &str) -> PathBuf {
         .collect();
     let safe_ep: String = episode_num
         .chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect();
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect::<String>()
+        .replace("..", "_");
     cache_dir().join(format!("{}.opts.{}.json", safe_slug, safe_ep))
 }
 
@@ -327,10 +328,15 @@ pub fn pick_preferred_filesize(
             return Some(format!("{} ({}p)", sz, r));
         }
     }
-    filesizes
-        .iter()
+    let mut keys: Vec<&String> = filesizes.keys().collect();
+    keys.sort_by(|a, b| {
+        let an: u32 = a.parse().unwrap_or(0);
+        let bn: u32 = b.parse().unwrap_or(0);
+        bn.cmp(&an).then_with(|| b.cmp(a))
+    });
+    keys.into_iter()
         .next()
-        .map(|(r, sz)| format!("{} ({}p)", sz, r))
+        .and_then(|r| filesizes.get(r).map(|sz| format!("{} ({}p)", sz, r)))
 }
 
 pub fn audio_flags_from_list(audios: &[String], fallback_dub: bool) -> (bool, bool) {
@@ -380,7 +386,8 @@ pub fn parse_latest_release_item_with_pref(
         || raw_audio == "eng"
         || title_lower.contains("(dub)")
         || title_lower.contains("[dub]")
-        || title_lower.contains(" dub");
+        || title_lower.ends_with(" dub")
+        || title_lower.contains(" dub ");
     let audio = if is_dub_hint {
         Some("dub".to_string())
     } else {
@@ -778,7 +785,6 @@ pub async fn release_with_status(
         }
     };
 
-    let first_count = first_items.len();
     for item in first_items {
         if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
             all_episodes.push(item);
@@ -850,8 +856,8 @@ pub async fn release_with_status(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Save whenever full or we fetched multiple pages successfully
-    if page_errors.is_empty() || all_episodes.len() > first_count {
+    // Only cache when every page succeeded so truncated lists don't poison cache
+    if page_errors.is_empty() {
         save_release_cache(slug, &all_episodes);
     }
 
@@ -973,7 +979,7 @@ pub fn parse_sources_from_html(html: &str) -> Vec<PlaySource> {
     // e.g. <a href="https://pahe.win/..." class="dropdown-item" target="_blank">Show - 720p (145MB)</a>
     if let (Some(res_re), Some(size_re)) = (&res_re, &size_re) {
         if let Ok(a_re) = Regex::new(r#"(?is)<a\b([^>]*)>(.*?)</a>"#) {
-            if let Ok(href_re) = Regex::new(r#"(?i)href\s*=\s*"([^"]*)""#) {
+            if let Ok(href_re) = Regex::new(r#"(?i)href\s*=\s*["']([^"']*)["']"#) {
                 for cap in a_re.captures_iter(html) {
                     let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
                     let text = cap.get(2).map(|m| m.as_str()).unwrap_or_default();
@@ -2149,5 +2155,36 @@ mod tests {
         let long =
             generate_search_terms("Chillin in Another World with Level 2 Super Cheat Powers");
         assert!(long.iter().any(|t| t == "Chillin in Another World"));
+    }
+
+    #[test]
+    fn options_cache_file_distinguishes_fractional_episodes() {
+        let p_dot = options_cache_file("slug-1", "1.5");
+        let p_int = options_cache_file("slug-1", "15");
+        assert_ne!(p_dot, p_int);
+        assert!(p_dot.to_string_lossy().contains("1.5"));
+    }
+
+    #[test]
+    fn pick_preferred_filesize_is_deterministic_descending() {
+        let mut sizes = HashMap::new();
+        sizes.insert("360".to_string(), "60 MB".to_string());
+        sizes.insert("1080".to_string(), "280 MB".to_string());
+        sizes.insert("720".to_string(), "140 MB".to_string());
+        let picked = pick_preferred_filesize(&[], &sizes, "").unwrap();
+        assert_eq!(picked, "280 MB (1080p)");
+    }
+
+    #[test]
+    fn dub_detection_ignores_substrings_like_dubious() {
+        let dubious = serde_json::json!({
+            "anime_title": "The Dubious Hero",
+            "anime_session": "sess-dubious",
+            "episode": 1,
+            "audio": "jpn"
+        });
+        let item = parse_latest_release_item(&dubious).unwrap();
+        assert_eq!(item.audio, Some("sub".to_string()));
+        assert!(!item.has_dub);
     }
 }

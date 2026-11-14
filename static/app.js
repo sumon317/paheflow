@@ -120,8 +120,8 @@
     epStatusKey: "",
     playlistKey: "",
     // Navigation history for back button handling
-    tabHistory: ["home"],
-    activeTab: "home",
+    tabHistory: ["browse"],
+    activeTab: "browse",
   };
 
   let logQueue = [];
@@ -808,7 +808,7 @@
 
     const CHUNK = 6;
     for (let i = 0; i < candidates.length; i += CHUNK) {
-      if (state.searchMode !== "recent" || state.activeTab !== "home") {
+      if (state.searchMode !== "recent" || state.activeTab !== "browse") {
         for (let j = i; j < candidates.length; j++) {
           delete state.recentMetaInFlight[recentItemKey(candidates[j])];
         }
@@ -2331,7 +2331,7 @@
   function setQueueHold(value) {
     const previous = state.queueHold;
     state.queueHold = value;
-    if (value && !previous) toast("Download queue paused — resume it in the Queue tab.", "warn");
+    if (value && !previous) toast("Downloads paused — tap Resume to continue.", "warn");
   }
 
   function audioLabelFor(audio) {
@@ -2524,24 +2524,28 @@
   }
 
   function applyQueueResponse(res, fallbackOk, fallbackErr) {
-    if (res && Array.isArray(res.queue)) {
-      state.queue = res.queue;
-      state.dlGroups = res.queue.map(e => ({
-        queueId: e.id,
-        slug: e.slug,
-        title: e.title,
-        episodes: e.episodes,
-        status: e.status,
-        error: e.error,
-        epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
-      }));
+    if (res && res.job && typeof res.job === "object") {
+      applyJob(res.job);
+    } else {
+      if (res && Array.isArray(res.queue)) {
+        state.queue = res.queue;
+        state.dlGroups = res.queue.map(e => ({
+          queueId: e.id,
+          slug: e.slug,
+          title: e.title,
+          episodes: e.episodes,
+          status: e.status,
+          error: e.error,
+          epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
+        }));
+      }
+      if (res && typeof res.queueHold === "boolean") setQueueHold(res.queueHold);
+      renderQueuePanel();
+      updateQueueCardButtons();
+      renderDlGroups();
+      updateDlOverall();
+      updateMainActionButton();
     }
-    if (res && typeof res.queueHold === "boolean") setQueueHold(res.queueHold);
-    renderQueuePanel();
-    updateQueueCardButtons();
-    renderDlGroups();
-    updateDlOverall();
-    updateMainActionButton();
     if (res && res.message) toast(res.message, fallbackOk || "ok");
     else if (fallbackErr) toast(fallbackErr, fallbackOk || "ok");
   }
@@ -2882,12 +2886,12 @@
     if (pct) pct.textContent = `${overallPct}%`;
 
     if (active) {
-      if (label) label.textContent = `Downloading ${escapeHtml(activeGroup?.title || "anime")} · ${escapeHtml(active.label || ("EP " + active.epId))}`;
+      if (label) label.textContent = `Downloading ${activeGroup?.title || "anime"} · ${active.label || ("EP " + active.epId)}`;
       const speedStr = active.speed ? `⚡ ${active.speed}` : (state.job?.progress?.speed ? `⚡ ${state.job.progress.speed}` : "");
       const etaStr = active.eta ? `⏱ ETA ${active.eta}` : (state.job?.progress?.eta ? `⏱ ETA ${state.job.progress.eta}` : "");
       if (spd) spd.textContent = [speedStr, etaStr].filter(Boolean).join(" · ");
     } else if (activeGroup) {
-      if (label) label.textContent = `Preparing ${escapeHtml(activeGroup.title || "anime")}...`;
+      if (label) label.textContent = `Preparing ${activeGroup.title || "anime"}...`;
       if (spd) spd.textContent = "Starting";
     } else if (allPausedState) {
       if (label) label.textContent = state.queueHold ? "Queue paused" : "Downloads paused";
@@ -3147,22 +3151,30 @@
   }
 
   function pauseJob() {
+    const btn = $("startBtn");
+    if (btn && btn.dataset.busy === "1") return;
+    if (btn) setBusy(btn, true);
     api.post("/api/pause", {}).then(res => {
       if (res && res.job) applyJob(res.job);
       updateProgressUI();
       updateMainActionButton();
       const hasMoreQueued = (state.queue || []).some(e => e.status === "queued");
       toast(hasMoreQueued ? "Current download paused — starting next queued anime" : "Download paused", "warn");
-    }).catch(e => toast("Pause failed: " + e.message, "error"));
+    }).catch(e => toast("Pause failed: " + e.message, "error"))
+      .finally(() => { if (btn) setBusy(btn, false); });
   }
 
   function resumeJob() {
+    const btn = $("startBtn");
+    if (btn && btn.dataset.busy === "1") return;
+    if (btn) setBusy(btn, true);
     api.post("/api/resume", {}).then(res => {
       if (res && res.job) applyJob(res.job);
       updateProgressUI();
       updateMainActionButton();
       toast("Download resumed", "ok");
-    }).catch(e => toast("Resume failed: " + e.message, "error"));
+    }).catch(e => toast("Resume failed: " + e.message, "error"))
+      .finally(() => { if (btn) setBusy(btn, false); });
   }
 
   function handleMainAction() {
@@ -3418,52 +3430,68 @@
       dlGroups.addEventListener("click", async (e) => {
         const pauseBtn = e.target.closest("[data-ep-pause]");
         if (pauseBtn) {
+          if (pauseBtn.disabled || pauseBtn.dataset.busy === "1") return;
           const queueId = Number(pauseBtn.dataset.queueId);
           const epId = pauseBtn.dataset.epPause;
+          setBusy(pauseBtn, true);
           try {
             const res = await api.post("/api/queue/ep/pause", { queueId, epId });
             applyQueueResponse(res);
           } catch (err) {
             toast("Failed to pause episode: " + err.message, "error");
+          } finally {
+            setBusy(pauseBtn, false);
           }
           return;
         }
 
         const resumeBtn = e.target.closest("[data-ep-resume]");
         if (resumeBtn) {
+          if (resumeBtn.disabled || resumeBtn.dataset.busy === "1") return;
           const queueId = Number(resumeBtn.dataset.queueId);
           const epId = resumeBtn.dataset.epResume;
+          setBusy(resumeBtn, true);
           try {
             const res = await api.post("/api/queue/ep/resume", { queueId, epId });
             applyQueueResponse(res);
           } catch (err) {
             toast("Failed to resume episode: " + err.message, "error");
+          } finally {
+            setBusy(resumeBtn, false);
           }
           return;
         }
 
         const removeBtn = e.target.closest("[data-ep-remove]");
         if (removeBtn) {
+          if (removeBtn.disabled || removeBtn.dataset.busy === "1") return;
           const queueId = Number(removeBtn.dataset.queueId);
           const epId = removeBtn.dataset.epRemove;
+          setBusy(removeBtn, true);
           try {
             const res = await api.post("/api/queue/ep/remove", { queueId, epId });
             applyQueueResponse(res);
           } catch (err) {
             toast("Failed to remove episode: " + err.message, "error");
+          } finally {
+            setBusy(removeBtn, false);
           }
           return;
         }
 
         const moveUpBtn = e.target.closest("[data-ep-move-up]");
         if (moveUpBtn) {
+          if (moveUpBtn.disabled || moveUpBtn.dataset.busy === "1") return;
           const queueId = Number(moveUpBtn.dataset.queueId);
           const epId = moveUpBtn.dataset.epMoveUp;
+          setBusy(moveUpBtn, true);
           try {
             const res = await api.post("/api/queue/ep/move-up", { queueId, epId });
             applyQueueResponse(res);
           } catch (err) {
             toast("Failed to move episode: " + err.message, "error");
+          } finally {
+            setBusy(moveUpBtn, false);
           }
           return;
         }
@@ -3485,6 +3513,7 @@
 
         const toggleGroupBtn = e.target.closest("[data-group-toggle]");
         if (toggleGroupBtn) {
+          if (toggleGroupBtn.disabled || toggleGroupBtn.dataset.busy === "1") return;
           const queueId = Number(toggleGroupBtn.dataset.groupToggle);
           const group = (state.dlGroups || []).find(g => g.queueId === queueId);
           const epItems = group?.epItems || [];
@@ -3493,23 +3522,30 @@
             ? pendingOrPaused.every(i => i.status === "paused" || i.status === "failed")
             : group?.status === "paused";
           const endpoint = allPaused ? "/api/queue/group/resume" : "/api/queue/group/pause";
+          setBusy(toggleGroupBtn, true);
           try {
             const res = await api.post(endpoint, { queueId });
             applyQueueResponse(res);
           } catch (err) {
             toast("Failed to update anime: " + err.message, "error");
+          } finally {
+            setBusy(toggleGroupBtn, false);
           }
           return;
         }
 
         const cancelGroupBtn = e.target.closest("[data-group-cancel]");
         if (cancelGroupBtn) {
+          if (cancelGroupBtn.disabled || cancelGroupBtn.dataset.busy === "1") return;
           const queueId = Number(cancelGroupBtn.dataset.groupCancel);
+          setBusy(cancelGroupBtn, true);
           try {
             const res = await api.post("/api/queue/remove", { queueId });
             applyQueueResponse(res);
           } catch (err) {
             toast("Failed to cancel anime: " + err.message, "error");
+          } finally {
+            setBusy(cancelGroupBtn, false);
           }
           return;
         }
@@ -3701,14 +3737,24 @@
     $("stopBtn").onclick = stopJob;
     if ($("queueSelectionBtn")) $("queueSelectionBtn").onclick = queueCurrentSelection;
     $("queueHoldBtn").onclick = () => {
+      const btn = $("queueHoldBtn");
+      if (btn && btn.dataset.busy === "1") return;
+      if (btn) setBusy(btn, true);
       const url = state.queueHold ? "/api/queue/resume" : "/api/queue/pause";
-      api.post(url, {}).then(res => applyQueueResponse(res)).catch(e => toast("Queue update failed: " + e.message, "error"));
+      api.post(url, {})
+        .then(res => applyQueueResponse(res))
+        .catch(e => toast("Queue update failed: " + e.message, "error"))
+        .finally(() => { if (btn) setBusy(btn, false); });
     };
     $("queueResumeBtn").onclick = () => {
+      const btn = $("queueResumeBtn");
+      if (btn && btn.dataset.busy === "1") return;
+      if (btn) setBusy(btn, true);
       api.post("/api/queue/resume", {}).then(res => {
         applyQueueResponse(res);
         toast("Queue resumed", "ok");
-      }).catch(e => toast("Queue resume failed: " + e.message, "error"));
+      }).catch(e => toast("Queue resume failed: " + e.message, "error"))
+        .finally(() => { if (btn) setBusy(btn, false); });
     };
     $("queueClearBtn").onclick = () => {
       api.post("/api/queue/clear", {}).then(res => applyQueueResponse(res, "info")).catch(e => toast("Clear failed: " + e.message, "error"));

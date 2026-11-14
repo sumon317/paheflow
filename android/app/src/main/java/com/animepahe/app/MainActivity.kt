@@ -535,6 +535,8 @@ class MainActivity : AppCompatActivity() {
 
     fun downloadLatestUpdate(apkUrl: String) {
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val cacheFolder = externalCacheDir ?: getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: cacheDir
+            val destFile = File(cacheFolder, "paheflow-update.apk")
             try {
                 runOnUiThread {
                     webView.evaluateJavascript(
@@ -542,8 +544,6 @@ class MainActivity : AppCompatActivity() {
                         null
                     )
                 }
-                val cacheFolder = externalCacheDir ?: getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: cacheDir
-                val destFile = File(cacheFolder, "paheflow-update.apk")
                 if (destFile.exists()) {
                     destFile.delete()
                 }
@@ -644,7 +644,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                val sharedUri = publishApkToSharedDownloads(destFile)
+                val sharedUri = publishApkToSharedDownloads(destFile, apkUrl)
                 val signatureMatches = isApkSignedWithSameKey(destFile)
                 runOnUiThread {
                     webView.evaluateJavascript(
@@ -660,17 +660,33 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 runOnUiThread {
                     Toast.makeText(this@MainActivity, "Download error: ${e.message}", Toast.LENGTH_LONG).show()
-                    val escaped = e.message?.replace("'", "\\'") ?: "Unknown error"
+                    val escaped = (e.message ?: "Unknown error")
+                        .replace("\\", "\\\\")
+                        .replace("'", "\\'")
+                        .replace("\n", " ")
+                        .replace("\r", " ")
                     webView.evaluateJavascript(
                         "if (typeof window.onUpdateDownloadFailed === 'function') window.onUpdateDownloadFailed('$escaped');",
                         null
                     )
                 }
+            } finally {
+                try {
+                    if (destFile.exists()) {
+                        destFile.delete()
+                    }
+                } catch (_: Exception) {}
             }
         }
     }
 
-    private fun updateDisplayName(): String {
+    private fun updateDisplayName(apkUrl: String): String {
+        val lastSeg = Uri.parse(apkUrl).lastPathSegment?.trim().orEmpty()
+        if (lastSeg.endsWith(".apk", ignoreCase = true) &&
+            lastSeg.matches(Regex("^[A-Za-z0-9._-]+$"))
+        ) {
+            return lastSeg
+        }
         val version = try {
             packageManager.getPackageInfo(packageName, 0).versionName ?: "update"
         } catch (e: Exception) {
@@ -679,11 +695,12 @@ class MainActivity : AppCompatActivity() {
         return "paheflow-update-v$version.apk"
     }
 
-    private fun publishApkToSharedDownloads(tempFile: File): Uri? {
+    private fun publishApkToSharedDownloads(tempFile: File, apkUrl: String): Uri? {
+        val displayName = updateDisplayName(apkUrl)
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, updateDisplayName())
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
                     put(MediaStore.MediaColumns.MIME_TYPE, "application/vnd.android.package-archive")
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/PaheFlow")
                 }
@@ -701,7 +718,7 @@ class MainActivity : AppCompatActivity() {
                     "PaheFlow"
                 )
                 if (!targetDir.exists()) targetDir.mkdirs()
-                val target = File(targetDir, updateDisplayName())
+                val target = File(targetDir, displayName)
                 tempFile.copyTo(target, overwrite = true)
                 androidx.core.content.FileProvider.getUriForFile(
                     this,
