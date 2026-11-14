@@ -2296,6 +2296,7 @@
   function applyJob(job) {
     state.job = job;
     if (job && typeof job === "object") {
+      let hasCfQueueError = false;
       if (Array.isArray(job.queue)) {
         state.queue = job.queue;
         state.dlGroups = job.queue.map(e => ({
@@ -2307,13 +2308,13 @@
           error: e.error,
           epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
         }));
-        const hasCfQueueError = job.queue.some(e =>
+        hasCfQueueError = job.queue.some(e =>
           isCloudflareError(e.error) ||
           (Array.isArray(e.episodeItems) && e.episodeItems.some(i => isCloudflareError(i.error)))
         );
         if (hasCfQueueError) highlightSolveCfButton("needed");
       }
-      if (typeof job.queueHold === "boolean") setQueueHold(job.queueHold);
+      if (typeof job.queueHold === "boolean") setQueueHold(job.queueHold, hasCfQueueError);
     }
     renderQueuePanel();
     updateQueueCardButtons();
@@ -2331,10 +2332,16 @@
 
   const isQueued = (slug) => Boolean(slug) && state.queue.some(e => e.slug === slug);
 
-  function setQueueHold(value) {
+  function setQueueHold(value, hasCfError = false) {
     const previous = state.queueHold;
     state.queueHold = value;
-    if (value && !previous) toast("Downloads paused — tap Resume to continue.", "warn");
+    if (value && !previous) {
+      if (hasCfError) {
+        toast("Cloudflare verification required — tap Solve Cloudflare to continue.", "warn");
+      } else {
+        toast("Downloads paused — tap Resume to continue.", "warn");
+      }
+    }
   }
 
   function audioLabelFor(audio) {
@@ -2542,7 +2549,13 @@
           epItems: Array.isArray(e.episodeItems) ? e.episodeItems : [],
         }));
       }
-      if (res && typeof res.queueHold === "boolean") setQueueHold(res.queueHold);
+      if (res && typeof res.queueHold === "boolean") {
+        const hasCfQueueError = (state.queue || []).some(e =>
+          isCloudflareError(e.error) ||
+          (Array.isArray(e.episodeItems) && e.episodeItems.some(i => isCloudflareError(i.error)))
+        );
+        setQueueHold(res.queueHold, hasCfQueueError);
+      }
       renderQueuePanel();
       updateQueueCardButtons();
       renderDlGroups();
@@ -2897,8 +2910,16 @@
       if (label) label.textContent = `Preparing ${activeGroup.title || "anime"}...`;
       if (spd) spd.textContent = "Starting";
     } else if (allPausedState) {
-      if (label) label.textContent = state.queueHold ? "Queue paused" : "Downloads paused";
-      if (spd) spd.textContent = "⏸ Paused";
+      const hasCfErr = groups.some(g =>
+        isCloudflareError(g.error) ||
+        (g.epItems || []).some(e => isCloudflareError(e.error))
+      );
+      if (label) {
+        label.textContent = hasCfErr
+          ? "Cloudflare verification required"
+          : (state.queueHold ? "Queue paused" : "Downloads paused");
+      }
+      if (spd) spd.textContent = hasCfErr ? "⚠ Solve Cloudflare" : "⏸ Paused";
     } else if (done === total && total > 0) {
       if (label) label.textContent = "All downloads completed";
       if (spd) spd.textContent = "✓ Completed";

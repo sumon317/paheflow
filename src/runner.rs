@@ -153,6 +153,13 @@ pub fn load_queue_file(path: &Path) -> QueueFile {
                 item.eta.clear();
             }
         }
+        if entry.status == "queued"
+            && !entry.episode_items.is_empty()
+            && !entry.episode_items.iter().any(|i| i.status == "queued")
+            && entry.episode_items.iter().any(|i| i.status == "paused")
+        {
+            entry.status = "paused".to_string();
+        }
     }
     if file.next_id <= file.entries.iter().map(|e| e.id).max().unwrap_or(0) {
         file.next_id = file.entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
@@ -542,7 +549,11 @@ impl Runner {
     pub async fn resume(&self) -> bool {
         let active_slug = {
             let mut st = self.state.lock().await;
-            if st.running && st.paused {
+            if st.running
+                && st.paused
+                && !self.job_pause_signal.load(Ordering::Relaxed)
+                && !self.stop_signal.load(Ordering::Relaxed)
+            {
                 self.pause_signal.store(false, Ordering::Relaxed);
                 st.paused = false;
                 self.pause_notify.notify_waiters();
@@ -550,6 +561,7 @@ impl Runner {
                 self.add_log("info", "Download resumed.").await;
                 return true;
             }
+            st.paused = false;
             st.anime.slug.clone()
         };
 
@@ -558,8 +570,24 @@ impl Runner {
             let idx = q
                 .iter()
                 .position(|e| e.slug == active_slug && e.status == "paused")
-                .or_else(|| q.iter().position(|e| e.status == "paused"));
+                .or_else(|| q.iter().position(|e| e.status == "paused"))
+                .or_else(|| {
+                    q.iter().position(|e| {
+                        e.status == "queued"
+                            && !e.episode_items.is_empty()
+                            && !e.episode_items.iter().any(|i| i.status == "queued")
+                            && e.episode_items
+                                .iter()
+                                .any(|i| i.status == "paused" || i.status == "failed")
+                    })
+                });
             if let Some(i) = idx {
+                let was_cf = crate::client::is_cloudflare_error(&q[i].error)
+                    || q[i]
+                        .episode_items
+                        .iter()
+                        .any(|item| crate::client::is_cloudflare_error(&item.error));
+                let primary_title = q[i].title.clone();
                 for item in &mut q[i].episode_items {
                     if item.status == "paused" || item.status == "failed" {
                         item.status = "queued".to_string();
@@ -568,7 +596,33 @@ impl Runner {
                 }
                 q[i].status = "queued".to_string();
                 q[i].error.clear();
-                Some(q[i].title.clone())
+
+                // When resuming after a Cloudflare pause, also unpause any sibling
+                // entries that were paused due to Cloudflare challenges.
+                if was_cf {
+                    for (j, entry) in q.iter_mut().enumerate() {
+                        if j == i {
+                            continue;
+                        }
+                        let entry_cf = entry.status == "paused"
+                            && (crate::client::is_cloudflare_error(&entry.error)
+                                || entry
+                                    .episode_items
+                                    .iter()
+                                    .any(|item| crate::client::is_cloudflare_error(&item.error)));
+                        if entry_cf {
+                            for item in &mut entry.episode_items {
+                                if item.status == "paused" || item.status == "failed" {
+                                    item.status = "queued".to_string();
+                                    item.error.clear();
+                                }
+                            }
+                            entry.status = "queued".to_string();
+                            entry.error.clear();
+                        }
+                    }
+                }
+                Some(primary_title)
             } else {
                 None
             }
@@ -753,6 +807,7 @@ impl Runner {
         self.job_pause_signal.store(false, Ordering::Relaxed);
         self.suppress_hold_on_stop.store(false, Ordering::Relaxed);
         if !from_queue {
+            self.queue_hold.store(false, Ordering::Relaxed);
             self.queue_failures.store(0, Ordering::Relaxed);
         }
 
@@ -2347,6 +2402,52 @@ impl RunnerHelper {
         self.queue_persist().await;
     }
 
+    async fn pause_for_cloudflare(
+        &self,
+        slug: &str,
+        anime_title: &str,
+        ep_num: Option<&str>,
+        error: &str,
+    ) {
+        let msg = if let Some(ep) = ep_num {
+            format!(
+                "Episode {}: Cloudflare verification required. Pausing downloads — tap 'Solve Cloudflare' in the top bar to continue.",
+                ep
+            )
+        } else {
+            format!(
+                "Cloudflare verification required for '{}'. Pausing downloads — tap 'Solve Cloudflare' in the top bar to continue.",
+                anime_title
+            )
+        };
+        self.log("warn", &msg).await;
+        {
+            let mut st = self.state.lock().await;
+            st.paused = false;
+            st.episodes.current = None;
+            st.progress = ProgressState::default();
+        }
+        {
+            let mut q = self.queue.lock().await;
+            if let Some(entry) = q.iter_mut().find(|e| e.slug == slug) {
+                entry.status = "paused".to_string();
+                entry.error = error.to_string();
+                if let Some(ep) = ep_num {
+                    if let Some(item) = entry.episode_items.iter_mut().find(|i| i.ep_id == ep) {
+                        item.status = "paused".to_string();
+                        item.error = error.to_string();
+                        item.speed.clear();
+                        item.eta.clear();
+                    }
+                }
+            }
+        }
+        self.job_pause.store(true, Ordering::Relaxed);
+        self.queue_hold.store(true, Ordering::Relaxed);
+        self.queue_persist().await;
+        self.pause_notify.notify_waiters();
+    }
+
     async fn run_job(&self, spec: JobSpec) {
         let _run_guard = RunGuard {
             state: self.state.clone(),
@@ -2441,31 +2542,8 @@ impl RunnerHelper {
             Err(e) => {
                 if !self.stop.load(Ordering::Relaxed) && !self.job_pause.load(Ordering::Relaxed) {
                     if crate::client::is_cloudflare_error(&e) {
-                        self.log(
-                            "warn",
-                            &format!(
-                                "Cloudflare verification required for '{}'. Pausing downloads — tap 'Solve Cloudflare' in the top bar to continue.",
-                                anime_title
-                            ),
-                        )
-                        .await;
-                        {
-                            let mut st = self.state.lock().await;
-                            st.paused = true;
-                            st.episodes.current = None;
-                        }
-                        {
-                            let mut q = self.queue.lock().await;
-                            if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
-                                entry.status = "paused".to_string();
-                                entry.error = e.clone();
-                            }
-                        }
-                        self.job_pause.store(true, Ordering::Relaxed);
-                        self.queue_hold.store(true, Ordering::Relaxed);
-                        self.queue_persist().await;
-                        self.pause_notify.notify_waiters();
-                        return;
+                        self.pause_for_cloudflare(&actual_slug, &anime_title, None, &e)
+                            .await;
                     } else if api::is_rotated_or_missing_error(&e) {
                         self.log(
                             "error",
@@ -2761,35 +2839,13 @@ impl RunnerHelper {
                         }
 
                         if crate::client::is_cloudflare_error(&e) {
-                            self.log(
-                                "warn",
-                                &format!("Episode {}: Cloudflare verification required. Pausing downloads — tap 'Solve Cloudflare' in the top bar to continue.", ep_num),
+                            self.pause_for_cloudflare(
+                                &actual_slug,
+                                &anime_title,
+                                Some(&ep_num),
+                                &e,
                             )
                             .await;
-                            {
-                                let mut st = self.state.lock().await;
-                                st.paused = true;
-                                st.episodes.current = None;
-                            }
-                            {
-                                let mut q = self.queue.lock().await;
-                                if let Some(entry) = q.iter_mut().find(|e| e.slug == actual_slug) {
-                                    entry.status = "paused".to_string();
-                                    entry.error = e.clone();
-                                    if let Some(item) =
-                                        entry.episode_items.iter_mut().find(|i| i.ep_id == ep_num)
-                                    {
-                                        item.status = "paused".to_string();
-                                        item.error = e.clone();
-                                        item.speed.clear();
-                                        item.eta.clear();
-                                    }
-                                }
-                            }
-                            self.job_pause.store(true, Ordering::Relaxed);
-                            self.queue_hold.store(true, Ordering::Relaxed);
-                            self.queue_persist().await;
-                            self.pause_notify.notify_waiters();
                             break;
                         }
 
@@ -4614,5 +4670,185 @@ mod tests {
         assert_eq!(snap.queue[0].episode_items[0].size, "30.0 MiB");
 
         release_data_dir(&dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env-var guard intentionally spans the test
+    async fn test_pause_for_cloudflare_and_resume_unblocks_all_cf_entries() {
+        let (_env_guard, dir) = with_data_dir("cf_pause_resume");
+        let runner = Runner::new();
+
+        runner
+            .queue_add(&serde_json::json!({
+                "slug": "cf-show-1",
+                "title": "CF Show 1",
+                "episodes": "1,2"
+            }))
+            .await
+            .unwrap();
+        runner
+            .queue_add(&serde_json::json!({
+                "slug": "cf-show-2",
+                "title": "CF Show 2",
+                "episodes": "1"
+            }))
+            .await
+            .unwrap();
+
+        // Mark second show as already CF-paused from an earlier attempt
+        {
+            let mut q = runner.queue.lock().await;
+            q[0].status = "downloading".to_string();
+            q[0].episode_items[0].status = "downloading".to_string();
+            q[1].status = "paused".to_string();
+            q[1].error = "Cloudflare is challenging this request (HTTP 403 challenge).".to_string();
+            q[1].episode_items[0].status = "paused".to_string();
+            q[1].episode_items[0].error = q[1].error.clone();
+        }
+        {
+            let mut st = runner.state.lock().await;
+            st.running = true;
+            st.anime.slug = "cf-show-1".to_string();
+            st.episodes.current = Some("1".to_string());
+        }
+
+        let helper = RunnerHelper {
+            state: runner.state.clone(),
+            queue: runner.queue.clone(),
+            queue_hold: runner.queue_hold.clone(),
+            queue_next_id: runner.queue_next_id.clone(),
+            stop: runner.stop_signal.clone(),
+            pause: runner.pause_signal.clone(),
+            ep_cancel: runner.ep_cancel_signal.clone(),
+            job_pause: runner.job_pause_signal.clone(),
+            suppress_hold_on_stop: runner.suppress_hold_on_stop.clone(),
+            pause_notify: runner.pause_notify.clone(),
+            pump_notify: runner.pump_notify.clone(),
+            seq: runner.seq.clone(),
+            event_tx: runner.event_tx.clone(),
+            logs: runner.logs.clone(),
+        };
+
+        helper
+            .pause_for_cloudflare(
+                "cf-show-1",
+                "CF Show 1",
+                Some("1"),
+                "Cloudflare is challenging this request (HTTP 403 challenge).",
+            )
+            .await;
+
+        assert!(runner.job_pause_signal.load(Ordering::Relaxed));
+        assert!(runner.queue_hold.load(Ordering::Relaxed));
+        {
+            let mut st = runner.state.lock().await;
+            assert!(!st.paused, "CF pause must not set st.paused = true");
+            assert!(st.episodes.current.is_none());
+            // Simulate run_job epilogue completing
+            st.running = false;
+            st.exit_code = Some(0);
+        }
+        runner.job_pause_signal.store(false, Ordering::Relaxed);
+
+        let snap = runner.snapshot(false).await;
+        assert_eq!(snap.queue[0].status, "paused");
+        assert_eq!(snap.queue[0].episode_items[0].status, "paused");
+        assert!(snap.queue_hold);
+
+        // Resuming after solving Cloudflare must unpause BOTH CF-paused entries and clear hold.
+        assert!(runner.resume().await);
+        let snap2 = runner.snapshot(false).await;
+        assert!(!snap2.queue_hold);
+        assert_eq!(snap2.queue[0].status, "queued");
+        assert!(snap2.queue[0].error.is_empty());
+        assert_eq!(snap2.queue[0].episode_items[0].status, "queued");
+        assert!(snap2.queue[0].episode_items[0].error.is_empty());
+        assert_eq!(snap2.queue[1].status, "queued");
+        assert!(snap2.queue[1].error.is_empty());
+        assert_eq!(snap2.queue[1].episode_items[0].status, "queued");
+
+        release_data_dir(&dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env-var guard intentionally spans the test
+    async fn test_resume_ignores_intra_job_branch_when_job_pause_active() {
+        let (_env_guard, dir) = with_data_dir("resume_job_pause_race");
+        let runner = Runner::new();
+
+        runner
+            .queue_add(&serde_json::json!({
+                "slug": "race-cf",
+                "title": "Race CF",
+                "episodes": "1"
+            }))
+            .await
+            .unwrap();
+
+        {
+            let mut q = runner.queue.lock().await;
+            q[0].status = "paused".to_string();
+            q[0].episode_items[0].status = "paused".to_string();
+        }
+        {
+            let mut st = runner.state.lock().await;
+            st.running = true;
+            st.paused = true;
+            st.anime.slug = "race-cf".to_string();
+        }
+        runner.job_pause_signal.store(true, Ordering::Relaxed);
+        runner.queue_hold.store(true, Ordering::Relaxed);
+
+        assert!(runner.resume().await);
+        let snap = runner.snapshot(false).await;
+        assert!(!snap.paused);
+        assert!(!snap.queue_hold);
+        assert_eq!(snap.queue[0].status, "queued");
+        assert_eq!(snap.queue[0].episode_items[0].status, "queued");
+
+        release_data_dir(&dir);
+    }
+
+    #[test]
+    fn load_queue_file_normalizes_queued_entry_with_only_paused_items() {
+        let dir =
+            std::env::temp_dir().join(format!("paheflow_queue_paused_norm_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+
+        let mut entry = queue_entry(1, "paused-ep-show", "queued");
+        entry.episode_items = vec![
+            EpisodeItem {
+                ep_id: "1".to_string(),
+                label: "EP 01".to_string(),
+                status: "done".to_string(),
+                percent: 100.0,
+                speed: String::new(),
+                eta: String::new(),
+                size: String::new(),
+                error: String::new(),
+            },
+            EpisodeItem {
+                ep_id: "2".to_string(),
+                label: "EP 02".to_string(),
+                status: "paused".to_string(),
+                percent: 20.0,
+                speed: String::new(),
+                eta: String::new(),
+                size: String::new(),
+                error: String::new(),
+            },
+        ];
+        let file = QueueFile {
+            version: 1,
+            hold: false,
+            next_id: 2,
+            entries: vec![entry],
+        };
+        save_queue_file(&path, &file).unwrap();
+
+        let loaded = load_queue_file(&path);
+        assert_eq!(loaded.entries[0].status, "paused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -28,6 +28,7 @@ __pycache__/
 target/
 .cargo/
 android/.gradle/
+android/.kotlin/
 android/build/
 android/**/build/
 android/app/src/main/jniLibs/

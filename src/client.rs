@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+#[cfg(target_os = "android")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +9,9 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::config::{resource_dir, AppConfig};
+
+#[cfg(target_os = "android")]
+static PREFER_WEBVIEW_FOR_ANIMEPAHE: AtomicBool = AtomicBool::new(false);
 
 pub const MIN_INTERVAL_MS: u64 = 350;
 pub const TIMEOUT_SECS: u64 = 30;
@@ -209,6 +214,45 @@ impl HttpClient {
     ) -> Result<String, String> {
         #[cfg(target_os = "android")]
         {
+            if is_animepahe_url(url) {
+                if PREFER_WEBVIEW_FOR_ANIMEPAHE.load(Ordering::Relaxed) {
+                    self.throttle().await;
+                    match crate::android::android_webview_fetch(url, referer, &cfg.cf, &cfg.ua)
+                        .await
+                    {
+                        Ok(body) => return Ok(body),
+                        Err(err) => {
+                            PREFER_WEBVIEW_FOR_ANIMEPAHE.store(false, Ordering::Relaxed);
+                            return Err(err);
+                        }
+                    }
+                }
+
+                match self.fetch_reqwest(url, referer, cfg).await {
+                    Ok(body) => return Ok(body),
+                    Err(req_err) => {
+                        if is_cloudflare_error(&req_err) || req_err.contains("403") {
+                            eprintln!(
+                                "[HttpClient] reqwest hit Cloudflare/403 ({}), trying Android WebView bridge for {}",
+                                req_err, url
+                            );
+                            self.throttle().await;
+                            match crate::android::android_webview_fetch(
+                                url, referer, &cfg.cf, &cfg.ua,
+                            )
+                            .await
+                            {
+                                Ok(body) => {
+                                    PREFER_WEBVIEW_FOR_ANIMEPAHE.store(true, Ordering::Relaxed);
+                                    return Ok(body);
+                                }
+                                Err(wv_err) => return Err(wv_err),
+                            }
+                        }
+                        return Err(req_err);
+                    }
+                }
+            }
             return self.fetch_reqwest(url, referer, cfg).await;
         }
 
@@ -408,6 +452,18 @@ impl HttpClient {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    let cf_mitigated = resp
+                        .headers()
+                        .get("cf-mitigated")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.eq_ignore_ascii_case("challenge"))
+                        .unwrap_or(false);
+                    if (cf_mitigated || status == reqwest::StatusCode::FORBIDDEN) && is_animepahe {
+                        return Err(String::from(
+                            "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings.",
+                        ));
+                    }
+
                     let is_429 =
                         status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 429;
 

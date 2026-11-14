@@ -208,13 +208,16 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         }
 
         var urlLoaded = false
+        var fallbackRunnable: Runnable? = null
         val doLoad = {
             if (!urlLoaded && !isSolved && webView != null) {
                 urlLoaded = true
+                fallbackRunnable?.let { handler.removeCallbacks(it) }
                 wv.loadUrl("https://animepahe.pw/")
                 handler.postDelayed(cookieChecker, 1000)
             }
         }
+        fallbackRunnable = Runnable { doLoad() }
 
         // Clear stale cookies first, then load AnimePahe cleanly
         cookieManager.removeAllCookies { success ->
@@ -222,7 +225,7 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
             cookieManager.flush()
             wv.post { doLoad() }
         }
-        handler.postDelayed({ doLoad() }, 600)
+        handler.postDelayed(fallbackRunnable, 600)
     }
 
     private fun extractClearance(cookieStr: String?): String {
@@ -290,6 +293,8 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         Log.d("CF_SHEET", "saveAndDismiss: clearance len=${clearanceVal.length}")
         isSolved = true
         handler.removeCallbacks(cookieChecker)
+        CookieManager.getInstance().flush()
+        AndroidHttpBridge.onCredentialsUpdated()
         val ua = webView?.settings?.userAgentString ?: ""
         NativeEngine.notifyCloudflareSolved(clearanceVal, ua)
         Toast.makeText(requireContext(), "Cloudflare clearance updated!", Toast.LENGTH_SHORT).show()

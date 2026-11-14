@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use jni::objects::{JClass, JString};
+use jni::objects::{GlobalRef, JClass, JString, JValue};
 use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
-use jni::JNIEnv;
+use jni::{JNIEnv, JavaVM};
 
 use crate::client::HttpClient;
 use crate::config::{read_config, write_config};
@@ -18,6 +18,139 @@ static START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static RUNNER: OnceLock<Mutex<Option<Arc<Runner>>>> = OnceLock::new();
 static SHUTDOWN_NOTIFY: OnceLock<Mutex<Option<Arc<tokio::sync::Notify>>>> = OnceLock::new();
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
+static BRIDGE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn parse_bridge_response(raw_json: &str) -> Result<String, String> {
+    let val: serde_json::Value = serde_json::from_str(raw_json)
+        .map_err(|e| format!("Invalid WebView bridge response: {}", e))?;
+    let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let status = val.get("status").and_then(|v| v.as_u64()).unwrap_or(0);
+    let body = val
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let error = val
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let cf_challenge = val
+        .get("cfChallenge")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if ok {
+        return Ok(body);
+    }
+    if cf_challenge || status == 403 {
+        return Err(if error.is_empty() {
+            "Cloudflare is challenging this request (HTTP 403 challenge). Tap 'Solve Cloudflare' or update cf_clearance in Settings.".to_string()
+        } else {
+            error
+        });
+    }
+    if status == 429 {
+        return Err(if error.is_empty() {
+            "animepahe.pw rate-limited requests (HTTP 429 Too Many Requests).".to_string()
+        } else {
+            error
+        });
+    }
+    Err(if error.is_empty() {
+        format!("HTTP request failed with status code {}", status)
+    } else {
+        error
+    })
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn android_webview_fetch_blocking(
+    url: &str,
+    referer: &str,
+    cf_cookie: &str,
+    user_agent: &str,
+) -> Result<String, String> {
+    let vm = JAVA_VM
+        .get()
+        .ok_or_else(|| "Android JavaVM is not initialized".to_string())?;
+    let cls_ref = BRIDGE_CLASS
+        .get()
+        .ok_or_else(|| "AndroidHttpBridge class is not cached".to_string())?;
+
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("JNI attach failed: {}", e))?;
+
+    let local_cls = env
+        .new_local_ref(cls_ref.as_obj())
+        .map_err(|e| format!("Failed to create local ref for AndroidHttpBridge: {}", e))?;
+    let cls = JClass::from(local_cls);
+
+    let j_url = env
+        .new_string(url)
+        .map_err(|e| format!("JNI string alloc failed: {}", e))?;
+    let j_ref = env
+        .new_string(referer)
+        .map_err(|e| format!("JNI string alloc failed: {}", e))?;
+    let j_cf = env
+        .new_string(cf_cookie)
+        .map_err(|e| format!("JNI string alloc failed: {}", e))?;
+    let j_ua = env
+        .new_string(user_agent)
+        .map_err(|e| format!("JNI string alloc failed: {}", e))?;
+
+    let res = env.call_static_method(
+        cls,
+        "fetch",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        &[
+            JValue::Object(&j_url),
+            JValue::Object(&j_ref),
+            JValue::Object(&j_cf),
+            JValue::Object(&j_ua),
+        ],
+    );
+
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+        return Err("AndroidHttpBridge.fetch threw a Java exception".to_string());
+    }
+
+    let val = res.map_err(|e| format!("AndroidHttpBridge.fetch call failed: {}", e))?;
+    let obj = val
+        .l()
+        .map_err(|e| format!("AndroidHttpBridge.fetch return conversion failed: {}", e))?;
+    let j_str = JString::from(obj);
+    let json_str: String = env
+        .get_string(&j_str)
+        .map_err(|e| format!("Failed to read AndroidHttpBridge response string: {}", e))?
+        .into();
+
+    parse_bridge_response(&json_str)
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub async fn android_webview_fetch(
+    url: &str,
+    referer: Option<&str>,
+    cf_cookie: &str,
+    user_agent: &str,
+) -> Result<String, String> {
+    let url = url.to_string();
+    let referer = referer.unwrap_or("").to_string();
+    let cf_cookie = cf_cookie.to_string();
+    let user_agent = user_agent.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        android_webview_fetch_blocking(&url, &referer, &cf_cookie, &user_agent)
+    })
+    .await
+    .map_err(|e| format!("WebView HTTP bridge task panicked: {}", e))?
+}
 
 fn get_runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
@@ -39,6 +172,26 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
     ext_download_dir: JString,
     cache_dir: JString,
 ) -> jint {
+    if let Ok(vm) = env.get_java_vm() {
+        let _ = JAVA_VM.set(vm);
+    }
+    if BRIDGE_CLASS.get().is_none() {
+        match env.find_class("com/animepahe/app/AndroidHttpBridge") {
+            Ok(cls) => {
+                if let Ok(global) = env.new_global_ref(cls) {
+                    let _ = BRIDGE_CLASS.set(global);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[NativeEngine] Could not cache AndroidHttpBridge class: {:?}",
+                    e
+                );
+                let _ = env.exception_clear();
+            }
+        }
+    }
+
     if RUNNING.load(Ordering::SeqCst) {
         return BOUND_PORT.load(Ordering::SeqCst) as jint;
     }
@@ -272,5 +425,27 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_shutdownEngine(
             })
             .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bridge_response;
+
+    #[test]
+    fn parse_bridge_response_handles_ok_cf_rate_limit_and_errors() {
+        let ok =
+            r#"{"ok":true,"status":200,"body":"<html>ok</html>","error":"","cfChallenge":false}"#;
+        assert_eq!(parse_bridge_response(ok).unwrap(), "<html>ok</html>");
+
+        let cf = r#"{"ok":false,"status":403,"body":"","error":"","cfChallenge":true}"#;
+        let cf_err = parse_bridge_response(cf).unwrap_err();
+        assert!(crate::client::is_cloudflare_error(&cf_err));
+
+        let rl = r#"{"ok":false,"status":429,"body":"","error":"","cfChallenge":false}"#;
+        assert!(parse_bridge_response(rl).unwrap_err().contains("429"));
+
+        let bad = r#"{"ok":false,"status":404,"body":"","error":"","cfChallenge":false}"#;
+        assert!(parse_bridge_response(bad).unwrap_err().contains("404"));
     }
 }
