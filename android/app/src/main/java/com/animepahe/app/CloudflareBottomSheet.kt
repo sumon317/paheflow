@@ -38,6 +38,8 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
     private val handler = Handler(Looper.getMainLooper())
     private var isSolved = false
     private var initialClearance: String = ""
+    private var targetOrigin: String = "https://animepahe.pw"
+    private var isAnimepaheTarget: Boolean = true
 
     private val cookieChecker = object : Runnable {
         override fun run() {
@@ -124,14 +126,15 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
             setTextColor(0xFFFFFFFF.toInt())
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.9f)
             setOnClickListener {
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://animepahe.pw/")).apply {
+                val loadUrl = "$targetOrigin/"
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(loadUrl)).apply {
                     setPackage("org.mozilla.firefox")
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 try {
                     startActivity(intent)
                 } catch (_: Exception) {
-                    val fallback = Intent(Intent.ACTION_VIEW, Uri.parse("https://animepahe.pw/")).apply {
+                    val fallback = Intent(Intent.ACTION_VIEW, Uri.parse(loadUrl)).apply {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
                     try {
@@ -175,11 +178,34 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(wv, true)
 
+        val pendingOrigin = AndroidHttpBridge.getPendingChallengeOrigin()?.trimEnd('/')
+        if (!pendingOrigin.isNullOrBlank()) {
+            targetOrigin = pendingOrigin
+        } else {
+            targetOrigin = "https://animepahe.pw"
+        }
+        val targetHost = Uri.parse(targetOrigin).host?.lowercase() ?: "animepahe.pw"
+        isAnimepaheTarget = targetHost == "animepahe.pw" ||
+            targetHost.endsWith(".animepahe.pw") ||
+            targetHost == "animepahe.com" ||
+            targetHost.endsWith(".animepahe.com") ||
+            targetHost == "animepahe.org" ||
+            targetHost.endsWith(".animepahe.org") ||
+            targetHost == "animepahe.ru" ||
+            targetHost.endsWith(".animepahe.ru") ||
+            targetHost == "animepahe.si" ||
+            targetHost.endsWith(".animepahe.si")
+
         // Capture whatever stale cookie might be in CookieManager currently
-        val existingPw = cookieManager.getCookie("https://animepahe.pw") ?: ""
-        val existingRu = cookieManager.getCookie("https://animepahe.ru") ?: ""
-        initialClearance = extractClearance(if (existingPw.isNotEmpty()) existingPw else existingRu)
-        Log.d("CF_SHEET", "onViewCreated: initialClearance len=${initialClearance.length}")
+        val existingForTarget = if (isAnimepaheTarget) {
+            val existingPw = cookieManager.getCookie("https://animepahe.pw") ?: ""
+            val existingRu = cookieManager.getCookie("https://animepahe.ru") ?: ""
+            if (existingPw.isNotEmpty()) existingPw else existingRu
+        } else {
+            cookieManager.getCookie(targetOrigin) ?: ""
+        }
+        initialClearance = extractClearance(existingForTarget)
+        Log.d("CF_SHEET", "onViewCreated: target=$targetOrigin, initialClearance len=${initialClearance.length}")
 
         val settings = wv.settings
         settings.javaScriptEnabled = true
@@ -213,19 +239,24 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
             if (!urlLoaded && !isSolved && webView != null) {
                 urlLoaded = true
                 fallbackRunnable?.let { handler.removeCallbacks(it) }
-                wv.loadUrl("https://animepahe.pw/")
+                wv.loadUrl("$targetOrigin/")
                 handler.postDelayed(cookieChecker, 1000)
             }
         }
         fallbackRunnable = Runnable { doLoad() }
 
-        // Clear stale cookies first, then load AnimePahe cleanly
-        cookieManager.removeAllCookies { success ->
-            Log.d("CF_SHEET", "removeAllCookies result: $success")
-            cookieManager.flush()
+        if (isAnimepaheTarget) {
+            // Clear stale cookies first, then load AnimePahe cleanly
+            cookieManager.removeAllCookies { success ->
+                Log.d("CF_SHEET", "removeAllCookies result: $success")
+                cookieManager.flush()
+                wv.post { doLoad() }
+            }
+            handler.postDelayed(fallbackRunnable, 600)
+        } else {
+            // Keep animepahe.pw cookies intact while solving a stream-host challenge (e.g. kwik.cx)
             wv.post { doLoad() }
         }
-        handler.postDelayed(fallbackRunnable, 600)
     }
 
     private fun extractClearance(cookieStr: String?): String {
@@ -242,19 +273,27 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
     private fun checkCookies(autoDismiss: Boolean = true, forceSave: Boolean = false) {
         if (isSolved && !forceSave) return
         val cookieManager = CookieManager.getInstance()
-        val cookiesPwSlash = cookieManager.getCookie("https://animepahe.pw/") ?: ""
-        val cookiesPw = cookieManager.getCookie("https://animepahe.pw") ?: ""
-        val cookiesRuSlash = cookieManager.getCookie("https://animepahe.ru/") ?: ""
-        val cookiesRu = cookieManager.getCookie("https://animepahe.ru") ?: ""
-        val cookiesOrg = cookieManager.getCookie("https://animepahe.org/") ?: ""
-
-        val clearance = listOf(
-            extractClearance(cookiesPwSlash),
-            extractClearance(cookiesPw),
-            extractClearance(cookiesRuSlash),
-            extractClearance(cookiesRu),
-            extractClearance(cookiesOrg)
-        ).firstOrNull { it.isNotEmpty() } ?: ""
+        val clearance = if (isAnimepaheTarget) {
+            val cookiesPwSlash = cookieManager.getCookie("https://animepahe.pw/") ?: ""
+            val cookiesPw = cookieManager.getCookie("https://animepahe.pw") ?: ""
+            val cookiesRuSlash = cookieManager.getCookie("https://animepahe.ru/") ?: ""
+            val cookiesRu = cookieManager.getCookie("https://animepahe.ru") ?: ""
+            val cookiesOrg = cookieManager.getCookie("https://animepahe.org/") ?: ""
+            listOf(
+                extractClearance(cookiesPwSlash),
+                extractClearance(cookiesPw),
+                extractClearance(cookiesRuSlash),
+                extractClearance(cookiesRu),
+                extractClearance(cookiesOrg)
+            ).firstOrNull { it.isNotEmpty() } ?: ""
+        } else {
+            val cookiesTargetSlash = cookieManager.getCookie("$targetOrigin/") ?: ""
+            val cookiesTarget = cookieManager.getCookie(targetOrigin) ?: ""
+            listOf(
+                extractClearance(cookiesTargetSlash),
+                extractClearance(cookiesTarget)
+            ).firstOrNull { it.isNotEmpty() } ?: ""
+        }
 
         val wvTitle = webView?.title?.lowercase() ?: ""
         val isChallengeTitle = wvTitle.contains("just a moment") ||
@@ -263,17 +302,31 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
                 wvTitle.contains("cloudflare")
 
         val currentUrl = webView?.url?.lowercase() ?: ""
-        val onSite = currentUrl.contains("animepahe.pw") ||
+        val targetHost = Uri.parse(targetOrigin).host?.lowercase() ?: "animepahe.pw"
+        val onSite = if (isAnimepaheTarget) {
+            currentUrl.contains("animepahe.pw") ||
                 currentUrl.contains("animepahe.ru") ||
-                currentUrl.contains("animepahe.org")
+                currentUrl.contains("animepahe.org") ||
+                currentUrl.contains("animepahe.si")
+        } else {
+            currentUrl.contains(targetHost)
+        }
 
-        val challengePassed = !isChallengeTitle && onSite
+        val challengePassed = !isChallengeTitle && onSite && currentUrl.isNotBlank()
 
         if (forceSave) {
-            if (clearance.isEmpty()) {
+            if (isAnimepaheTarget && clearance.isEmpty()) {
                 Toast.makeText(
                     requireContext(),
                     "No cf_clearance cookie detected yet. Please solve the challenge above.",
+                    Toast.LENGTH_SHORT
+                ).show()
+                return
+            }
+            if (!isAnimepaheTarget && !challengePassed) {
+                Toast.makeText(
+                    requireContext(),
+                    "Please wait for the Cloudflare check to finish loading.",
                     Toast.LENGTH_SHORT
                 ).show()
                 return
@@ -283,20 +336,28 @@ class CloudflareBottomSheet : BottomSheetDialogFragment() {
         }
 
         // Auto-dismiss once clearance cookie is detected and page challenge is passed
-        if (autoDismiss && clearance.isNotEmpty() && challengePassed) {
-            Log.d("CF_SHEET", "Clearance cookie verified! Auto-dismissing.")
+        val readyToDismiss = if (isAnimepaheTarget) {
+            clearance.isNotEmpty() && challengePassed
+        } else {
+            challengePassed && (clearance.isNotEmpty() || wvTitle.contains("kwik"))
+        }
+        if (autoDismiss && readyToDismiss) {
+            Log.d("CF_SHEET", "Challenge verified for $targetOrigin! Auto-dismissing.")
             saveAndDismiss(clearance)
         }
     }
 
     private fun saveAndDismiss(clearanceVal: String) {
-        Log.d("CF_SHEET", "saveAndDismiss: clearance len=${clearanceVal.length}")
+        Log.d("CF_SHEET", "saveAndDismiss: target=$targetOrigin, clearance len=${clearanceVal.length}")
         isSolved = true
         handler.removeCallbacks(cookieChecker)
         CookieManager.getInstance().flush()
+        AndroidHttpBridge.clearPendingChallengeOrigin()
         AndroidHttpBridge.onCredentialsUpdated()
-        val ua = webView?.settings?.userAgentString ?: ""
-        NativeEngine.notifyCloudflareSolved(clearanceVal, ua)
+        if (isAnimepaheTarget && clearanceVal.isNotEmpty()) {
+            val ua = webView?.settings?.userAgentString ?: ""
+            NativeEngine.notifyCloudflareSolved(clearanceVal, ua)
+        }
         Toast.makeText(requireContext(), "Cloudflare clearance updated!", Toast.LENGTH_SHORT).show()
         onSolvedCallback?.invoke()
         dismissAllowingStateLoss()

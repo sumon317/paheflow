@@ -34,17 +34,18 @@ object AndroidHttpBridge {
 
     private const val TAG = "AndroidHttpBridge"
     private const val FETCH_TIMEOUT_SECS = 28L
-    private const val NAV_TIMEOUT_MS = 18_000L
-    private const val CF_WAIT_MAX_MS = 3_500L
+    private const val NAV_TIMEOUT_MS = 22_000L
+    private const val CF_WAIT_MAX_MS = 6_500L
+    private const val MAX_WEBVIEWS = 4
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val fetchLock = ReentrantLock()
 
-    private var bridgeWebView: WebView? = null
-    private var loadedOrigin: String? = null
+    private val webViewsByOrigin = LinkedHashMap<String, WebView>(4, 0.75f, true)
+    private val loadedOrigins = HashSet<String>()
 
     @Volatile
-    private var credentialsDirty: Boolean = false
+    private var pendingChallengeOrigin: String? = null
 
     private data class FetchResult(
         val ok: Boolean,
@@ -74,6 +75,9 @@ object AndroidHttpBridge {
         var httpStatus: Int = 200
 
         @Volatile
+        var pageGeneration: Long = 0
+
+        @Volatile
         var netError: String? = null
 
         @Volatile
@@ -94,7 +98,15 @@ object AndroidHttpBridge {
 
     @JvmStatic
     fun onCredentialsUpdated() {
-        credentialsDirty = true
+        loadedOrigins.clear()
+    }
+
+    @JvmStatic
+    fun getPendingChallengeOrigin(): String? = pendingChallengeOrigin
+
+    @JvmStatic
+    fun clearPendingChallengeOrigin() {
+        pendingChallengeOrigin = null
     }
 
     @JvmStatic
@@ -142,45 +154,78 @@ object AndroidHttpBridge {
         val origin = extractOrigin(url)
             ?: return FetchResult(false, 0, "", "Invalid URL for WebView bridge: $url", false)
 
-        syncManualCookieIfNeeded(origin, cfCookie)
+        if (cfCookie.isNotBlank()) {
+            syncManualCookieIfNeeded(origin, cfCookie)
+        }
 
-        val wv = ensureWebViewOnMain(userAgent)
+        val wv = ensureWebViewOnMain(origin, userAgent)
             ?: return FetchResult(false, 0, "", "Failed to initialize Android WebView", false)
 
-        val needOriginNav = credentialsDirty || loadedOrigin != origin
-        if (needOriginNav) {
-            credentialsDirty = false
+        val isApiCall = url.contains("/api")
+        val refOrigin = if (referer.isNotBlank()) extractOrigin(referer) else null
+        val isCrossOriginDoc = !isApiCall && refOrigin != null && refOrigin != origin
+
+        // Cross-origin document fetches (e.g., https://kwik.cx/e/... with Referer: https://animepahe.pw/)
+        // need a direct top-level navigation so Chromium sends the exact cross-origin Referer and
+        // navigation Sec-Fetch headers and lets Cloudflare's JS challenge run if needed.
+        if (isCrossOriginDoc) {
+            val navResult = navigateAndRead(wv, url, referer)
+            if (navResult.ok) {
+                loadedOrigins.add(origin)
+                if (pendingChallengeOrigin == origin) {
+                    pendingChallengeOrigin = null
+                }
+                return navResult
+            }
+            if (navResult.cfChallenge || navResult.status == 403) {
+                loadedOrigins.remove(origin)
+                pendingChallengeOrigin = origin
+            }
+            return navResult
+        }
+
+        if (origin !in loadedOrigins) {
             val originNav = navigateAndRead(wv, "$origin/", null)
             if (!originNav.ok) {
-                loadedOrigin = null
+                loadedOrigins.remove(origin)
+                if (originNav.cfChallenge || originNav.status == 403) {
+                    pendingChallengeOrigin = origin
+                }
                 return originNav
             }
-            loadedOrigin = origin
+            loadedOrigins.add(origin)
         }
 
         val apiResult = runJsFetch(wv, url, referer, origin)
         if (apiResult.ok) {
+            if (pendingChallengeOrigin == origin) {
+                pendingChallengeOrigin = null
+            }
             return apiResult
         }
 
         // Non-API pages (e.g., /play/{slug}/{session}) can require top-level
         // navigation headers (`sec-fetch-mode: navigate`, `sec-fetch-dest: document`).
-        val isApiCall = url.contains("/api")
         if (!isApiCall && (apiResult.status == 403 || apiResult.cfChallenge || apiResult.status == 0)) {
             Log.d(TAG, "JS fetch got ${apiResult.status} for $url; trying document navigation")
             val navResult = navigateAndRead(wv, url, referer.ifBlank { "$origin/" })
             if (navResult.ok) {
-                loadedOrigin = origin
+                loadedOrigins.add(origin)
+                if (pendingChallengeOrigin == origin) {
+                    pendingChallengeOrigin = null
+                }
                 return navResult
             }
             if (navResult.cfChallenge || navResult.status == 403) {
-                loadedOrigin = null
+                loadedOrigins.remove(origin)
+                pendingChallengeOrigin = origin
             }
             return navResult
         }
 
         if (apiResult.cfChallenge || apiResult.status == 403) {
-            loadedOrigin = null
+            loadedOrigins.remove(origin)
+            pendingChallengeOrigin = origin
         }
         return apiResult
     }
@@ -352,14 +397,22 @@ object AndroidHttpBridge {
     }
 
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
-    private fun ensureWebViewOnMain(userAgent: String): WebView? {
+    private fun ensureWebViewOnMain(origin: String, userAgent: String): WebView? {
         val holder = arrayOfNulls<WebView>(1)
         val latch = CountDownLatch(1)
 
         mainHandler.post {
             try {
-                var wv = bridgeWebView
+                var wv = webViewsByOrigin[origin]
                 if (wv == null) {
+                    if (webViewsByOrigin.size >= MAX_WEBVIEWS) {
+                        val oldestKey = webViewsByOrigin.keys.firstOrNull()
+                        if (oldestKey != null) {
+                            webViewsByOrigin.remove(oldestKey)?.destroy()
+                            loadedOrigins.remove(oldestKey)
+                        }
+                    }
+
                     val ctx = AnimePaheApp.instance
                     wv = WebView(ctx)
                     val settings = wv.settings
@@ -378,7 +431,7 @@ object AndroidHttpBridge {
 
                     wv.addJavascriptInterface(BridgeJsInterface(), "__paheBridge")
                     wv.webViewClient = BridgeWebViewClient()
-                    bridgeWebView = wv
+                    webViewsByOrigin[origin] = wv
                 }
 
                 val targetUa = if (userAgent.isNotBlank()) {
@@ -394,7 +447,7 @@ object AndroidHttpBridge {
 
                 holder[0] = wv
             } catch (t: Throwable) {
-                Log.e(TAG, "Failed to create hidden WebView", t)
+                Log.e(TAG, "Failed to create hidden WebView for $origin", t)
             } finally {
                 latch.countDown()
             }
@@ -404,13 +457,20 @@ object AndroidHttpBridge {
         return holder[0]
     }
 
-    private fun inspectLoadedPage(wv: WebView, nav: PendingNav, attemptStartMs: Long) {
-        if (nav.settled || activeNav !== nav) return
+    private fun inspectLoadedPage(
+        wv: WebView,
+        nav: PendingNav,
+        generation: Long,
+        attemptStartMs: Long
+    ) {
+        if (nav.settled || activeNav !== nav || nav.pageGeneration != generation) return
 
         wv.evaluateJavascript(
             "(function(){return JSON.stringify({title: document.title || '', html: document.documentElement ? document.documentElement.outerHTML : ''});})();"
         ) { raw ->
-            if (nav.settled || activeNav !== nav) return@evaluateJavascript
+            if (nav.settled || activeNav !== nav || nav.pageGeneration != generation) {
+                return@evaluateJavascript
+            }
             var title = ""
             var html = ""
             try {
@@ -442,7 +502,7 @@ object AndroidHttpBridge {
             val elapsed = System.currentTimeMillis() - attemptStartMs
             if (elapsed < CF_WAIT_MAX_MS) {
                 mainHandler.postDelayed({
-                    inspectLoadedPage(wv, nav, attemptStartMs)
+                    inspectLoadedPage(wv, nav, generation, attemptStartMs)
                 }, 450)
             } else {
                 nav.html = html
@@ -462,6 +522,7 @@ object AndroidHttpBridge {
             super.onPageStarted(view, url, favicon)
             val nav = activeNav
             if (nav != null && !nav.settled) {
+                nav.pageGeneration += 1
                 nav.httpStatus = 200
             }
         }
@@ -502,7 +563,7 @@ object AndroidHttpBridge {
             if (view == null || url.isNullOrBlank() || url == "about:blank") return
             val nav = activeNav ?: return
             if (nav.settled) return
-            inspectLoadedPage(view, nav, System.currentTimeMillis())
+            inspectLoadedPage(view, nav, nav.pageGeneration, System.currentTimeMillis())
         }
     }
 
@@ -536,7 +597,7 @@ object AndroidHttpBridge {
             }
         }
         cm.flush()
-        credentialsDirty = true
+        loadedOrigins.remove(origin)
     }
 
     private fun extractClearance(cookieStr: String?): String {

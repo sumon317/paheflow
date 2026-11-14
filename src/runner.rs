@@ -2916,12 +2916,22 @@ impl RunnerHelper {
                 }
 
                 let mut resolved_stream: Option<(&PlaySource, String)> = None;
+                let mut stream_cf_error: Option<String> = None;
+                let mut cf_blocked_hosts: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for (idx, src) in candidate_sources.iter().enumerate() {
                     if self.stop.load(Ordering::Relaxed)
                         || self.job_pause.load(Ordering::Relaxed)
                         || self.ep_cancel.load(Ordering::Relaxed)
                     {
                         break;
+                    }
+                    let src_host = url::Url::parse(&src.url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+                        .unwrap_or_default();
+                    if !src_host.is_empty() && cf_blocked_hosts.contains(&src_host) {
+                        continue;
                     }
                     let mut html_opt = None;
                     for attempt in 1..=2 {
@@ -2945,6 +2955,15 @@ impl RunnerHelper {
                                     || self.job_pause.load(Ordering::Relaxed)
                                     || self.ep_cancel.load(Ordering::Relaxed)
                                 {
+                                    break;
+                                }
+                                if crate::client::is_cloudflare_error(&e) {
+                                    if stream_cf_error.is_none() {
+                                        stream_cf_error = Some(e.clone());
+                                    }
+                                    if !src_host.is_empty() {
+                                        cf_blocked_hosts.insert(src_host.clone());
+                                    }
                                     break;
                                 }
                                 if attempt < 2 {
@@ -2988,6 +3007,16 @@ impl RunnerHelper {
                 let (chosen_source, m3u8_url) = match resolved_stream {
                     Some((s, u)) => (Some(s.clone()), u),
                     None => {
+                        if let Some(cf_err) = stream_cf_error {
+                            self.pause_for_cloudflare(
+                                &actual_slug,
+                                &anime_title,
+                                Some(&ep_num),
+                                &cf_err,
+                            )
+                            .await;
+                            break;
+                        }
                         self.log(
                             "warn",
                             &format!("Episode {}: stream resolver did not find playlist.", ep_num),
