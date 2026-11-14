@@ -882,7 +882,71 @@ async fn get_episodes(
         })));
     }
 
-    // 2. Not cached: fetch the requested page directly (fast single request, no multi-page loop timeouts)
+    // 2. If all episodes requested (all=true) or no specific page, fetch the full release
+    if all_param || page.is_none() {
+        let mut rel_res = api::release_with_status(&state.client, &slug, &cfg).await;
+        if let Err(ref e) = rel_res {
+            if api::is_rotated_or_missing_error(e) {
+                if let Some(new_slug) =
+                    api::resolve_active_slug(&state.client, &slug, title_param.as_deref(), &cfg).await
+                {
+                    println!(
+                        "[Slug Auto-Heal] Self-healed rotated slug: {} -> {}",
+                        slug, new_slug
+                    );
+                    slug = new_slug;
+                    rel_res = api::release_with_status(&state.client, &slug, &cfg).await;
+                }
+            }
+        }
+        match rel_res {
+            Ok(rel) => {
+                let items = rel.items;
+                let available_audios = api::detect_available_audios(&items);
+                let total_all = items.len();
+                let filtered = api::filter_episodes_by_audio(&items, &audio_filter);
+                let total = filtered.len();
+
+                return Ok(Json(serde_json::json!({
+                    "items": filtered,
+                    "lastPage": 1,
+                    "page": 1,
+                    "slug": slug,
+                    "total": total,
+                    "totalAll": total_all,
+                    "availableAudios": available_audios,
+                    "audio": if audio_filter.is_empty() || audio_filter == "all" { serde_json::Value::Null } else { serde_json::json!(audio_filter) },
+                    "stale": rel.stale,
+                    "warning": rel.warning,
+                })));
+            }
+            Err(e) => {
+                if cached.is_empty() {
+                    if api::is_rotated_or_missing_error(&e) {
+                        return Ok(Json(serde_json::json!({
+                            "items": [],
+                            "lastPage": 1,
+                            "page": 1,
+                            "slug": slug,
+                            "total": 0,
+                            "totalAll": 0,
+                            "availableAudios": [],
+                            "audio": serde_json::Value::Null,
+                            "stale": true,
+                            "notFound": true,
+                            "warning": "No release data found on AnimePahe. This title may have been removed or unavailable.",
+                        })));
+                    }
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "error": e })),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 3. Paginated single-page request fallback
     if let Some(pg) = page {
         let mut res = api::release_page(&state.client, &slug, pg, &cfg).await;
         if let Err(ref e) = res {
@@ -910,7 +974,7 @@ async fn get_episodes(
                 // If this is the only page, cache it immediately so subsequent loads are instant
                 if last_page <= 1 && !items.is_empty() {
                     api::save_release_cache(&slug, &items);
-                } else if last_page > 1 && last_page <= 20 {
+                } else if last_page > 1 {
                     let bg_client = state.client.clone();
                     let bg_slug = slug.clone();
                     let bg_cfg = cfg.clone();

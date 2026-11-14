@@ -24,7 +24,7 @@
     <nav class="tabs" role="tablist">
       <button class="tab is-active" data-tab="browse" role="tab">Browse</button>
       <button class="tab" data-tab="episodes" role="tab">Episodes</button>
-      <button class="tab" data-tab="queue" role="tab">Queue<span class="tab-badge hidden" id="queueTabCount">0</span></button>
+      <button class="tab" data-tab="downloads" id="tabDownloads" role="tab">Downloads<span class="tab-badge hidden" id="queueTabCount">0</span></button>
       <button class="tab" data-tab="settings" role="tab">Settings</button>
     </nav>
 
@@ -231,32 +231,32 @@
       </div>
     </section>
 
-    <!-- ──────────────────────────────  QUEUE  ────────────────────────────── -->
-    <section class="panel" id="panel-queue">
+    <!-- ────────────────────────────  DOWNLOADS  ──────────────────────────── -->
+    <section class="panel" id="panel-downloads">
       <div class="panel-head">
         <div>
-          <h2>Download queue</h2>
-          <p class="panel-sub">Queued anime are downloaded one after another, automatically. Adding to the queue resumes it.</p>
+          <h2>Downloads</h2>
+          <p class="panel-sub">Active downloads and queue. Anime are downloaded sequentially, one episode at a time.</p>
         </div>
         <div class="panel-actions">
-          <button class="btn btn-ghost btn-sm" id="queueHoldBtn" title="Pause or resume the automatic queue">Pause queue</button>
-          <button class="btn btn-ghost btn-sm" id="queueClearBtn" title="Remove all queued and failed entries">Clear queue</button>
+          <button class="btn btn-ghost btn-sm" id="queueHoldBtn" title="Pause or resume downloads">Pause downloads</button>
+          <button class="btn btn-ghost btn-sm" id="queueClearBtn" title="Remove all queued and finished entries">Clear list</button>
         </div>
       </div>
 
       <div class="banner hidden" id="queueHoldBanner" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.1);">
         <div class="banner-icon" style="background: rgba(245, 158, 11, 0.2); color: #f59e0b;">⏸</div>
         <div class="banner-body">
-          <strong>Queue paused</strong>
-          <span>Auto-download is on hold, often because a download was stopped. Resume to continue with the next queued anime.</span>
+          <strong>Downloads paused</strong>
+          <span>Automatic downloads are on hold. Resume to continue downloading the next episodes.</span>
         </div>
-        <button class="btn btn-primary btn-sm" id="queueResumeBtn" style="background: #f59e0b; border-color: #f59e0b; color: #000; font-weight: 600;">▶ Resume queue</button>
+        <button class="btn btn-primary btn-sm" id="queueResumeBtn" style="background: #f59e0b; border-color: #f59e0b; color: #000; font-weight: 600;">▶ Resume</button>
       </div>
 
       <div class="queue-list" id="queueList">
         <div class="empty">
-          <p class="empty-title">The queue is empty</p>
-          <p class="empty-text">Use the Queue button on any anime in Browse, or queue your episode selection from the Episodes tab.</p>
+          <p class="empty-title">No downloads in queue</p>
+          <p class="empty-text">Select episodes from the Episodes tab and press Download to start or queue them.</p>
         </div>
       </div>
     </section>
@@ -545,8 +545,7 @@
     </div>
     <div class="action-buttons">
       <button class="btn btn-ghost" id="stopBtn" disabled>Stop</button>
-      <button class="btn btn-ghost" id="queueSelectionBtn" disabled title="Add the selected episodes to the download queue">Queue</button>
-      <button class="btn btn-primary btn-lg" id="startBtn" disabled>Start download</button>
+      <button class="btn btn-primary btn-lg" id="startBtn" disabled>Download</button>
     </div>
   </footer>
 

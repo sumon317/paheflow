@@ -605,11 +605,11 @@ impl Runner {
                 entry.status = "downloading".to_string();
                 entry.error.clear();
                 if entry.episode_items.is_empty() {
-                    entry.episode_items = build_episode_items(&episode_spec);
+                    entry.episode_items = build_or_cached_episode_items(&episode_spec, &slug);
                 }
             } else {
                 let id = self.queue_next_id.fetch_add(1, Ordering::Relaxed) + 1;
-                let episode_items = build_episode_items(&episode_spec);
+                let episode_items = build_or_cached_episode_items(&episode_spec, &slug);
                 q.insert(
                     0,
                     QueueEntry {
@@ -824,7 +824,7 @@ impl Runner {
             q[index].list_only = list_only;
             q[index].status = "queued".to_string();
             q[index].error.clear();
-            q[index].episode_items = build_episode_items(&episodes);
+            q[index].episode_items = build_or_cached_episode_items(&episodes, &slug);
             drop(q);
             self.queue_hold.store(false, Ordering::Relaxed);
             self.queue_failures.store(0, Ordering::Relaxed);
@@ -840,7 +840,7 @@ impl Runner {
 
         let id = self.queue_next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let position = q.len() + 1;
-        let episode_items = build_episode_items(&episodes);
+        let episode_items = build_or_cached_episode_items(&episodes, &slug);
         q.push(QueueEntry {
             id,
             slug,
@@ -1367,6 +1367,41 @@ fn build_episode_items(episodes: &str) -> Vec<EpisodeItem> {
             size: String::new(),
             error: String::new(),
         });
+    }
+    items
+}
+
+fn build_or_cached_episode_items(episodes: &str, slug: &str) -> Vec<EpisodeItem> {
+    let mut items = build_episode_items(episodes);
+    if items.is_empty() {
+        let cached = api::load_release_cache(slug);
+        if !cached.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for item in cached {
+                let ep_str = match &item.episode {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => continue,
+                };
+                if seen.insert(ep_str.clone()) {
+                    let label = if let Ok(n) = ep_str.parse::<u32>() {
+                        format!("EP {:02}", n)
+                    } else {
+                        format!("EP {}", ep_str)
+                    };
+                    items.push(EpisodeItem {
+                        ep_id: ep_str,
+                        label,
+                        status: "queued".to_string(),
+                        percent: 0.0,
+                        speed: String::new(),
+                        eta: String::new(),
+                        size: String::new(),
+                        error: String::new(),
+                    });
+                }
+            }
+        }
     }
     items
 }

@@ -137,6 +137,10 @@ pub fn load_release_cache_with_meta(slug: &str) -> (Vec<EpisodeItem>, Option<i64
     (Vec::new(), None)
 }
 
+pub fn load_release_cache(slug: &str) -> Vec<EpisodeItem> {
+    load_release_cache_with_meta(slug).0
+}
+
 pub fn cache_warning(error: &str, count: usize, saved_at: Option<i64>) -> String {
     let when = saved_at
         .and_then(|ts| chrono::Local.timestamp_opt(ts, 0).single())
@@ -559,6 +563,7 @@ pub async fn release_with_status(
         }
     };
 
+    let first_count = first_items.len();
     for item in first_items {
         if !item.session.is_empty() && seen_sessions.insert(item.session.clone()) {
             all_episodes.push(item);
@@ -595,14 +600,42 @@ pub async fn release_with_status(
                             }
                         }
                     }
-                    Err(err) => page_errors.push(format!("page {}: {}", page, err)),
+                    Err(err) => {
+                        // Retry failed page once
+                        match release_page(client, slug, page, cfg).await {
+                            Ok((page_items, _)) => {
+                                for item in page_items {
+                                    if !item.session.is_empty()
+                                        && seen_sessions.insert(item.session.clone())
+                                    {
+                                        all_episodes.push(item);
+                                    }
+                                }
+                            }
+                            Err(_) => page_errors.push(format!("page {}: {}", page, err)),
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Never replace a complete cached list with a partial one.
-    if page_errors.is_empty() {
+    all_episodes.sort_by(|a, b| {
+        let a_num = match &a.episode {
+            serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+            serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+            _ => 0.0,
+        };
+        let b_num = match &b.episode {
+            serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+            serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+            _ => 0.0,
+        };
+        a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Save whenever full or we fetched multiple pages successfully
+    if page_errors.is_empty() || all_episodes.len() > first_count {
         save_release_cache(slug, &all_episodes);
     }
 

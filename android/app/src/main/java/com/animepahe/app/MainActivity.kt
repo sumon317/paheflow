@@ -263,7 +263,39 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        webView.webChromeClient = WebChromeClient()
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage?): Boolean {
+                android.util.Log.d("WebViewConsole", "${consoleMessage?.message()} -- From line ${consoleMessage?.lineNumber()} of ${consoleMessage?.sourceId()}")
+                return true
+            }
+
+            override fun onJsPrompt(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                defaultValue: String?,
+                result: android.webkit.JsPromptResult?
+            ): Boolean {
+                val input = android.widget.EditText(this@MainActivity).apply {
+                    setText(defaultValue ?: "")
+                    selectAll()
+                }
+                androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle(message ?: "Enter value")
+                    .setView(input)
+                    .setPositiveButton("OK") { _, _ ->
+                        result?.confirm(input.text.toString())
+                    }
+                    .setNegativeButton("Cancel") { _, _ ->
+                        result?.cancel()
+                    }
+                    .setOnCancelListener {
+                        result?.cancel()
+                    }
+                    .show()
+                return true
+            }
+        }
 
         ViewCompat.setOnApplyWindowInsetsListener(container) { v, windowInsets ->
             val insets = windowInsets.getInsets(

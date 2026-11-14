@@ -518,7 +518,6 @@
           </div>
           <div class="result-actions">
             <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
-            ${queueBtnHtml(a.slug, a.title)}
           </div>
         </div>
       `;
@@ -542,7 +541,6 @@
         </div>
         <div class="result-actions">
           <button class="btn btn-ghost btn-sm select-btn" title="Select this anime">Select</button>
-          ${queueBtnHtml(a.slug, a.title)}
         </div>
       </div>
     `;
@@ -783,7 +781,6 @@
         </div>
         <div class="result-actions">
           <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(epNum)}">Open</button>
-          ${queueBtnHtml(session, title)}
         </div>
       </div>
     `;
@@ -1493,8 +1490,8 @@
     const totalSize = calculateTotalSelectedSize();
     const sizeStr = totalSize ? ` (~${totalSize})` : "";
     $("epSubtitle").textContent = `${base} • ${count} selected${sizeStr}${count ? " — " + compressEpisodes(state.episodesSelected) : ""}`;
-    $("startBtn").disabled = count === 0;
-    $("queueSelectionBtn").disabled = count === 0;
+    if ($("queueSelectionBtn")) $("queueSelectionBtn").disabled = count === 0;
+    updateMainActionButton();
 
     const pill = $("epCapacityPill");
     if (pill) {
@@ -2163,26 +2160,18 @@
           <div class="result-actions">
             ${status === "downloading"
               ? `<button class="btn btn-ghost btn-sm" disabled title="Stop the download first">Downloading</button>`
-              : `<button class="btn btn-ghost btn-sm" data-unqueue="${escapeHtml(entry.slug)}" title="Remove from queue">Unqueue</button>`}
+              : `<button class="btn btn-ghost btn-sm" data-unqueue="${escapeHtml(entry.slug)}" title="Remove from queue">Cancel</button>`}
           </div>
         </div>`;
     }).join("");
   }
 
   function queueBtnHtml(slug, title) {
-    const queued = isQueued(slug);
-    return `<button class="btn btn-ghost btn-sm queue-btn${queued ? " is-queued" : ""}" data-queue-slug="${escapeHtml(slug)}" data-queue-title="${escapeHtml(title)}" title="${queued ? "Remove from download queue" : "Add to download queue (downloads automatically after the current job)"}">${queued ? "Unqueue" : "Queue"}</button>`;
+    return "";
   }
 
   function updateQueueCardButtons() {
-    $$(".queue-btn").forEach(btn => {
-      const slug = btn.dataset.queueSlug;
-      const queued = isQueued(slug);
-      const label = queued ? "Unqueue" : "Queue";
-      if (btn.textContent !== label) btn.textContent = label;
-      btn.classList.toggle("is-queued", queued);
-      btn.title = queued ? "Remove from download queue" : "Add to download queue (downloads automatically after the current job)";
-    });
+    // No-op: card queue/unqueue buttons removed
   }
 
   function applyQueueResponse(res, fallbackOk, fallbackErr) {
@@ -2570,27 +2559,47 @@
     }
   }
 
+  function updateMainActionButton() {
+    const isCurrentJob = Boolean(
+      state.job &&
+      (state.job.running || state.job.paused) &&
+      state.job.anime?.slug &&
+      state.job.anime.slug === state.selectedSlug
+    );
+    const hasJobRunning = Boolean(state.job && (state.job.running || state.job.paused));
+    const count = state.episodesSelected ? state.episodesSelected.length : 0;
+
+    const stopBtn = $("stopBtn");
+    const startBtn = $("startBtn");
+    if (!startBtn) return;
+
+    if (isCurrentJob) {
+      if (stopBtn) stopBtn.disabled = false;
+      startBtn.disabled = false;
+      startBtn.textContent = state.job.paused ? "Resume" : "Pause";
+    } else {
+      if (stopBtn) stopBtn.disabled = !hasJobRunning;
+      startBtn.disabled = count === 0;
+      if (count === 0) {
+        startBtn.textContent = "Download";
+      } else {
+        startBtn.textContent = `Download (${count})`;
+      }
+    }
+  }
+
   function handleState(msg) {
     applyJob(msg);
     if (typeof msg.logSeq === "number") state.logSeq = msg.logSeq;
     if (msg.running) {
-      $("stopBtn").disabled = false;
-      if (msg.paused) {
-        $("startBtn").textContent = "Resume";
-        $("startBtn").disabled = false;
-        updatePill("paused");
-      } else {
-        $("startBtn").textContent = "Pause";
-        $("startBtn").disabled = false;
-        updatePill("running");
-      }
+      updatePill(msg.paused ? "paused" : "running");
+      updateMainActionButton();
       return;
     }
-    $("startBtn").textContent = "Start download";
-    if (msg.exitCode === null || msg.exitCode === undefined) return;
-    updatePill(msg.stopped ? "idle" : (msg.exitCode === 0 ? "done" : "error"));
-    $("startBtn").disabled = state.episodesSelected.length === 0;
-    $("stopBtn").disabled = true;
+    if (msg.exitCode !== null && msg.exitCode !== undefined) {
+      updatePill(msg.stopped ? "idle" : (msg.exitCode === 0 ? "done" : "error"));
+    }
+    updateMainActionButton();
   }
 
   function handleDone(msg) {
@@ -2688,11 +2697,13 @@
       debug: $("optDebug").checked,
     };
     api.post("/api/run", payload).then(res => {
-      if (res.queued) {
-        toast(res.message || "Added to download queue", "ok");
-      }
       applyJob(res.job);
       state.lastDoneJob = "";
+      if (res.queued) {
+        toast(`'${state.selectedTitle || state.selectedSlug}' added to downloads — will start after current finishes`, "ok");
+      } else {
+        toast(`Download started for '${state.selectedTitle || state.selectedSlug}'`, "ok");
+      }
       // Remove the previous job's lines, but keep any new lines that the SSE
       // stream already delivered while this request was in flight.
       const clearThrough = Number(res.job?.logSeq || 0);
@@ -2701,12 +2712,7 @@
       $$(".log-line", $("logs")).forEach(line => {
         if (Number(line.dataset.seq || 0) <= clearThrough) line.remove();
       });
-      if (!res.queued) {
-        $("startBtn").textContent = "Pause";
-        $("startBtn").disabled = false;
-        $("stopBtn").disabled = false;
-        updatePill("running");
-      }
+      updateMainActionButton();
       toggleActivityPanel(true);
     }).catch(e => toast("Start failed: " + e.message, "error"));
   }
@@ -2714,8 +2720,8 @@
   function pauseJob() {
     api.post("/api/pause", {}).then(() => {
       if (state.job) state.job.paused = true;
-      $("startBtn").textContent = "Resume";
       updatePill("paused");
+      updateMainActionButton();
       updateProgressUI();
       toast("Download paused", "warn");
     }).catch(e => toast("Pause failed: " + e.message, "error"));
@@ -2724,20 +2730,29 @@
   function resumeJob() {
     api.post("/api/resume", {}).then(() => {
       if (state.job) state.job.paused = false;
-      $("startBtn").textContent = "Pause";
       updatePill("running");
+      updateMainActionButton();
       updateProgressUI();
       toast("Download resumed", "ok");
     }).catch(e => toast("Resume failed: " + e.message, "error"));
   }
 
   function handleMainAction() {
-    if (!state.job?.running) {
-      startJob();
-    } else if (state.job?.paused) {
-      resumeJob();
+    const isCurrentJob = Boolean(
+      state.job &&
+      (state.job.running || state.job.paused) &&
+      state.job.anime?.slug &&
+      state.job.anime.slug === state.selectedSlug
+    );
+
+    if (isCurrentJob) {
+      if (state.job.paused) {
+        resumeJob();
+      } else {
+        pauseJob();
+      }
     } else {
-      pauseJob();
+      startJob();
     }
   }
 
@@ -2747,10 +2762,8 @@
         state.job.running = false;
         state.job.paused = false;
       }
-      $("startBtn").textContent = "Start download";
-      $("startBtn").disabled = state.episodesSelected.length === 0;
-      $("stopBtn").disabled = true;
       updatePill("idle");
+      updateMainActionButton();
       updateProgressUI();
     }).catch(e => toast("Stop failed: " + e.message, "error"));
   }
@@ -2769,6 +2782,12 @@
   }
 
   function showTab(name) {
+    if (name === "downloads" || name === "queue") {
+      name = "downloads";
+      if (window.innerWidth <= 900) {
+        toggleActivityPanel(true);
+      }
+    }
     if (name !== "browse" && state.catalogObserver) {
       state.catalogObserver.disconnect();
       state.catalogObserver = null;
@@ -2786,9 +2805,10 @@
       if (state.tabHistory.length > 20) state.tabHistory.shift();
       state.activeTab = name;
     }
-    $$(".panel").forEach(p => p.classList.toggle("is-active", p.id === "panel-" + name));
-    $$(".tab").forEach(t => t.classList.toggle("is-active", t.dataset.tab === name));
+    $$(".panel").forEach(p => p.classList.toggle("is-active", p.id === "panel-" + name || (name === "downloads" && (p.id === "panel-downloads" || p.id === "panel-queue"))));
+    $$(".tab").forEach(t => t.classList.toggle("is-active", t.dataset.tab === name || (name === "downloads" && (t.dataset.tab === "downloads" || t.dataset.tab === "queue"))));
     updateActionBarVisibility();
+    updateMainActionButton();
   }
 
   /* ─────────────────────────────────────────────────────────────────
@@ -2826,24 +2846,11 @@
       applyJob(init.job);
       if (init.job?.logSeq !== undefined) state.logSeq = init.job.logSeq;
       if (init.job?.running) {
-        $("stopBtn").disabled = false;
-        if (init.job?.paused) {
-          $("startBtn").textContent = "Resume";
-          $("startBtn").disabled = false;
-          updatePill("paused");
-        } else {
-          $("startBtn").textContent = "Pause";
-          $("startBtn").disabled = false;
-          updatePill("running");
-        }
-      } else {
-        $("startBtn").textContent = "Start download";
-        if (init.job?.exitCode !== null && init.job?.exitCode !== undefined) {
-          updatePill(init.job.stopped ? "idle" : (init.job.exitCode === 0 ? "done" : "error"));
-        }
-        $("startBtn").disabled = state.episodesSelected.length === 0;
-        $("stopBtn").disabled = true;
+        updatePill(init.job?.paused ? "paused" : "running");
+      } else if (init.job?.exitCode !== null && init.job?.exitCode !== undefined) {
+        updatePill(init.job.stopped ? "idle" : (init.job.exitCode === 0 ? "done" : "error"));
       }
+      updateMainActionButton();
       updateActionBarVisibility();
       checkAppUpdates(true);
     } catch (e) {
@@ -3246,7 +3253,7 @@
     // actions
     $("startBtn").onclick = handleMainAction;
     $("stopBtn").onclick = stopJob;
-    $("queueSelectionBtn").onclick = queueCurrentSelection;
+    if ($("queueSelectionBtn")) $("queueSelectionBtn").onclick = queueCurrentSelection;
     $("queueHoldBtn").onclick = () => {
       const url = state.queueHold ? "/api/queue/resume" : "/api/queue/pause";
       api.post(url, {}).then(res => applyQueueResponse(res)).catch(e => toast("Queue update failed: " + e.message, "error"));
