@@ -54,12 +54,14 @@ android {
             keyPassword = signingProp("keyPassword")
             enableV1Signing = true
             enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

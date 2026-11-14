@@ -26,7 +26,6 @@ import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.system.exitProcess
 
 class AnimePaheService : Service() {
 
@@ -90,7 +89,12 @@ class AnimePaheService : Service() {
 
             val mainHandler = Handler(Looper.getMainLooper())
             mainHandler.post {
-                currentInstance?.get()?.stopForShutdown()
+                val svc = currentInstance?.get()
+                if (svc != null) {
+                    svc.stopForShutdown()
+                } else {
+                    appCtx.stopService(Intent(appCtx, AnimePaheService::class.java))
+                }
                 MainActivity.currentInstance?.get()?.let { activity ->
                     if (!activity.isFinishing && !activity.isDestroyed) {
                         activity.finishAndRemoveTask()
@@ -104,18 +108,9 @@ class AnimePaheService : Service() {
                 } catch (e: Throwable) {
                     Log.w(TAG, "Error stopping native engine: ${e.message}")
                 }
-                // Let stopSelf()/onDestroy() settle with ActivityManagerService before exiting
-                // so the OS does not treat shutdown as an unexpected process crash.
-                try {
-                    Thread.sleep(300)
-                } catch (_: InterruptedException) {}
-
                 nm?.cancel(NOTIFICATION_ID)
+                isShuttingDown.set(false)
                 onFinished?.invoke()
-                try {
-                    Thread.sleep(50)
-                } catch (_: InterruptedException) {}
-                exitProcess(0)
             }, "PaheFlow-Shutdown").start()
         }
     }
@@ -268,17 +263,13 @@ class AnimePaheService : Service() {
         serviceScope.launch {
             val app = AnimePaheApp.instance
             app.awaitAssetsReady()
-            try {
-                android.system.Os.setenv("ANIMEPAHE_APP_EXT_DOWNLOAD_DIR", app.getExternalDownloadDir().absolutePath, true)
-                android.system.Os.setenv("ANIMEPAHE_GUI_CACHE_DIR", app.getAppCacheDir().absolutePath, true)
-            } catch (e: Exception) {
-                Log.w(TAG, "Could not set native storage environment variables: ${e.message}")
-            }
 
             val port = NativeEngine.startServer(
                 preferredPort = 8765,
                 resDir = app.getResourceDir().absolutePath,
-                dataDir = app.getAppDataDir().absolutePath
+                dataDir = app.getAppDataDir().absolutePath,
+                extDownloadDir = app.getExternalDownloadDir().absolutePath,
+                cacheDir = app.getAppCacheDir().absolutePath
             )
             Log.i(TAG, "Native engine started on port $port")
 

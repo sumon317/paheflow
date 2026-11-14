@@ -16,6 +16,7 @@ static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
 static SERVER_TOKEN: OnceLock<Mutex<String>> = OnceLock::new();
 static START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static RUNNER: OnceLock<Mutex<Option<Arc<Runner>>>> = OnceLock::new();
+static SHUTDOWN_NOTIFY: OnceLock<Mutex<Option<Arc<tokio::sync::Notify>>>> = OnceLock::new();
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn get_runtime() -> &'static tokio::runtime::Runtime {
@@ -35,6 +36,8 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
     preferred_port: jint,
     res_dir: JString,
     data_dir: JString,
+    ext_download_dir: JString,
+    cache_dir: JString,
 ) -> jint {
     if RUNNING.load(Ordering::SeqCst) {
         return BOUND_PORT.load(Ordering::SeqCst) as jint;
@@ -57,12 +60,26 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
         Ok(s) => s.into(),
         Err(_) => return -1,
     };
+    let ext_download_dir_str: String = env
+        .get_string(&ext_download_dir)
+        .map(Into::into)
+        .unwrap_or_default();
+    let cache_dir_str: String = env
+        .get_string(&cache_dir)
+        .map(Into::into)
+        .unwrap_or_default();
 
     if !res_dir_str.is_empty() {
         std::env::set_var("ANIMEPAHE_GUI_RESOURCES", &res_dir_str);
     }
     if !data_dir_str.is_empty() {
         std::env::set_var("ANIMEPAHE_GUI_DATA_DIR", &data_dir_str);
+    }
+    if !ext_download_dir_str.is_empty() {
+        std::env::set_var("ANIMEPAHE_APP_EXT_DOWNLOAD_DIR", &ext_download_dir_str);
+    }
+    if !cache_dir_str.is_empty() {
+        std::env::set_var("ANIMEPAHE_GUI_CACHE_DIR", &cache_dir_str);
     }
 
     let target_port = if preferred_port > 0 {
@@ -124,6 +141,14 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
             token,
         });
 
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        {
+            let lock = SHUTDOWN_NOTIFY.get_or_init(|| Mutex::new(None));
+            if let Ok(mut guard) = lock.lock() {
+                *guard = Some(shutdown_notify.clone());
+            }
+        }
+
         let app = server::create_router(state);
         let _ = tx.send(Ok(actual_port));
 
@@ -131,10 +156,14 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
             "[NativeEngine] Server listening on http://127.0.0.1:{}",
             actual_port
         );
-        if let Err(e) = axum::serve(listener, app).await {
+        let serve_fut = axum::serve(listener, app).with_graceful_shutdown(async move {
+            shutdown_notify.notified().await;
+        });
+        if let Err(e) = serve_fut.await {
             eprintln!("[NativeEngine] Axum server error: {}", e);
         }
         RUNNING.store(false, Ordering::SeqCst);
+        BOUND_PORT.store(0, Ordering::SeqCst);
     });
 
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
@@ -220,6 +249,14 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_shutdownEngine(
 ) {
     RUNNING.store(false, Ordering::SeqCst);
     BOUND_PORT.store(0, Ordering::SeqCst);
+
+    if let Some(notify) = SHUTDOWN_NOTIFY
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|mut g| g.take())
+    {
+        notify.notify_waiters();
+    }
 
     let runner = RUNNER
         .get()

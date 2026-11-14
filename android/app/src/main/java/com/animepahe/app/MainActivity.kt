@@ -157,7 +157,7 @@ class MainActivity : AppCompatActivity() {
         settings.loadsImagesAutomatically = true
         settings.blockNetworkImage = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
@@ -313,15 +313,13 @@ class MainActivity : AppCompatActivity() {
             val port = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 val app = AnimePaheApp.instance
                 app.awaitAssetsReady()
-                try {
-                    android.system.Os.setenv("ANIMEPAHE_APP_EXT_DOWNLOAD_DIR", app.getExternalDownloadDir().absolutePath, true)
-                    android.system.Os.setenv("ANIMEPAHE_GUI_CACHE_DIR", app.getAppCacheDir().absolutePath, true)
-                } catch (_: Exception) {}
 
                 var p = NativeEngine.startServer(
                     preferredPort = 8765,
                     resDir = app.getResourceDir().absolutePath,
-                    dataDir = app.getAppDataDir().absolutePath
+                    dataDir = app.getAppDataDir().absolutePath,
+                    extDownloadDir = app.getExternalDownloadDir().absolutePath,
+                    cacheDir = app.getAppCacheDir().absolutePath
                 )
                 var attempts = 0
                 while (p <= 0 && attempts < 40) {
@@ -473,12 +471,6 @@ class MainActivity : AppCompatActivity() {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
             }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
-            }
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
-                permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
-            }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                 permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
@@ -556,10 +548,25 @@ class MainActivity : AppCompatActivity() {
                     destFile.delete()
                 }
 
+                if (!isTrustedUpdateUrl(apkUrl)) {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "Untrusted update URL rejected", Toast.LENGTH_LONG).show()
+                        webView.evaluateJavascript(
+                            "if (typeof window.onUpdateDownloadFailed === 'function') window.onUpdateDownloadFailed('Untrusted URL');",
+                            null
+                        )
+                    }
+                    return@launch
+                }
+
                 var currentUrl = apkUrl
                 var connection: java.net.HttpURLConnection? = null
                 var redirects = 0
                 while (redirects < 8) {
+                    if (!isTrustedUpdateUrl(currentUrl)) {
+                        connection = null
+                        break
+                    }
                     val urlObj = java.net.URL(currentUrl)
                     connection = urlObj.openConnection() as java.net.HttpURLConnection
                     connection.instanceFollowRedirects = false
@@ -739,25 +746,59 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun isTrustedUpdateUrl(rawUrl: String): Boolean {
+        val uri = Uri.parse(rawUrl)
+        if (!"https".equals(uri.scheme, ignoreCase = true)) return false
+        val host = uri.host?.lowercase(java.util.Locale.US) ?: return false
+        return when (host) {
+            "github.com" -> (uri.path ?: "").startsWith("/sumon317/paheflow/")
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+            "github-releases.githubusercontent.com" -> true
+            else -> false
+        }
+    }
+
+    @Suppress("DEPRECATION")
     private fun isApkSignedWithSameKey(apkFile: File): Boolean {
         return try {
-            val archiveInfo = packageManager.getPackageArchiveInfo(
-                apkFile.absolutePath,
-                PackageManager.GET_SIGNATURES
-            ) ?: return false
-            val installedInfo = packageManager.getPackageInfo(
-                packageName,
-                PackageManager.GET_SIGNATURES
-            )
-            val archiveCerts = archiveInfo.signatures
-                ?.map { it.toByteArray().sha256Hex() }
-                ?.toSet()
-                ?: return false
-            val installedCerts = installedInfo.signatures
-                ?.map { it.toByteArray().sha256Hex() }
-                ?.toSet()
-                ?: return false
-            archiveCerts == installedCerts
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val archiveInfo = packageManager.getPackageArchiveInfo(
+                    apkFile.absolutePath,
+                    PackageManager.GET_SIGNING_CERTIFICATES
+                ) ?: return false
+                val installedInfo = packageManager.getPackageInfo(
+                    packageName,
+                    PackageManager.GET_SIGNING_CERTIFICATES
+                )
+                val archiveCerts = archiveInfo.signingInfo?.apkContentsSigners
+                    ?.map { it.toByteArray().sha256Hex() }
+                    ?.toSet()
+                    ?: return false
+                val installedCerts = installedInfo.signingInfo?.apkContentsSigners
+                    ?.map { it.toByteArray().sha256Hex() }
+                    ?.toSet()
+                    ?: return false
+                archiveCerts.isNotEmpty() && archiveCerts == installedCerts
+            } else {
+                val archiveInfo = packageManager.getPackageArchiveInfo(
+                    apkFile.absolutePath,
+                    PackageManager.GET_SIGNATURES
+                ) ?: return false
+                val installedInfo = packageManager.getPackageInfo(
+                    packageName,
+                    PackageManager.GET_SIGNATURES
+                )
+                val archiveCerts = archiveInfo.signatures
+                    ?.map { it.toByteArray().sha256Hex() }
+                    ?.toSet()
+                    ?: return false
+                val installedCerts = installedInfo.signatures
+                    ?.map { it.toByteArray().sha256Hex() }
+                    ?.toSet()
+                    ?: return false
+                archiveCerts.isNotEmpty() && archiveCerts == installedCerts
+            }
         } catch (e: Exception) {
             false
         }

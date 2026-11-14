@@ -5,7 +5,13 @@ object NativeEngine {
         System.loadLibrary("animepahe_gui")
     }
 
-    external fun startServer(preferredPort: Int, resDir: String, dataDir: String): Int
+    external fun startServer(
+        preferredPort: Int,
+        resDir: String,
+        dataDir: String,
+        extDownloadDir: String,
+        cacheDir: String
+    ): Int
     external fun getServerPort(): Int
     external fun isServerRunning(): Boolean
     external fun getServerToken(): String
