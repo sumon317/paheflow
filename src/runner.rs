@@ -3590,7 +3590,7 @@ fn send_desktop_notification(summary: &str, body: &str, is_error: bool) {
     }
 }
 
-fn select_candidate_sources<'a>(
+pub(crate) fn select_candidate_sources<'a>(
     sources: &'a [PlaySource],
     resolution: &str,
     audio: &str,
@@ -3799,10 +3799,13 @@ mod tests {
     fn test_probe_dir_writable() {
         let temp = std::env::temp_dir().join(format!("paheflow_test_{}", fastrand::u32(..)));
         assert!(probe_dir_writable(&temp));
-        let _ = std::fs::remove_dir_all(&temp);
 
-        let non_writable = Path::new("/proc/sys/fs/probe_fail_test");
-        assert!(!probe_dir_writable(non_writable));
+        let blocker_file = temp.join("not_a_dir");
+        std::fs::write(&blocker_file, b"file").unwrap();
+        let non_writable = blocker_file.join("probe_fail_test");
+        assert!(!probe_dir_writable(&non_writable));
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /* ─────────────────── download queue ─────────────────── */

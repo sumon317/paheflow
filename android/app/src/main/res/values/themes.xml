@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <style name="Theme.AnimePahe" parent="Theme.Material3.Dark.NoActionBar">
         <item name="android:statusBarColor">#0b0a10</item>
         <item name="android:navigationBarColor">#0b0a10</item>
         <item name="android:windowBackground">#0b0a10</item>
+    </style>
+
+    <style name="Theme.AnimePahe.Player" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="p">shortEdges</item>
     </style>
 </resources>

@@ -26,10 +26,12 @@ use crate::client::HttpClient;
 use crate::config::{public_config, read_config, resource_dir, write_config, PublicConfig};
 use crate::library;
 use crate::runner::Runner;
+use crate::stream::{StreamManager, StreamProxyError, StreamResolveRequest};
 
 pub struct AppState {
     pub client: HttpClient,
     pub runner: Arc<Runner>,
+    pub stream_manager: Arc<StreamManager>,
     pub token: String,
 }
 
@@ -91,6 +93,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/sync-credentials", post(post_sync_credentials))
         .route("/api/auto-detect-cookie", post(post_auto_detect_cookie))
         .route("/api/open-cf-page", post(post_open_cf_page))
+        .route("/api/stream/resolve", post(post_stream_resolve))
+        .route("/api/stream/close", post(post_stream_close))
+        .route(
+            "/api/stream/hls/:id/playlist.m3u8",
+            get(get_stream_playlist),
+        )
+        .route("/api/stream/hls/:id/key/:idx", get(get_stream_key))
+        .route("/api/stream/hls/:id/map/:idx", get(get_stream_map))
+        .route("/api/stream/hls/:id/seg/:idx", get(get_stream_segment))
         .layer(extension_cors())
         .layer(middleware::from_fn(validate_host))
         .with_state(state)
@@ -2041,6 +2052,238 @@ async fn post_open_cf_page(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+async fn post_stream_resolve(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<StreamResolveRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_token(&headers, &state) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Invalid token" })),
+        ));
+    }
+
+    let cfg = read_config();
+    match state
+        .stream_manager
+        .resolve_episode(&state.client, &cfg, payload)
+        .await
+    {
+        Ok(resolved) => Ok(Json(serde_json::to_value(&resolved).unwrap_or_default())),
+        Err(err) => {
+            let status = if err.cf_challenge {
+                StatusCode::FORBIDDEN
+            } else if err.not_found {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            Err((
+                status,
+                Json(serde_json::json!({
+                    "error": err.message,
+                    "cfChallenge": err.cf_challenge,
+                    "notFound": err.not_found,
+                })),
+            ))
+        }
+    }
+}
+
+async fn post_stream_close(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_token(&headers, &state) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let id = payload
+        .get("streamId")
+        .or_else(|| payload.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let closed = if id.is_empty() {
+        false
+    } else {
+        state.stream_manager.close_session(id).await
+    };
+    Ok(Json(serde_json::json!({ "ok": true, "closed": closed })))
+}
+
+fn stream_proxy_error_response(err: StreamProxyError) -> Response<Body> {
+    match err {
+        StreamProxyError::NotFound(msg) => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "error": msg }).to_string(),
+        )
+            .into_response(),
+        StreamProxyError::Upstream { status, message } => {
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            (
+                code,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "error": message }).to_string(),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn parse_stream_index(raw: &str, suffix: &str) -> Option<usize> {
+    let trimmed = raw.strip_suffix(suffix).unwrap_or(raw);
+    trimmed.parse::<usize>().ok()
+}
+
+async fn get_stream_playlist(
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Response<Body> {
+    if !check_token_any(&headers, &query, &state) {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid token"}"#,
+        )
+            .into_response();
+    }
+
+    match state
+        .stream_manager
+        .render_playlist(&id, &state.token)
+        .await
+    {
+        Some(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "application/vnd.apple.mpegurl; charset=utf-8",
+            )
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(body))
+            .unwrap(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Stream session not found or expired"}"#,
+        )
+            .into_response(),
+    }
+}
+
+async fn get_stream_key(
+    headers: HeaderMap,
+    axum::extract::Path((id, raw_idx)): axum::extract::Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Response<Body> {
+    if !check_token_any(&headers, &query, &state) {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid token"}"#,
+        )
+            .into_response();
+    }
+
+    let Some(idx) = parse_stream_index(&raw_idx, ".key") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid key index"}"#,
+        )
+            .into_response();
+    };
+
+    match state.stream_manager.fetch_key(&id, idx).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+            .header(header::CACHE_CONTROL, "private, max-age=3600")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(err) => stream_proxy_error_response(err),
+    }
+}
+
+async fn get_stream_map(
+    headers: HeaderMap,
+    axum::extract::Path((id, raw_idx)): axum::extract::Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Response<Body> {
+    if !check_token_any(&headers, &query, &state) {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid token"}"#,
+        )
+            .into_response();
+    }
+
+    let Some(idx) = parse_stream_index(&raw_idx, ".mp4") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid map index"}"#,
+        )
+            .into_response();
+    };
+
+    match state.stream_manager.fetch_map(&id, idx).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "video/mp4")
+            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+            .header(header::CACHE_CONTROL, "private, max-age=600")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(err) => stream_proxy_error_response(err),
+    }
+}
+
+async fn get_stream_segment(
+    headers: HeaderMap,
+    axum::extract::Path((id, raw_idx)): axum::extract::Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> Response<Body> {
+    if !check_token_any(&headers, &query, &state) {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid token"}"#,
+        )
+            .into_response();
+    }
+
+    let Some(idx) = parse_stream_index(&raw_idx, ".ts") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"Invalid segment index"}"#,
+        )
+            .into_response();
+    };
+
+    match state.stream_manager.fetch_segment(&id, idx).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "video/mp2t")
+            .header(header::CONTENT_LENGTH, bytes.len().to_string())
+            .header(header::CACHE_CONTROL, "private, max-age=600")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(err) => stream_proxy_error_response(err),
+    }
+}
+
 async fn get_events(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
@@ -2112,6 +2355,7 @@ pub async fn serve_on_listener(
     let state = Arc::new(AppState {
         client,
         runner,
+        stream_manager: Arc::new(StreamManager::new()),
         token,
     });
 
@@ -2262,5 +2506,16 @@ mod tests {
                 || host.ends_with(".kwik.si");
             assert!(!ok, "Expected host {} to be rejected", host);
         }
+    }
+
+    #[test]
+    fn parse_stream_index_accepts_plain_and_suffixed_indices() {
+        assert_eq!(parse_stream_index("0.ts", ".ts"), Some(0));
+        assert_eq!(parse_stream_index("42.ts", ".ts"), Some(42));
+        assert_eq!(parse_stream_index("7", ".ts"), Some(7));
+        assert_eq!(parse_stream_index("0.mp4", ".mp4"), Some(0));
+        assert_eq!(parse_stream_index("3.key", ".key"), Some(3));
+        assert_eq!(parse_stream_index("abc.ts", ".ts"), None);
+        assert_eq!(parse_stream_index("-1.ts", ".ts"), None);
     }
 }

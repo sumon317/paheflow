@@ -291,6 +291,7 @@ pub extern "system" fn Java_com_animepahe_app_NativeEngine_startServer(
         let state = Arc::new(server::AppState {
             client,
             runner,
+            stream_manager: Arc::new(crate::stream::StreamManager::new()),
             token,
         });
 

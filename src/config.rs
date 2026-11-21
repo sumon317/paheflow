@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_FRAGMENTS: usize = 8;
+pub const DEFAULT_FRAGMENTS: usize = 16;
 pub const MIN_FRAGMENTS: usize = 1;
 pub const MAX_FRAGMENTS: usize = 64;
 

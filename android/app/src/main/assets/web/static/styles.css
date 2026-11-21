@@ -1901,3 +1901,190 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); }
   font-size: 12px;
   line-height: 1.6;
 }
+
+/* ─────────────────────────  DIRECT STREAMING UI  ───────────────────────── */
+.ep-play-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, 0.16));
+  background: var(--accent-soft, rgba(124, 77, 255, 0.16));
+  color: var(--accent, #a78bfa);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.12s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.ep-play-btn:hover {
+  background: var(--accent, #7c4dff);
+  border-color: var(--accent, #7c4dff);
+  color: #fff;
+  transform: scale(1.06);
+}
+.ep-play-btn:active {
+  transform: scale(0.95);
+}
+.ep-play-btn svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+  margin-left: 1px;
+}
+
+.result-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.watch-btn {
+  border-color: var(--accent, #7c4dff);
+  color: var(--accent, #a78bfa);
+  background: var(--accent-soft, rgba(124, 77, 255, 0.14));
+  font-weight: 600;
+}
+.watch-btn:hover {
+  background: var(--accent, #7c4dff);
+  color: #fff;
+}
+
+.stream-modal {
+  padding: 16px;
+  z-index: 1200;
+}
+.stream-player-shell {
+  width: min(1040px, 100%);
+  max-height: 94vh;
+  background: var(--panel, #141218);
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, 0.12));
+  border-radius: var(--radius, 14px);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.65);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.stream-player-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line-soft, rgba(255, 255, 255, 0.08));
+  flex-wrap: wrap;
+}
+.stream-player-title-wrap {
+  min-width: 0;
+  flex: 1 1 220px;
+}
+.stream-player-title-wrap h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text, #f0eef5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stream-player-meta {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-faint, #9893aa);
+}
+.stream-player-head-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.stream-select {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line-strong, rgba(255, 255, 255, 0.14));
+  background: var(--panel-2, #1e1c24);
+  color: var(--text, #f0eef5);
+  font-size: 12px;
+  cursor: pointer;
+}
+.stream-video-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 70vh;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stream-video {
+  width: 100%;
+  height: 100%;
+  background: #000;
+  outline: none;
+}
+.stream-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(11, 10, 16, 0.86);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 20px;
+  text-align: center;
+  color: #f0eef5;
+  font-size: 13.5px;
+}
+.stream-error-overlay p {
+  margin: 0;
+  max-width: 480px;
+  color: #c9c4d6;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.stream-error-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.stream-player-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line-soft, rgba(255, 255, 255, 0.08));
+  flex-wrap: wrap;
+}
+.stream-ep-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stream-status-hint {
+  font-size: 12px;
+  color: var(--text-faint, #9893aa);
+}
+
+@media (max-width: 900px) {
+  .ep-play-btn {
+    width: 26px;
+    height: 26px;
+  }
+  .stream-modal {
+    padding: 8px;
+  }
+  .stream-player-head,
+  .stream-player-foot {
+    padding: 10px 12px;
+  }
+}
+

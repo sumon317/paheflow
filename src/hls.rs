@@ -128,12 +128,15 @@ impl HlsDownloader {
         };
         let client = reqwest::Client::builder()
             .dns_resolver(Arc::new(crate::dns::SmartDnsResolver::new()))
+            .http1_only()
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(64)
             .timeout(Duration::from_secs(120))
             .read_timeout(Duration::from_secs(25))
             .connect_timeout(Duration::from_secs(15))
             .user_agent(ua)
             .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { client }
@@ -539,6 +542,10 @@ impl HlsDownloader {
         let total_bytes_acc = Arc::new(AtomicU64::new(preexisting_bytes));
         let session_bytes_acc = Arc::new(AtomicU64::new(0));
         let start_time = Instant::now();
+        let speed_window: Arc<std::sync::Mutex<std::collections::VecDeque<(Instant, u64)>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([(
+                start_time, 0u64,
+            )])));
 
         let mut join_set = JoinSet::new();
 
@@ -552,6 +559,7 @@ impl HlsDownloader {
             let completed = completed_segments.clone();
             let total_acc = total_bytes_acc.clone();
             let session_acc = session_bytes_acc.clone();
+            let speed_win = speed_window.clone();
             let stop = stop_signal.clone();
             let pause = pause_signal.clone();
             let p_notify = pause_notify.clone();
@@ -681,24 +689,45 @@ impl HlsDownloader {
                 })?;
 
                 let byte_len = payload.len() as u64;
-                let tmp_seg = seg_path.with_extension("ts.tmp");
-                fs::write(&tmp_seg, &payload)
-                    .map_err(|e| format!("Writing fragment {} failed: {}", idx, e))?;
-                if fs::rename(&tmp_seg, &seg_path).is_err() {
-                    if let Err(e) = fs::copy(&tmp_seg, &seg_path) {
+                let seg_path_write = seg_path.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let tmp_seg = seg_path_write.with_extension("ts.tmp");
+                    fs::write(&tmp_seg, &payload)
+                        .map_err(|e| format!("Writing fragment {} failed: {}", idx, e))?;
+                    if fs::rename(&tmp_seg, &seg_path_write).is_err() {
+                        if let Err(e) = fs::copy(&tmp_seg, &seg_path_write) {
+                            let _ = fs::remove_file(&tmp_seg);
+                            return Err(format!("Saving fragment {} failed: {}", idx, e));
+                        }
                         let _ = fs::remove_file(&tmp_seg);
-                        return Err(format!("Saving fragment {} failed: {}", idx, e));
                     }
-                    let _ = fs::remove_file(&tmp_seg);
-                }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| format!("Fragment {} write task failed: {}", idx, e))??;
+
+                drop(_permit);
 
                 let total_bytes = total_acc.fetch_add(byte_len, Ordering::Relaxed) + byte_len;
                 let session_bytes = session_acc.fetch_add(byte_len, Ordering::Relaxed) + byte_len;
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
 
-                // Update progress metrics using session bytes for accurate speed/ETA
-                let elapsed_secs = start_time.elapsed().as_secs_f64().max(0.1);
-                let speed_bps = session_bytes as f64 / elapsed_secs;
+                // Update progress metrics using a 4-second rolling window for responsive live speed
+                let now = Instant::now();
+                let speed_bps = {
+                    let mut win = speed_win.lock().unwrap_or_else(|e| e.into_inner());
+                    win.push_back((now, session_bytes));
+                    while win.len() > 2
+                        && now.duration_since(win[1].0) >= Duration::from_secs(4)
+                    {
+                        win.pop_front();
+                    }
+                    let (anchor_time, anchor_bytes) =
+                        win.front().copied().unwrap_or((start_time, 0));
+                    let elapsed = now.duration_since(anchor_time).as_secs_f64().max(0.1);
+                    let delta = session_bytes.saturating_sub(anchor_bytes);
+                    delta as f64 / elapsed
+                };
                 let pct = (done as f64 / total_segments as f64) * 100.0;
 
                 let avg_seg_bytes = if done > 0 {
@@ -926,8 +955,8 @@ fn assemble_segments(
             temp_ts, e
         )
     })?;
-    let mut writer = BufWriter::with_capacity(128 * 1024, out);
-    let mut buf = [0u8; 64 * 1024];
+    let mut writer = BufWriter::with_capacity(512 * 1024, out);
+    let mut buf = vec![0u8; 256 * 1024];
 
     for idx in 0..total_segments {
         if stop_signal.load(Ordering::Relaxed) {
@@ -1451,6 +1480,9 @@ seg2.ts
 
         let downloader = HlsDownloader::new(None);
         let pause_signal = Arc::new(AtomicBool::new(false));
+        let test_cache_dir =
+            std::env::temp_dir().join(format!("paheflow_frag_cache_{}", fastrand::u64(..)));
+        std::env::set_var("ANIMEPAHE_GUI_CACHE_DIR", &test_cache_dir);
         let dest = std::env::temp_dir().join(format!("paheflow_resume_{}.mp4", fastrand::u64(..)));
         let cache_key = format!("test-pause-cache-{}", fastrand::u64(..));
         let m3u8_url = format!("http://127.0.0.1:{}/stream/test-pause/uwu.m3u8", port);
@@ -1497,6 +1529,8 @@ seg2.ts
         );
         assert!(dest.exists());
         let _ = fs::remove_file(&dest);
+        std::env::remove_var("ANIMEPAHE_GUI_CACHE_DIR");
+        let _ = fs::remove_dir_all(&test_cache_dir);
     }
 
     #[tokio::test]

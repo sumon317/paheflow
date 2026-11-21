@@ -14,7 +14,7 @@
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   };
   // Keep concurrency within the range the native engine accepts.
-  const clampFragments = (value, fallback = 8) => {
+  const clampFragments = (value, fallback = 16) => {
     const parsed = parseInt(value, 10);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.min(64, Math.max(1, parsed));
@@ -49,7 +49,7 @@
     return {
       ua: config.ua || "",
       // The Rust API uses camelCase; older Python responses used snake_case.
-      concurrent_fragments: config.concurrentFragments ?? config.concurrent_fragments ?? 8,
+      concurrent_fragments: config.concurrentFragments ?? config.concurrent_fragments ?? 16,
       downloadDir: config.downloadDir || config.download_dir || "",
       defaultDownloadDir:
         config.defaultDownloadDir || config.default_download_dir || config.downloadDir || config.download_dir || "",
@@ -102,7 +102,7 @@
     recentMetaInFlight: {},
     pendingSelectEpisode: null,
     allKnownEpisodes: {},
-    config: { ua: "", concurrent_fragments: 8, cfConfigured: false, cfLength: 0 },
+    config: { ua: "", concurrent_fragments: 16, cfConfigured: false, cfLength: 0 },
     deps: [],
     job: null,
     queue: [],
@@ -1047,6 +1047,7 @@
           </div>
         </div>
         <div class="result-actions">
+          <button class="btn btn-ghost btn-sm watch-btn" title="Stream Episode ${escapeHtml(epNum)} natively">▶ Watch</button>
           <button class="btn btn-ghost btn-sm select-btn" title="Open Episode ${escapeHtml(epNum)}">Open</button>
         </div>
       </div>
@@ -1425,7 +1426,7 @@
       const sizeTag = getEpisodeSizeBadge(e);
       const isDubTag = audioTag.includes("DUB");
       return `
-      <div class="ep ${checked ? "is-checked" : ""}" data-ep="${escapeHtml(id)}" title="Episode ${escapeHtml(id)}${dur ? ` · ${dur}` : ""}${sizeTag ? ` · ${sizeTag}` : ""}">
+      <div class="ep ${checked ? "is-checked" : ""}" data-ep="${escapeHtml(id)}" data-ep-session="${escapeHtml(e.session || "")}" title="Episode ${escapeHtml(id)}${dur ? ` · ${dur}` : ""}${sizeTag ? ` · ${sizeTag}` : ""}">
         <input type="checkbox" ${checked ? "checked" : ""} style="pointer-events: none;" />
         <span class="ep-num">E${escapeHtml(id)}</span>
         <div class="ep-info">
@@ -1435,6 +1436,7 @@
           </div>
           ${dur ? `<span class="ep-dur">${dur}</span>` : ""}
         </div>
+        <button type="button" class="ep-play-btn" data-stream-ep="${escapeHtml(id)}" data-stream-session="${escapeHtml(e.session || "")}" title="Stream Episode ${escapeHtml(id)} natively" aria-label="Stream Episode ${escapeHtml(id)}"><svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="6,4 20,12 6,20"/></svg></button>
       </div>`;
     }).join("");
     updateEpSelectionUI();
@@ -3109,6 +3111,16 @@
         startBtn.textContent = `Download (${count})`;
       }
     }
+
+    const watchBtn = $("watchBtn");
+    if (watchBtn) {
+      const targetEp = getActionBarStreamTarget();
+      watchBtn.disabled = !targetEp;
+      watchBtn.textContent = targetEp ? `▶ Watch E${targetEp.episode}` : "▶ Watch";
+      watchBtn.title = targetEp
+        ? `Stream Episode ${targetEp.episode} natively in app`
+        : "Select an anime episode to stream";
+    }
   }
 
   function handleState(msg) {
@@ -3459,7 +3471,14 @@
       return "handled";
     }
 
-    // 2. Close any open modals first
+    // 2. Close stream player modal cleanly if open
+    const streamModal = $("streamPlayerModal");
+    if (streamModal && !streamModal.classList.contains("hidden")) {
+      closeStreamPlayer();
+      return "handled";
+    }
+
+    // 2b. Close any other open modals
     const modals = document.querySelectorAll(".modal-overlay:not(.hidden), .dialog-overlay:not(.hidden)");
     if (modals.length > 0) {
       modals.forEach(m => m.classList.add("hidden"));
@@ -3483,6 +3502,520 @@
   window.handleBackPress = handleBackPress;
 
   /* ─────────────────────────────────────────────────────────────────
+   *  direct native streaming (Android Media3 + Desktop in-app HLS)
+   * ───────────────────────────────────────────────────────────────── */
+
+  const STREAM_PROGRESS_KEY = "paheflow_stream_progress_v1";
+  const streamState = {
+    open: false,
+    resolving: false,
+    reqSeq: 0,
+    streamId: "",
+    playlistUrl: "",
+    slug: "",
+    title: "",
+    episode: "",
+    session: "",
+    resolution: "",
+    audio: "",
+    variants: [],
+    episodes: [],
+    hls: null,
+    hlsScriptPromise: null,
+  };
+
+  function getActionBarStreamTarget() {
+    if (!state.selectedSlug) return null;
+    if (state.episodesSelected && state.episodesSelected.length > 0) {
+      const epNum = String(state.episodesSelected[0]);
+      const meta = state.allKnownEpisodes[epNum] || (state.episodes || []).find(e => epId(e.episode) === epNum);
+      return { episode: epNum, session: meta?.session || "" };
+    }
+    const visible = getDisplayEpisodes();
+    if (visible && visible.length > 0) {
+      const first = visible[0];
+      return { episode: epId(first.episode), session: first.session || "" };
+    }
+    return null;
+  }
+
+  function buildSurroundingEpisodes(targetEp) {
+    const raw = getDisplayEpisodes();
+    const list = (raw && raw.length ? raw : (state.episodes || [])).map(e => ({
+      episode: epId(e.episode),
+      session: e.session || "",
+      audio: e.audio || "",
+    }));
+    if (list.length <= 160) return list;
+    const idx = list.findIndex(e => String(e.episode) === String(targetEp));
+    const center = idx >= 0 ? idx : 0;
+    const start = Math.max(0, center - 80);
+    const end = Math.min(list.length, start + 160);
+    return list.slice(start, end);
+  }
+
+  function normalizeStreamAudioPref(raw) {
+    const v = String(raw || "").trim().toLowerCase();
+    if (v === "sub") return "jpn";
+    if (v === "dub") return "eng";
+    return v;
+  }
+
+  function formatStreamAudioLabel(audio) {
+    const v = String(audio || "").trim().toLowerCase();
+    if (v === "jpn" || v === "sub") return "SUB";
+    if (v === "eng" || v === "dub") return "DUB";
+    return v ? v.toUpperCase() : "";
+  }
+
+  function getSavedStreamProgress(slug, episode) {
+    try {
+      const map = JSON.parse(localStorage.getItem(STREAM_PROGRESS_KEY) || "{}");
+      const val = Number(map[`${slug}__${episode}`] || 0);
+      return Number.isFinite(val) && val > 5 ? val : 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function saveStreamProgress(slug, episode, currentSecs, durationSecs) {
+    if (!slug || !episode) return;
+    try {
+      const map = JSON.parse(localStorage.getItem(STREAM_PROGRESS_KEY) || "{}");
+      const key = `${slug}__${episode}`;
+      if (Number.isFinite(durationSecs) && durationSecs > 0 && currentSecs >= durationSecs - 15) {
+        delete map[key];
+      } else if (Number.isFinite(currentSecs) && currentSecs > 5) {
+        map[key] = Math.floor(currentSecs);
+      }
+      const keys = Object.keys(map);
+      if (keys.length > 200) {
+        delete map[keys[0]];
+      }
+      localStorage.setItem(STREAM_PROGRESS_KEY, JSON.stringify(map));
+    } catch (_) { /* ignore storage quota issues */ }
+  }
+
+  function loadHlsJsLibrary() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (streamState.hlsScriptPromise) return streamState.hlsScriptPromise;
+    streamState.hlsScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js";
+      script.async = true;
+      script.onload = () => {
+        if (window.Hls) resolve(window.Hls);
+        else reject(new Error("hls.js loaded without global Hls export"));
+      };
+      script.onerror = () => {
+        streamState.hlsScriptPromise = null;
+        reject(new Error("Could not load HLS playback library (offline?)"));
+      };
+      document.head.appendChild(script);
+    });
+    return streamState.hlsScriptPromise;
+  }
+
+  function releaseActiveWebStreamSession() {
+    if (streamState.hls) {
+      try { streamState.hls.destroy(); } catch (_) {}
+      streamState.hls = null;
+    }
+    const prevId = streamState.streamId;
+    streamState.streamId = "";
+    streamState.playlistUrl = "";
+    if (prevId) {
+      api.post("/api/stream/close", { streamId: prevId }).catch(() => {});
+    }
+  }
+
+  function getAbsoluteStreamUrl() {
+    if (!streamState.playlistUrl) return "";
+    const sep = streamState.playlistUrl.includes("?") ? "&" : "?";
+    return `${window.location.origin}${streamState.playlistUrl}${sep}token=${encodeURIComponent(token())}`;
+  }
+
+  function setStreamOverlayState(mode, text = "", cfChallenge = false) {
+    const loading = $("streamLoadingOverlay");
+    const err = $("streamErrorOverlay");
+    const cfBtn = $("streamSolveCfBtn");
+    if (mode === "loading") {
+      if ($("streamLoadingText")) $("streamLoadingText").textContent = text || "Resolving stream…";
+      loading?.classList.remove("hidden");
+      err?.classList.add("hidden");
+    } else if (mode === "error") {
+      if ($("streamErrorText")) $("streamErrorText").textContent = text || "Unable to play stream.";
+      loading?.classList.add("hidden");
+      err?.classList.remove("hidden");
+      if (cfBtn) cfBtn.classList.toggle("hidden", !cfChallenge);
+    } else {
+      loading?.classList.add("hidden");
+      err?.classList.add("hidden");
+    }
+  }
+
+  function updateWebStreamHeaderAndNav() {
+    if ($("streamPlayerTitle")) $("streamPlayerTitle").textContent = streamState.title || streamState.slug || "PaheFlow Player";
+    const metaParts = [];
+    if (streamState.episode) metaParts.push(`Episode ${streamState.episode}`);
+    if (streamState.resolution) metaParts.push(`${streamState.resolution}p`);
+    const audioLabel = formatStreamAudioLabel(streamState.audio);
+    if (audioLabel) metaParts.push(audioLabel);
+    if ($("streamPlayerMeta")) $("streamPlayerMeta").textContent = metaParts.join(" · ") || "Resolving…";
+
+    const select = $("streamQualitySelect");
+    if (select) {
+      if (streamState.variants.length) {
+        select.innerHTML = streamState.variants.map((v, idx) => {
+          const al = formatStreamAudioLabel(v.audio);
+          const sz = v.filesize ? ` (${v.filesize})` : "";
+          const av1 = v.av1 ? " [AV1]" : "";
+          return `<option value="${idx}" ${v.selected ? "selected" : ""}>${escapeHtml(v.resolution)}p${al ? ` · ${escapeHtml(al)}` : ""}${escapeHtml(sz)}${av1}</option>`;
+        }).join("");
+        select.disabled = false;
+      } else {
+        select.innerHTML = `<option value="">Auto</option>`;
+        select.disabled = true;
+      }
+    }
+
+    const idx = streamState.episodes.findIndex(e => String(e.episode) === String(streamState.episode));
+    if ($("streamPrevEpBtn")) $("streamPrevEpBtn").disabled = !(idx > 0);
+    if ($("streamNextEpBtn")) $("streamNextEpBtn").disabled = !(idx >= 0 && idx < streamState.episodes.length - 1);
+  }
+
+  function closeStreamPlayer() {
+    const video = $("streamVideo");
+    if (video) {
+      saveStreamProgress(streamState.slug, streamState.episode, video.currentTime, video.duration);
+      try {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      } catch (_) {}
+    }
+    streamState.reqSeq++;
+    streamState.open = false;
+    streamState.resolving = false;
+    releaseActiveWebStreamSession();
+    $("streamPlayerModal")?.classList.add("hidden");
+  }
+
+  async function resolveAndPlayInWebModal(preserveSecs = null) {
+    const seq = ++streamState.reqSeq;
+    streamState.resolving = true;
+    releaseActiveWebStreamSession();
+
+    const video = $("streamVideo");
+    if (video) {
+      try { video.pause(); } catch (_) {}
+    }
+
+    updateWebStreamHeaderAndNav();
+    setStreamOverlayState("loading", `Resolving Episode ${streamState.episode} from AnimePahe…`);
+
+    try {
+      const payload = {
+        slug: streamState.slug,
+        title: streamState.title,
+        episode: String(streamState.episode),
+      };
+      if (streamState.session) payload.session = streamState.session;
+      if (streamState.resolution) payload.resolution = streamState.resolution;
+      if (streamState.audio) payload.audio = streamState.audio;
+
+      const res = await fetch("/api/stream/resolve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-App-Token": token() },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (seq !== streamState.reqSeq || !streamState.open) {
+        if (data?.streamId) api.post("/api/stream/close", { streamId: data.streamId }).catch(() => {});
+        return;
+      }
+      if (!res.ok || !data.ok) {
+        const msg = data.error || `Stream resolve failed (HTTP ${res.status})`;
+        const cf = Boolean(data.cfChallenge) || isCloudflareError(msg);
+        if (cf) noteApiError(msg);
+        setStreamOverlayState("error", msg, cf);
+        streamState.resolving = false;
+        return;
+      }
+
+      markConnectionHealthy();
+      streamState.streamId = data.streamId || "";
+      streamState.playlistUrl = data.playlistUrl || "";
+      streamState.slug = data.slug || streamState.slug;
+      streamState.title = data.title || streamState.title;
+      streamState.session = data.session || streamState.session;
+      streamState.resolution = data.resolution || streamState.resolution;
+      streamState.audio = data.audio || streamState.audio;
+      streamState.variants = Array.isArray(data.variants) ? data.variants : [];
+      updateWebStreamHeaderAndNav();
+
+      const hintParts = [];
+      if (data.resolution) hintParts.push(`${data.resolution}p`);
+      const al = formatStreamAudioLabel(data.audio);
+      if (al) hintParts.push(al);
+      if (data.filesize) hintParts.push(data.filesize);
+      if (data.segmentCount) hintParts.push(`${data.segmentCount} segments`);
+      if ($("streamStatusHint")) $("streamStatusHint").textContent = hintParts.join(" · ") || "Direct local HLS stream";
+
+      const fullUrl = getAbsoluteStreamUrl();
+      const seekTarget = preserveSecs !== null
+        ? preserveSecs
+        : getSavedStreamProgress(streamState.slug, streamState.episode);
+
+      await attachHlsToVideoElement(video, fullUrl, seekTarget, seq);
+      streamState.resolving = false;
+    } catch (err) {
+      if (seq !== streamState.reqSeq || !streamState.open) return;
+      const msg = err?.message || "Failed to resolve stream";
+      const cf = isCloudflareError(msg);
+      if (cf) noteApiError(msg);
+      setStreamOverlayState("error", msg, cf);
+      streamState.resolving = false;
+    }
+  }
+
+  async function attachHlsToVideoElement(video, fullUrl, seekTargetSecs, seq) {
+    if (!video || !fullUrl) {
+      setStreamOverlayState("error", "Video player is unavailable.");
+      return;
+    }
+    const speed = parseFloat($("streamSpeedSelect")?.value || "1") || 1;
+    video.playbackRate = speed;
+
+    const applySeekAndPlay = () => {
+      if (seq !== streamState.reqSeq || !streamState.open) return;
+      if (seekTargetSecs > 0 && Number.isFinite(seekTargetSecs)) {
+        try { video.currentTime = seekTargetSecs; } catch (_) {}
+      }
+      video.playbackRate = parseFloat($("streamSpeedSelect")?.value || "1") || 1;
+      setStreamOverlayState("playing");
+      video.play().catch(() => {});
+    };
+
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = fullUrl;
+      video.addEventListener("loadedmetadata", applySeekAndPlay, { once: true });
+      video.load();
+      return;
+    }
+
+    setStreamOverlayState("loading", "Initializing HLS player…");
+    let HlsCtor;
+    try {
+      HlsCtor = await loadHlsJsLibrary();
+    } catch (e) {
+      if (seq !== streamState.reqSeq || !streamState.open) return;
+      setStreamOverlayState(
+        "error",
+        `${e.message}. You can still click "Copy HLS URL" and play it directly in MPV or VLC.`
+      );
+      return;
+    }
+
+    if (seq !== streamState.reqSeq || !streamState.open) return;
+    if (!HlsCtor.isSupported()) {
+      setStreamOverlayState(
+        "error",
+        "This browser does not support MediaSource HLS playback. Click \"Copy HLS URL\" to open it in MPV or VLC."
+      );
+      return;
+    }
+
+    const hls = new HlsCtor({
+      enableWorker: true,
+      lowLatencyMode: false,
+      maxBufferLength: 60,
+      maxMaxBufferLength: 120,
+      startPosition: seekTargetSecs > 0 ? seekTargetSecs : -1,
+    });
+    streamState.hls = hls;
+    hls.attachMedia(video);
+    hls.on(HlsCtor.Events.MEDIA_ATTACHED, () => {
+      if (seq !== streamState.reqSeq) return;
+      hls.loadSource(fullUrl);
+    });
+    hls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
+      applySeekAndPlay();
+    });
+    hls.on(HlsCtor.Events.ERROR, (_evt, data) => {
+      if (seq !== streamState.reqSeq || !data?.fatal) return;
+      if (data.type === HlsCtor.ErrorTypes.NETWORK_ERROR) {
+        setStreamOverlayState("error", `Network error while streaming (${data.details || "unknown"}). Click Retry to refresh the stream.`);
+      } else if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+      } else {
+        setStreamOverlayState("error", `Stream playback failed (${data.details || "unknown"}).`);
+      }
+    });
+  }
+
+  function openEpisodeStream(opts) {
+    const slug = (opts?.slug || state.selectedSlug || "").trim();
+    const episode = String(opts?.episode || "").trim();
+    if (!slug || !episode) {
+      toast("Select an episode to stream", "error");
+      return;
+    }
+    const title = (opts?.title || state.selectedTitle || slug).trim();
+    const epMeta = state.allKnownEpisodes[episode] || (state.episodes || []).find(e => epId(e.episode) === episode);
+    const session = (opts?.session || epMeta?.session || "").trim();
+    const resolution = opts?.resolution !== undefined
+      ? String(opts.resolution || "").trim()
+      : ($("optResolution")?.value || "").trim();
+    const audio = opts?.audio !== undefined
+      ? normalizeStreamAudioPref(opts.audio)
+      : normalizeStreamAudioPref($("optAudio")?.value || state.audioFilter || "");
+    const episodes = Array.isArray(opts?.episodes)
+      ? opts.episodes
+      : (slug === state.selectedSlug ? buildSurroundingEpisodes(episode) : [{ episode, session, audio }]);
+
+    // Android native Media3 ExoPlayer path
+    if (window.AndroidBridge && typeof window.AndroidBridge.openStreamPlayer === "function") {
+      window.AndroidBridge.openStreamPlayer(JSON.stringify({
+        slug,
+        title,
+        episode,
+        session,
+        resolution,
+        audio,
+        episodes,
+      }));
+      return;
+    }
+
+    // Desktop / Web in-app HLS player modal
+    streamState.open = true;
+    streamState.slug = slug;
+    streamState.title = title;
+    streamState.episode = episode;
+    streamState.session = session;
+    streamState.resolution = resolution;
+    streamState.audio = audio;
+    streamState.variants = [];
+    streamState.episodes = episodes;
+
+    $("streamPlayerModal")?.classList.remove("hidden");
+    resolveAndPlayInWebModal(null);
+  }
+
+  function switchWebStreamEpisode(offset) {
+    const idx = streamState.episodes.findIndex(e => String(e.episode) === String(streamState.episode));
+    if (idx < 0) return;
+    const next = streamState.episodes[idx + offset];
+    if (!next) return;
+    const video = $("streamVideo");
+    if (video) {
+      saveStreamProgress(streamState.slug, streamState.episode, video.currentTime, video.duration);
+    }
+    streamState.episode = String(next.episode);
+    streamState.session = next.session || "";
+    resolveAndPlayInWebModal(null);
+  }
+
+  function bindStreamPlayer() {
+    const modal = $("streamPlayerModal");
+    const video = $("streamVideo");
+    if (!modal || !video) return;
+
+    $("streamCloseBtn")?.addEventListener("click", closeStreamPlayer);
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) closeStreamPlayer();
+    });
+
+    $("streamRetryBtn")?.addEventListener("click", () => {
+      const pos = Number.isFinite(video.currentTime) && video.currentTime > 0 ? video.currentTime : null;
+      resolveAndPlayInWebModal(pos);
+    });
+
+    $("streamSolveCfBtn")?.addEventListener("click", () => {
+      if (typeof window.openCfSolverModal === "function") {
+        window.openCfSolverModal();
+      } else {
+        openCfSolverModal();
+      }
+    });
+
+    const copyHandler = () => {
+      const url = getAbsoluteStreamUrl();
+      if (!url) {
+        toast("No active stream URL yet", "error");
+        return;
+      }
+      copyToClip(url, "Local HLS stream URL copied");
+    };
+    $("streamCopyUrlBtn")?.addEventListener("click", copyHandler);
+    $("streamCopyUrlErrBtn")?.addEventListener("click", copyHandler);
+
+    $("streamQualitySelect")?.addEventListener("change", (e) => {
+      const picked = streamState.variants[Number(e.target.value)];
+      if (!picked) return;
+      streamState.resolution = picked.resolution || "";
+      streamState.audio = picked.audio || "";
+      const pos = Number.isFinite(video.currentTime) && video.currentTime > 0 ? video.currentTime : 0;
+      resolveAndPlayInWebModal(pos);
+    });
+
+    $("streamSpeedSelect")?.addEventListener("change", (e) => {
+      const speed = parseFloat(e.target.value) || 1;
+      video.playbackRate = speed;
+    });
+
+    $("streamPrevEpBtn")?.addEventListener("click", () => switchWebStreamEpisode(-1));
+    $("streamNextEpBtn")?.addEventListener("click", () => switchWebStreamEpisode(1));
+    $("streamSkipOpBtn")?.addEventListener("click", () => {
+      if (!Number.isFinite(video.currentTime)) return;
+      const target = video.currentTime + 85;
+      video.currentTime = Number.isFinite(video.duration) && video.duration > 0
+        ? Math.min(video.duration, target)
+        : target;
+    });
+
+    video.addEventListener("timeupdate", debounce(() => {
+      if (streamState.open && !video.paused) {
+        saveStreamProgress(streamState.slug, streamState.episode, video.currentTime, video.duration);
+      }
+    }, 3000));
+
+    video.addEventListener("ended", () => {
+      saveStreamProgress(streamState.slug, streamState.episode, video.duration || 0, video.duration || 0);
+      const idx = streamState.episodes.findIndex(e => String(e.episode) === String(streamState.episode));
+      if (idx >= 0 && idx < streamState.episodes.length - 1) {
+        toast("Episode finished — click Next Ep ⏭ to continue", "ok");
+      }
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (!streamState.open) return;
+      const tag = (e.target?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeStreamPlayer();
+      } else if (e.key === " ") {
+        e.preventDefault();
+        if (video.paused) video.play().catch(() => {});
+        else video.pause();
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        video.currentTime = Math.max(0, (video.currentTime || 0) - 10);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        const next = (video.currentTime || 0) + 10;
+        video.currentTime = Number.isFinite(video.duration) ? Math.min(video.duration, next) : next;
+      } else if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+        else video.requestFullscreen?.().catch(() => {});
+      }
+    });
+  }
+
+  /* ─────────────────────────────────────────────────────────────────
    *  bindings
    * ───────────────────────────────────────────────────────────────── */
 
@@ -3494,6 +4027,25 @@
     const resultsList = $("resultsList");
     if (resultsList) {
       resultsList.addEventListener("click", (e) => {
+        const watchBtn = e.target.closest(".watch-btn");
+        if (watchBtn) {
+          e.stopPropagation();
+          const card = watchBtn.closest(".result");
+          if (card && card.dataset.session && card.dataset.ep) {
+            openEpisodeStream({
+              slug: card.dataset.session,
+              title: card.dataset.title || card.dataset.session,
+              episode: card.dataset.ep,
+              session: card.dataset.epSession || "",
+              episodes: [{
+                episode: card.dataset.ep,
+                session: card.dataset.epSession || "",
+                audio: "",
+              }],
+            });
+          }
+          return;
+        }
         const queueBtn = e.target.closest(".queue-btn");
         if (queueBtn) {
           handleQueueCardToggle(queueBtn);
@@ -3650,6 +4202,21 @@
     const epGrid = $("epGrid");
     if (epGrid) {
       epGrid.addEventListener("click", (e) => {
+        const playBtn = e.target.closest(".ep-play-btn");
+        if (playBtn) {
+          e.stopPropagation();
+          const ep = playBtn.dataset.streamEp;
+          const epSession = playBtn.dataset.streamSession || "";
+          if (ep) {
+            openEpisodeStream({
+              slug: state.selectedSlug,
+              title: state.selectedTitle || state.selectedSlug,
+              episode: ep,
+              session: epSession,
+            });
+          }
+          return;
+        }
         const el = e.target.closest(".ep");
         if (!el) return;
         const ep = el.dataset.ep;
@@ -3827,6 +4394,22 @@
     $("copyPlaylists").onclick = () => copyToClip(state.job?.playlists?.join("\n") || "", "All playlist links copied");
 
     // actions
+    if ($("watchBtn")) {
+      $("watchBtn").onclick = () => {
+        const target = getActionBarStreamTarget();
+        if (!target) {
+          toast("Select an episode to watch", "error");
+          return;
+        }
+        openEpisodeStream({
+          slug: state.selectedSlug,
+          title: state.selectedTitle || state.selectedSlug,
+          episode: target.episode,
+          session: target.session,
+        });
+      };
+    }
+    bindStreamPlayer();
     $("startBtn").onclick = handleMainAction;
     $("stopBtn").onclick = stopJob;
     if ($("queueSelectionBtn")) $("queueSelectionBtn").onclick = queueCurrentSelection;
@@ -3987,6 +4570,14 @@
         applyQueueResponse(res);
         toast("Cloudflare solved! Resuming downloads…", "ok");
       } catch (_) {}
+    }
+
+    if (streamState.open && !$("streamErrorOverlay")?.classList.contains("hidden")) {
+      const video = $("streamVideo");
+      const pos = video && Number.isFinite(video.currentTime) && video.currentTime > 0
+        ? video.currentTime
+        : null;
+      resolveAndPlayInWebModal(pos);
     }
 
     if (state.selectedSlug) {

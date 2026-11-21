@@ -57,9 +57,14 @@ impl SmartDnsResolver {
 }
 
 fn filter_ips(ips: impl IntoIterator<Item = IpAddr>, is_localhost: bool) -> Vec<IpAddr> {
-    ips.into_iter()
+    let mut out: Vec<IpAddr> = ips
+        .into_iter()
         .filter(|ip| is_localhost || (!ip.is_loopback() && !ip.is_unspecified()))
-        .collect()
+        .collect();
+    // Prefer IPv4 ahead of IPv6 so CDN connections avoid degraded/high-RTT IPv6 routes.
+    out.sort_by_key(|ip| ip.is_ipv6());
+    out.dedup();
+    out
 }
 
 fn anycast_fallback(lower: &str) -> Option<Vec<SocketAddr>> {
@@ -137,27 +142,33 @@ impl Resolve for SmartDnsResolver {
         let resolver = self.clone();
 
         Box::pin(async move {
-            // 1. Try standard system DNS first (ignoring poisoned loopback/unspecified answers)
             let is_localhost = host.eq_ignore_ascii_case("localhost");
-            let target = format!("{}:0", host);
-            if let Ok(lookup) = tokio::net::lookup_host(&target).await {
-                let addrs: Vec<SocketAddr> = lookup
-                    .filter(|addr| {
-                        is_localhost || (!addr.ip().is_loopback() && !addr.ip().is_unspecified())
-                    })
-                    .collect();
-                if !addrs.is_empty() {
-                    let iter: Addrs = Box::new(addrs.into_iter());
+            let lower = host.to_ascii_lowercase();
+
+            // 1. Check in-memory DNS cache first so parallel connections never
+            // block on repeated getaddrinfo syscalls or slow ISP DNS timeouts.
+            if !is_localhost {
+                if let Some(cached) = resolver.get_cached(&lower) {
+                    let iter: Addrs = Box::new(cached.into_iter());
                     return Ok(iter);
                 }
             }
 
-            let lower = host.to_ascii_lowercase();
-
-            // 2. Check cached DoH results before querying upstream resolvers
-            if let Some(cached) = resolver.get_cached(&lower) {
-                let iter: Addrs = Box::new(cached.into_iter());
-                return Ok(iter);
+            // 2. Try standard system DNS with a bounded 2s timeout (ignoring poisoned loopback/unspecified answers)
+            let target = format!("{}:0", host);
+            if let Ok(Ok(lookup)) =
+                tokio::time::timeout(Duration::from_secs(2), tokio::net::lookup_host(&target)).await
+            {
+                let ips = filter_ips(lookup.map(|addr| addr.ip()), is_localhost);
+                if !ips.is_empty() {
+                    if !is_localhost {
+                        resolver.put_cached(lower, ips.clone());
+                    }
+                    let addrs: Vec<SocketAddr> =
+                        ips.into_iter().map(|ip| SocketAddr::new(ip, 0)).collect();
+                    let iter: Addrs = Box::new(addrs.into_iter());
+                    return Ok(iter);
+                }
             }
 
             // 3. Query Cloudflare DoH (1.1.1.1) directly by IP

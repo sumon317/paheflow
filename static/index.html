@@ -538,6 +538,7 @@
       </div>
     </div>
     <div class="action-buttons">
+      <button class="btn btn-ghost" id="watchBtn" disabled title="Stream episode natively in app">▶ Watch</button>
       <button class="btn btn-ghost" id="stopBtn" disabled>Stop</button>
       <button class="btn btn-primary btn-lg" id="startBtn" disabled>Download</button>
     </div>
@@ -618,6 +619,58 @@
     <div class="modal-actions" style="justify-content: flex-end; margin-top: 10px;">
       <button class="btn btn-ghost" id="dismissUpdateModalBtn">Later</button>
       <button class="btn btn-primary" id="confirmUpdateBtn" style="background: #3b82f6; border-color: #3b82f6; color: #fff;">⬇️ Download &amp; Install</button>
+    </div>
+  </div>
+</div>
+
+<!-- Native In-App Video Stream Player Modal (Desktop / Web) -->
+<div id="streamPlayerModal" class="modal-overlay stream-modal hidden" role="dialog" aria-modal="true" aria-label="Anime stream player">
+  <div class="stream-player-shell">
+    <div class="stream-player-head">
+      <div class="stream-player-title-wrap">
+        <h2 id="streamPlayerTitle">PaheFlow Player</h2>
+        <span id="streamPlayerMeta" class="stream-player-meta">Resolving stream…</span>
+      </div>
+      <div class="stream-player-head-controls">
+        <select id="streamQualitySelect" class="stream-select" aria-label="Stream quality and audio" title="Switch quality or audio"></select>
+        <select id="streamSpeedSelect" class="stream-select" aria-label="Playback speed" title="Playback speed">
+          <option value="0.5">0.5x</option>
+          <option value="0.75">0.75x</option>
+          <option value="1" selected>1.0x</option>
+          <option value="1.25">1.25x</option>
+          <option value="1.5">1.5x</option>
+          <option value="1.75">1.75x</option>
+          <option value="2">2.0x</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" id="streamCopyUrlBtn" title="Copy local HLS stream URL for external players like MPV or VLC">Copy URL</button>
+        <button class="btn btn-ghost btn-sm btn-icon" id="streamCloseBtn" title="Close player" aria-label="Close player">✕</button>
+      </div>
+    </div>
+
+    <div class="stream-video-stage">
+      <video id="streamVideo" class="stream-video" controls playsinline preload="auto"></video>
+      <div id="streamLoadingOverlay" class="stream-overlay hidden">
+        <span class="spinner"></span>
+        <span id="streamLoadingText">Resolving stream from AnimePahe…</span>
+      </div>
+      <div id="streamErrorOverlay" class="stream-overlay stream-error-overlay hidden">
+        <strong>Unable to play stream</strong>
+        <p id="streamErrorText"></p>
+        <div class="stream-error-actions">
+          <button class="btn btn-primary btn-sm hidden" id="streamSolveCfBtn">🛡️ Solve Cloudflare</button>
+          <button class="btn btn-primary btn-sm" id="streamRetryBtn">↻ Retry</button>
+          <button class="btn btn-ghost btn-sm" id="streamCopyUrlErrBtn">Copy HLS URL</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="stream-player-foot">
+      <div class="stream-ep-nav">
+        <button class="btn btn-ghost btn-sm" id="streamPrevEpBtn" disabled>⏮ Prev Ep</button>
+        <button class="btn btn-ghost btn-sm" id="streamSkipOpBtn" title="Skip 85 seconds (opening/ending)">+85s OP</button>
+        <button class="btn btn-ghost btn-sm" id="streamNextEpBtn" disabled>Next Ep ⏭</button>
+      </div>
+      <span id="streamStatusHint" class="stream-status-hint">Direct local HLS stream</span>
     </div>
   </div>
 </div>

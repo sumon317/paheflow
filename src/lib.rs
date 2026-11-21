@@ -15,3 +15,4 @@ pub mod kwik;
 pub mod library;
 pub mod runner;
 pub mod server;
+pub mod stream;

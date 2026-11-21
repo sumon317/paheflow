@@ -228,6 +228,18 @@ class MainActivity : AppCompatActivity() {
             }
 
             @JavascriptInterface
+            fun hasNativePlayer(): Boolean {
+                return true
+            }
+
+            @JavascriptInterface
+            fun openStreamPlayer(payloadJson: String) {
+                runOnUiThread {
+                    launchNativeStreamPlayer(payloadJson)
+                }
+            }
+
+            @JavascriptInterface
             fun isAndroid(): Boolean {
                 return true
             }
@@ -867,6 +879,37 @@ class MainActivity : AppCompatActivity() {
                 "if (typeof window.onFolderPicked === 'function') { window.onFolderPicked(null); }"
             }
             webView.evaluateJavascript(js, null)
+        }
+    }
+
+    private fun launchNativeStreamPlayer(payloadJson: String) {
+        if (isFinishing || isDestroyed) return
+        try {
+            val json = org.json.JSONObject(payloadJson)
+            val slug = json.optString("slug", "").trim()
+            val episode = json.optString("episode", "").trim()
+            if (slug.isEmpty() || episode.isEmpty()) {
+                Toast.makeText(this, "Missing episode information for streaming", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val title = json.optString("title", slug).trim()
+            val session = json.optString("session", "").trim()
+            val resolution = json.optString("resolution", "").trim()
+            val audio = json.optString("audio", "").trim()
+            val episodesJson = json.optJSONArray("episodes")?.toString() ?: "[]"
+            val intent = StreamPlayerActivity.createIntent(
+                context = this,
+                slug = slug,
+                title = title,
+                episode = episode,
+                session = session,
+                resolution = resolution,
+                audio = audio,
+                episodesJson = episodesJson
+            )
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Could not launch player: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
